@@ -1,0 +1,81 @@
+{
+	"schema_version": 1,
+	"lot": "Lot 1 — Infrastructure (Foundation)",
+	"version": "1.0",
+	"generated_at": "2026-01-20",
+	"timezone": "Europe/Paris",
+	"priority_mapping": {
+		"0": "P0 / This task should not be done in parallel with another.",
+		"1": "P1 / Must-have for MVP",
+		"2": "P2 / Should-have for MVP",
+		"3": "P3 / Nice-to-have (MVP+) or preparatory",
+		"4": "P4 / Lowest priority / can defer"
+	},
+	"state_mapping": {
+		"todo": "todo",
+		"claimed": "reserved",
+		"in_progress": "dev in progress",
+		"pr_open": "awaiting review/CI",
+		"changes_requested": "changes requested",
+		"queued": "in merge queue",
+		"merged": "merged"
+	},
+	"tasks": [
+		{
+			"id": "L1-INFRA-005",
+			"title": "Bootstrap script for 3-node k3s",
+			"priority": "0",
+			"state": "merged",
+			"dependencies": [],
+			"exclusive_resources": [
+				"cluster-bootstrap"
+			],
+			"assignee": null,
+			"claimed_at": null,
+			"tool": "codex",
+			"base_branch": "main",
+			"worktree": null,
+			"review": {
+				"reviewer": null,
+				"changed": false,
+				"last_reviewed_at": null
+			}
+		},
+		{
+			"id": "L1-INFRA-006",
+			"title": "Create monorepo infrastructure layout and conventions",
+			"priority": "1",
+			"state": "claimed",
+			"dependencies": [
+				"L1-INFRA-005"
+			],
+			"exclusive_resources": [
+				"deps-lockfile"
+			],
+			"assignee": "agentA",
+			"claimed_at": "2026-01-20T12:34:56Z",
+			"tool": "codex",
+			"base_branch": "main",
+			"worktree": {
+				"worktree_path": ".macc/worktree/l1-infra-006-create-monorepo-1737376496",
+				"branch": "ai/task/l1-infra-006-create-monorepo-1737376496",
+				"base_branch": "main",
+				"last_commit": "3f2a9b4c0d2d7c0b8b2c9e9f1a3d4e5f6a7b8c9d",
+				"session_id": "agentA-L1-INFRA-006-20260120T123456Z"
+			},
+			"review": {
+				"reviewer": null,
+				"changed": false,
+				"last_reviewed_at": null
+			}
+		}
+	],
+	"resource_locks": {
+		"deps-lockfile": {
+			"task_id": "L1-INFRA-006",
+			"worktree_path": ".macc/worktree/l1-infra-006-create-monorepo-1737376496",
+			"locked_at": "2026-01-20T12:34:56Z"
+		}
+	},
+	"updated_at": "2026-01-20T12:34:56Z"
+}

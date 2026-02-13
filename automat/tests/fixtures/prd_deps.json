@@ -1,0 +1,28 @@
+{
+  "lot": "Test Lot",
+  "version": "1.0",
+  "generated_at": "2026-02-05",
+  "timezone": "UTC",
+  "priority_mapping": {
+    "p0": "P0",
+    "p1": "P1"
+  },
+  "tasks": [
+    {
+      "id": "TASK-A",
+      "title": "Base task",
+      "state": "merged",
+      "priority": "p0",
+      "dependencies": [],
+      "exclusive_resources": []
+    },
+    {
+      "id": "TASK-B",
+      "title": "Dependent task",
+      "state": "todo",
+      "priority": "p1",
+      "dependencies": ["TASK-A"],
+      "exclusive_resources": []
+    }
+  ]
+}

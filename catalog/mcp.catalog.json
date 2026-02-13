@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0",
+  "type": "mcp",
+  "updated_at": "2026-01-30",
+  "entries": [
+    {
+      "id": "brave-search",
+      "name": "Brave Search MCP",
+      "description": "MCP server configuration for Brave Search (placeholders only).",
+      "tags": [
+        "search",
+        "mcp"
+      ],
+      "selector": {
+        "subpath": "servers/brave-search"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/example/macc-mcp-packages.git",
+        "ref": "v1.2.0",
+        "checksum": null
+      }
+    }
+  ]
+}

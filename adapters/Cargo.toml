@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "shared",
+    "gemini",
+    "claude",
+    "codex",
+]
+resolver = "2"

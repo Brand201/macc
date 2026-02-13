@@ -1,0 +1,629 @@
+{
+  "lot": "Lot 0 — MACC Foundations (M0: Apply Engine + Project Config)",
+  "version": "1.0",
+  "generated_at": "2026-01-29",
+  "timezone": "Europe/Paris",
+  "priority_mapping": {
+    "1": "P0 / Must-have for M0",
+    "2": "P1 / Should-have for M0",
+    "4": "P2 / Nice-to-have (M0+)",
+    "5": "P3 / Defer / backlog"
+  },
+  "assumptions": [
+    "MACC is implemented in Rust (stable) and distributed as a single binary; M0 focuses on CLI only (no TUI).",
+    "The canonical project configuration source-of-truth is .macc/macc.yaml.",
+    "M0 must support safe project-level generation with atomic writes and timestamped backups; user-level writes are disabled unless explicitly enabled later.",
+    "Tasks are sized for completion in < 1 day by a single AI agent."
+  ],
+  "tasks": [
+    {
+      "id": "L1-BOOT-001",
+      "title": "Create Rust workspace and initial crates for MACC core and CLI",
+      "category": "repo-structure",
+      "description": "Problem/Objective: Establish a predictable Rust workspace so subsequent tasks can build on stable crate boundaries.\nMain Features: Create Cargo workspace with crates for core logic and CLI entrypoint; ensure compilation succeeds.\nScope/Boundaries: Do not implement TUI; do not implement real tool adapters (Claude/Codex/Gemini) yet.\nSuccess Criteria: `cargo build` succeeds on a fresh clone and produces a runnable `macc` binary (even if commands are stubbed).",
+      "objective": "Create the minimal Rust workspace layout required to implement the M0 apply engine and CLI commands.",
+      "result": "Workspace contains `macc-core` (library) and `macc-cli` (binary). Running `cargo build` succeeds and `macc --help` prints usage.",
+      "steps": [
+        "Create repository folders and a root Cargo.toml with [workspace].",
+        "Create `crates/macc-core` as a library crate.",
+        "Create `crates/macc-cli` as a binary crate that depends on `macc-core`.",
+        "Add minimal main.rs that prints help/version via clap (stub).",
+        "Run `cargo build` and fix compilation issues."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Keep crate boundaries stable: core must be reusable by TUI later."
+    },
+    {
+      "id": "L1-BOOT-002",
+      "title": "Add baseline tooling: formatting, linting, and test commands",
+      "category": "quality",
+      "description": "Problem/Objective: Without consistent formatting/linting, AI agents will create divergent code styles and hidden defects.\nMain Features: Enable `cargo fmt`, `cargo clippy`, `cargo test` as standard commands.\nScope/Boundaries: No CI provider integration required in M0; just repo scripts/docs and optional config files.\nSuccess Criteria: Running `cargo fmt --check` and `cargo clippy -- -D warnings` passes on the empty baseline.",
+      "objective": "Provide a stable quality baseline so every subsequent task can validate changes locally.",
+      "result": "Repo contains configuration (if needed) and documentation so contributors/agents can run fmt/clippy/tests reliably.",
+      "steps": [
+        "Add minimal CONTRIBUTING note or Makefile/justfile with fmt/clippy/test commands (optional).",
+        "Ensure `cargo fmt` works (add rustfmt.toml only if needed).",
+        "Ensure `cargo clippy` is enabled for workspace and no warnings exist.",
+        "Add a minimal `cargo test` that runs quickly (even if empty)."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "This reduces churn and keeps diffs readable for later preview/diff features."
+    },
+    {
+      "id": "L1-CLI-001",
+      "title": "Implement CLI command skeleton with clap: init/apply/plan",
+      "category": "cli",
+      "description": "Problem/Objective: M0 needs a callable interface to run init/apply and inspect planned changes.\nMain Features: Provide subcommands `init`, `apply`, and `plan` with common flags.\nScope/Boundaries: No TUI; no worktree subcommands yet (only `--cwd` support).\nSuccess Criteria: `macc init`, `macc plan`, and `macc apply` parse arguments and call into core with stub behavior.",
+      "objective": "Create the CLI surface required for M0 and wire it to core entrypoints.",
+      "result": "Running `macc --help` shows `init`, `plan`, `apply` with flags; calling each subcommand reaches core functions without panics.",
+      "steps": [
+        "Add clap dependency and define top-level `Cli` struct with subcommands.",
+        "Define global flags: `--cwd <path>`, `--verbose`.",
+        "Define `init` flags: `--force` (optional).",
+        "Define `plan/apply` flags: `--tools <csv>` (optional), `--dry-run` (plan-only).",
+        "Wire each subcommand to a core function signature (even if placeholder)."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-CLI-002",
+      "title": "Add structured error handling and exit codes for CLI",
+      "category": "cli",
+      "description": "Problem/Objective: AI agents need deterministic signals to know whether a step succeeded or failed.\nMain Features: Normalize errors, print actionable messages, and return distinct exit codes.\nScope/Boundaries: Do not implement full diagnostics framework yet; keep it simple and predictable.\nSuccess Criteria: Errors are printed once (no double prints), and exit code differs between validation vs IO failures.",
+      "objective": "Make the CLI reliable for automation and future scripts (e.g., ralph) by standardizing failure behavior.",
+      "result": "CLI returns consistent exit codes and user-readable error messages for common failure classes (config parse, validation, IO).",
+      "steps": [
+        "Define an error enum in core (or use anyhow + mapping) for common failure classes.",
+        "Map errors to exit codes in CLI (e.g., 1=usage/validation, 2=refused user-scope, 3=IO).",
+        "Ensure errors include context (file path, action type) without leaking secrets.",
+        "Add 2-3 small tests for exit code mapping (unit tests)."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-PATH-001",
+      "title": "Implement project root discovery by locating .macc/macc.yaml",
+      "category": "paths",
+      "description": "Problem/Objective: `macc` must operate on the correct project even when invoked from a subdirectory.\nMain Features: Walk upward from CWD (or `--cwd`) until `.macc/macc.yaml` is found.\nScope/Boundaries: Do not implement git-root discovery fallback yet; only `.macc/macc.yaml` is authoritative.\nSuccess Criteria: Given nested directories, discovery returns the correct root; returns a clear error if not found.",
+      "objective": "Allow `macc` to reliably find the canonical config regardless of invocation directory.",
+      "result": "Core exposes `find_project_root(start_dir)` and CLI uses it to resolve the project root for all subcommands.",
+      "steps": [
+        "Define `ProjectPaths` struct (root, macc_dir, config_path, backups_dir, tmp_dir).",
+        "Implement `find_project_root(start_dir)` (walk parents).",
+        "Add unit tests using temp directories to verify behavior.",
+        "Integrate into CLI so all subcommands resolve root consistently."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-PATH-002",
+      "title": "Add `--cwd` support and path normalization for all commands",
+      "category": "paths",
+      "description": "Problem/Objective: Worktrees and automation require running MACC in a specific directory.\nMain Features: `--cwd` overrides the OS process CWD for discovery and all file operations.\nScope/Boundaries: Do not implement `worktree` commands yet; only ensure the plumbing works.\nSuccess Criteria: `macc --cwd <path> init/plan/apply` operates exclusively within that directory tree.",
+      "objective": "Ensure MACC can operate on any target directory (including worktrees) deterministically.",
+      "result": "All filesystem reads/writes are anchored to the discovered root from `--cwd`, with no accidental writes elsewhere.",
+      "steps": [
+        "In CLI, resolve `--cwd` to an absolute path and pass to core.",
+        "In core, treat the provided start dir as the base for discovery.",
+        "Add integration test: create nested dir, run with `--cwd`, verify correct files created."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-CONFIG-001",
+      "title": "Define CanonicalConfig schema (Rust structs) for .macc/macc.yaml",
+      "category": "config",
+      "description": "Problem/Objective: MACC needs a canonical, tool-agnostic configuration source-of-truth.\nMain Features: Create typed structs for core fields (enabled tools, standards, skills/agents selection placeholders, policies placeholders).\nScope/Boundaries: Do not fully model all tool-specific settings in M0; only the minimal stable envelope.\nSuccess Criteria: CanonicalConfig can parse a minimal yaml and serialize back to yaml without losing key fields.",
+      "objective": "Create the minimal canonical config model that later tool adapters and TUI can extend safely.",
+      "result": "A `CanonicalConfig` type exists with serde support and a documented minimal example matching `macc init` output.",
+      "steps": [
+        "Create `macc-core/src/config/mod.rs` and a `CanonicalConfig` struct.",
+        "Include minimal fields: version (optional), tools.enabled list/map, standards pointer or inline, selections for skills/agents (optional).",
+        "Add serde attributes for stable naming and future compatibility.",
+        "Add unit test to deserialize the minimal template and re-serialize (roundtrip)."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-CONFIG-002",
+      "title": "Implement YAML loader with strictness and clear error messages",
+      "category": "config",
+      "description": "Problem/Objective: Mis-typed keys in yaml can silently break generation; errors must be actionable.\nMain Features: Load `.macc/macc.yaml`, parse with serde_yaml, and validate with helpful messages including line/column when possible.\nScope/Boundaries: Do not implement interactive repair; just fail with actionable errors.\nSuccess Criteria: Invalid yaml or unknown fields produce a readable error referencing the file path and the failing key.",
+      "objective": "Make configuration reading reliable and safe for AI agents and humans.",
+      "result": "Core exposes `load_canonical_config(path) -> CanonicalConfig` and returns readable errors for parse/validation failures.",
+      "steps": [
+        "Implement `load_canonical_config` reading file as UTF-8.",
+        "Enable `deny_unknown_fields` where appropriate to catch typos.",
+        "Wrap errors with context (path).",
+        "Add unit tests: unknown key, invalid yaml syntax, missing required field."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-CONFIG-003",
+      "title": "Create default config template and implement `macc init` file generation",
+      "category": "config",
+      "description": "Problem/Objective: Projects need a consistent starting point to use MACC without manual setup.\nMain Features: `macc init` creates `.macc/` and writes a minimal `.macc/macc.yaml` template.\nScope/Boundaries: Do not generate tool-specific files in init; only canonical config and folders.\nSuccess Criteria: Running `macc init` in an empty directory creates `.macc/macc.yaml` and required subfolders; re-running is idempotent.",
+      "objective": "Provide a predictable bootstrap for new projects.",
+      "result": "After `macc init`, the project contains `.macc/macc.yaml` with sensible defaults and no secrets; the command is idempotent unless `--force` is used.",
+      "steps": [
+        "Define the minimal yaml template content in core (string or serde struct serialize).",
+        "Create `.macc/` directory if missing.",
+        "Write `.macc/macc.yaml` only if absent (or overwrite if `--force`).",
+        "Create `.macc/backups/` and `.macc/tmp/` directories.",
+        "Add integration tests for idempotence and `--force` behavior."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-RESOLVE-001",
+      "title": "Define ResolvedConfig and normalization rules (minimal)",
+      "category": "resolve",
+      "description": "Problem/Objective: Tools and generators should rely on a fully normalized configuration (defaults applied, sorted lists, stable paths).\nMain Features: Create a ResolvedConfig type derived from CanonicalConfig with defaults applied.\nScope/Boundaries: Do not implement presets marketplace; only basic defaulting and normalization.\nSuccess Criteria: Given the same canonical config, ResolvedConfig is deterministic (stable ordering).",
+      "objective": "Create the minimal resolve layer required by planning/generation to be deterministic.",
+      "result": "Core exposes `resolve(canonical, cli_overrides) -> ResolvedConfig` and guarantees stable ordering for diff friendliness.",
+      "steps": [
+        "Define `ResolvedConfig` struct in `macc-core/src/resolve/`.",
+        "Implement defaults: enabled tools empty => none; language default 'English' for outputs (if stored).",
+        "Sort lists/keys where order should be stable (tools list, skills list).",
+        "Add unit tests: same input yields identical serialized output."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-RESOLVE-002",
+      "title": "Implement CLI overrides for tool selection (`--tools`)",
+      "category": "resolve",
+      "description": "Problem/Objective: Users and agents need to apply only specific tools without editing yaml.\nMain Features: Parse `--tools` CSV and override the enabled tools set for the current run.\nScope/Boundaries: Do not persist overrides into `.macc/macc.yaml` in M0.\nSuccess Criteria: `macc plan/apply --tools foo,bar` limits planning to those tools (or errors if unknown).",
+      "objective": "Allow per-run selection of tools for faster iteration and safer incremental adoption.",
+      "result": "ResolvedConfig reflects CLI tool selection for the current invocation; unknown tool IDs generate a clear error.",
+      "steps": [
+        "Add parser for comma-separated tool list in CLI (trim whitespace).",
+        "Add a `CliOverrides` struct passed to `resolve`.",
+        "Validate tool IDs: accept only known IDs from a registry placeholder.",
+        "Add unit tests for parsing and overriding behavior."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-TOOLAPI-001",
+      "title": "Define minimal ToolAdapter trait and registry interface",
+      "category": "tool-api",
+      "description": "Problem/Objective: The apply engine must be adapter-driven in later milestones; M0 should establish the interface now.\nMain Features: Define a ToolAdapter trait that can produce an ActionPlan from ResolvedConfig; define a registry to discover adapters.\nScope/Boundaries: No real Claude/Codex/Gemini adapter implementation in M0; only a test adapter.\nSuccess Criteria: Core can iterate over registered adapters and ask each to produce an ActionPlan.",
+      "objective": "Prepare the architecture for scalable tool integrations while keeping M0 focused on the apply engine.",
+      "result": "A `ToolAdapter` trait exists in core and a `ToolRegistry` can list adapters. The CLI can run with a dummy adapter.",
+      "steps": [
+        "Define `ToolAdapter` with methods: `id()`, `plan(ctx, resolved) -> ActionPlan`.",
+        "Define `ToolRegistry` interface and a simple static implementation for M0.",
+        "Ensure `ResolvedConfig` includes enabled tool IDs so registry can filter.",
+        "Add unit test: registry returns test adapter, and planning returns a plan."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-TOOLAPI-002",
+      "title": "Implement a 'test adapter' that generates a small deterministic plan",
+      "category": "tool-api",
+      "description": "Problem/Objective: M0 needs an end-to-end way to validate planning, diffing, backups, and atomic writes without depending on external tools.\nMain Features: A test adapter produces actions to write a few files (text + json) under project root.\nScope/Boundaries: The test adapter must not write secrets or user-level files.\nSuccess Criteria: Running `macc plan/apply --tools test` produces predictable outputs and diffs.",
+      "objective": "Enable deterministic end-to-end verification of the apply engine in M0.",
+      "result": "A `test` tool exists that generates `MACC_GENERATED.txt` and `.macc/test-output.json` (or similar) via ActionPlan, enabling integration tests.",
+      "steps": [
+        "Create an adapter implementation `TestAdapter` in `macc-core` (or `macc-adapters` if present).",
+        "Have it generate a text file and a JSON file with stable ordering/content.",
+        "Ensure the adapter is registered in the registry implementation.",
+        "Add integration test to call plan/apply and verify file outputs."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-PLAN-001",
+      "title": "Define ActionPlan and core action types (WriteFile, Mkdir, EnsureGitignore, BackupFile)",
+      "category": "plan",
+      "description": "Problem/Objective: A unified plan representation enables preview/apply and keeps tool adapters side-effect free.\nMain Features: Implement ActionPlan with a small set of typed actions for M0.\nScope/Boundaries: Do not implement MergeJson/MergeToml in M0; only full-file writes and backups.\nSuccess Criteria: ActionPlan can be built, iterated deterministically, and rendered as a summary.",
+      "objective": "Create the data model for 'plan -> preview -> apply' that all later tools will use.",
+      "result": "ActionPlan exists with deterministic ordering and the required action variants for M0.",
+      "steps": [
+        "Create `macc-core/src/plan/` module.",
+        "Define `Scope` enum (Project, User) but enforce Project-only in M0.",
+        "Define action enums/structs: WriteFile, Mkdir, EnsureGitignore, BackupFile.",
+        "Add ordering rules and a function to 'normalize/sort' actions."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-PLAN-002",
+      "title": "Implement ActionPlan builder helpers and path safety checks",
+      "category": "plan",
+      "description": "Problem/Objective: Adapters should not duplicate boilerplate and should not be able to escape the project root.\nMain Features: Provide helper methods to add actions; validate that project-scoped paths are relative and safe.\nScope/Boundaries: Do not implement advanced policies; only basic safety validation.\nSuccess Criteria: Attempting to add a path like `../../etc/passwd` is rejected during plan validation.",
+      "objective": "Make plan creation safe, ergonomic, and hard to misuse by adapters or agents.",
+      "result": "Plan builder rejects unsafe paths, normalizes separators, and provides simple convenience APIs.",
+      "steps": [
+        "Add `ActionPlanBuilder` with methods: `mkdir`, `write_text`, `write_bytes`, `ensure_gitignore_entry`.",
+        "Implement path validation: deny absolute paths for project scope; deny parent traversal.",
+        "Add unit tests for safe/unsafe paths."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-DIFF-001",
+      "title": "Implement filesystem snapshot reader for planned files",
+      "category": "diff",
+      "description": "Problem/Objective: Preview/diff requires reading existing project files to compare against planned outputs.\nMain Features: For each WriteFile action, read current file if it exists (best-effort) and return 'missing/exists/content' info.\nScope/Boundaries: Do not recurse directories; only files explicitly in the plan.\nSuccess Criteria: For each planned file, preview can state created/updated/unchanged reliably.",
+      "objective": "Provide the foundation for preview and idempotence checks.",
+      "result": "A `read_existing(path)` function supports previewing planned file writes and determining whether content changes are needed.",
+      "steps": [
+        "Implement file read with UTF-8 for text; keep raw bytes for unknown types.",
+        "Return a struct `ExistingFile { exists, bytes, is_text_guess }`.",
+        "Add unit tests for missing file, existing file, and non-UTF8 handling."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-DIFF-002",
+      "title": "Implement unified diff for text files (markdown, rules, toml-as-text)",
+      "category": "diff",
+      "description": "Problem/Objective: Users need to understand exactly what will change before apply.\nMain Features: Generate a unified diff for text files; mark created/deleted/updated.\nScope/Boundaries: Do not implement syntax-aware TOML diff in M0; treat TOML as plain text.\nSuccess Criteria: `macc plan` prints readable diffs for text outputs generated by test adapter.",
+      "objective": "Enable a human/agent-readable preview for planned changes.",
+      "result": "Plan preview can produce a unified diff for text files with stable headers and minimal noise.",
+      "steps": [
+        "Choose a diff library or implement minimal unified diff generation.",
+        "Define rules for file type detection (extensions: .md, .txt, .rules, .toml).",
+        "Add tests comparing expected diff output for simple modifications."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-DIFF-003",
+      "title": "Implement JSON pretty-print + diff for .json outputs",
+      "category": "diff",
+      "description": "Problem/Objective: Raw JSON diffs are noisy; pretty-printing makes review feasible.\nMain Features: Parse JSON and re-render with stable formatting before diffing; fall back to text diff if parse fails.\nScope/Boundaries: No deep semantic diff; only pretty-print normalization then line diff.\nSuccess Criteria: A key reordering does not create a diff if pretty-print output is identical.",
+      "objective": "Make JSON diffs stable and reviewable for preview/apply.",
+      "result": "Preview for .json files uses stable pretty-print formatting and produces minimal diffs.",
+      "steps": [
+        "Implement `normalize_json(bytes) -> pretty_string` using serde_json.",
+        "On parse error, fall back to treating file as text.",
+        "Add tests for stable formatting and fallback behavior."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-DIFF-004",
+      "title": "Implement plan summary renderer (created/updated/unchanged)",
+      "category": "diff",
+      "description": "Problem/Objective: Diff output can be long; a concise summary is needed for quick decisions and automation.\nMain Features: Print a table/list of files with status and scope; optionally include byte sizes.\nScope/Boundaries: No TUI rendering in M0; CLI text summary only.\nSuccess Criteria: `macc plan` prints a stable summary that can be parsed by humans and used in logs.",
+      "objective": "Provide a compact preview summary for planned filesystem changes.",
+      "result": "CLI can render a stable, readable summary of planned changes including file statuses and scopes.",
+      "steps": [
+        "Compute status per WriteFile: created/updated/unchanged by comparing normalized content.",
+        "Render a deterministic order (sorted by path).",
+        "Include scope marker (Project/User) even if User is disabled."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-APPLY-001",
+      "title": "Implement timestamped backup creation for project files",
+      "category": "apply",
+      "description": "Problem/Objective: Apply must be safe; overwriting files must be recoverable.\nMain Features: Before overwriting any existing project file, copy it to `.macc/backups/<timestamp>/...` preserving relative path.\nScope/Boundaries: Do not implement user-level backups in M0; only project backups.\nSuccess Criteria: After apply, backups exist for every overwritten file and paths are correct.",
+      "objective": "Guarantee recoverability for project-level changes made by `macc apply`.",
+      "result": "When applying updates, each overwritten file is backed up under `.macc/backups/<timestamp>/...` and the backup root is reported in output.",
+      "steps": [
+        "Define a timestamp format (e.g., YYYYMMDD-HHMMSS).",
+        "Create backup root directory and mirror subdirectories as needed.",
+        "Copy existing file bytes into backup path before writing new content.",
+        "Add integration test: modify file then apply again; ensure backup created."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-APPLY-002",
+      "title": "Implement atomic file writing (tmp + rename) with safe temp directory",
+      "category": "apply",
+      "description": "Problem/Objective: Partial writes can corrupt configs if MACC is interrupted.\nMain Features: Write to `.macc/tmp/<random>.tmp` then atomically rename into final location.\nScope/Boundaries: Do not implement cross-filesystem atomicity; assume tmp is on same filesystem as project root.\nSuccess Criteria: Interrupted writes never leave partially written target files; tmp files are cleaned up on success.",
+      "objective": "Ensure apply writes are resilient to crashes and safe for config files.",
+      "result": "All file writes are atomic via tmp+rename; successful apply leaves no stray temp files.",
+      "steps": [
+        "Implement `atomic_write(path, bytes)` that writes to a tmp file and renames.",
+        "Ensure parent directories exist before writing.",
+        "Use fsync or best-effort flushing if appropriate (optional in M0).",
+        "Add unit test for atomic_write and cleanup behavior."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-APPLY-003",
+      "title": "Implement replace-only-if-changed to avoid noisy churn",
+      "category": "apply",
+      "description": "Problem/Objective: Re-running apply should be idempotent and not touch files if nothing changed.\nMain Features: Compare existing vs planned (normalized) content; skip write and backup when identical.\nScope/Boundaries: No semantic merges in M0; only full-file equality checks.\nSuccess Criteria: Running `macc apply` twice with the same plan results in zero file writes on the second run.",
+      "objective": "Make apply idempotent and reduce unnecessary diffs in git.",
+      "result": "Apply skips unchanged files (no write, no backup) and reports them as unchanged.",
+      "steps": [
+        "Implement equality check using the same normalization logic as preview (text/json).",
+        "Skip backup/write steps when unchanged.",
+        "Add integration test that runs apply twice and checks file modification times or apply report."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-APPLY-004",
+      "title": "Implement action ordering and directory creation strategy for apply",
+      "category": "apply",
+      "description": "Problem/Objective: Apply must be deterministic and must not fail due to missing directories.\nMain Features: Ensure directories exist; apply actions in stable order (Mkdir -> Backup -> Write -> Gitignore).\nScope/Boundaries: No concurrency in M0; keep it single-threaded.\nSuccess Criteria: Applying a plan with nested files succeeds on an empty project and yields deterministic logs.",
+      "objective": "Make apply deterministic and robust for nested file outputs.",
+      "result": "Apply engine creates required directories first, applies backups/writes in stable order, and logs stable output.",
+      "steps": [
+        "Implement `apply_plan(plan, root)` that normalizes and sorts actions.",
+        "Run Mkdir actions first (deduplicate).",
+        "Run backups for existing files before their corresponding writes.",
+        "Run writes via atomic_write and replace-only-if-changed.",
+        "Run EnsureGitignore last (or integrated with file writes)."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-APPLY-005",
+      "title": "Add apply report output (machine-friendly + human-friendly)",
+      "category": "apply",
+      "description": "Problem/Objective: After apply, users and agents need a clear summary of what happened.\nMain Features: Print created/updated/unchanged counts and the backup directory path.\nScope/Boundaries: No JSON report output in M0 (optional); focus on readable CLI output.\nSuccess Criteria: `macc apply` prints a stable summary that includes backup root when applicable.",
+      "objective": "Provide clear feedback after apply to support manual review and automation.",
+      "result": "`macc apply` prints a deterministic summary including file statuses and backup directory path (if any files were backed up).",
+      "steps": [
+        "Define an `ApplyReport` struct in core.",
+        "Collect per-file outcomes during apply.",
+        "Render a stable CLI summary sorted by path.",
+        "Include backup root path when backups were created."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-GIT-001",
+      "title": "Implement EnsureGitignore action and minimal .gitignore update logic",
+      "category": "git",
+      "description": "Problem/Objective: MACC must prevent committing generated temp/backups or sensitive placeholders.\nMain Features: Ensure `.gitignore` contains entries for `.macc/tmp/` and `.macc/backups/` (and other baseline ignores).\nScope/Boundaries: Do not manage user-level ignore files; only project `.gitignore`.\nSuccess Criteria: If `.gitignore` exists, entries are appended once; if missing, `.gitignore` is created with required entries.",
+      "objective": "Prevent accidental commits of MACC internal artifacts and reduce repository noise.",
+      "result": "Project `.gitignore` includes required MACC entries without duplication; apply is idempotent.",
+      "steps": [
+        "Define baseline ignore entries (at minimum: `.macc/tmp/`, `.macc/backups/`).",
+        "Implement `ensure_gitignore_entries(root, entries)` with idempotent insertion.",
+        "Integrate EnsureGitignore into apply engine.",
+        "Add integration tests for existing/missing `.gitignore` and duplicate prevention."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-SEC-001",
+      "title": "Implement secret scanning for generated outputs (best-effort)",
+      "category": "security",
+      "description": "Problem/Objective: MACC must never write real secrets into versioned files.\nMain Features: Scan planned file contents for common secret patterns and block or warn.\nScope/Boundaries: This is best-effort; do not implement a full secret-detection product. Do not scan the entire repo, only planned outputs.\nSuccess Criteria: Obvious secrets (e.g., 'sk-' tokens, 'AKIA' keys) are detected in generated content and cause a hard error (or strong warning per policy).",
+      "objective": "Reduce risk of accidentally committing secrets by detecting likely credentials before writing.",
+      "result": "Apply/plan aborts (or warns) if generated outputs contain high-confidence secret patterns; messages do not echo the full secret.",
+      "steps": [
+        "Create `security/secret_scan.rs` with a small set of regex patterns (high confidence).",
+        "Implement `scan_bytes(path, bytes) -> Vec<Finding>` returning redacted findings.",
+        "Decide policy for M0: default 'error' for high confidence patterns.",
+        "Add unit tests for detection and redaction behavior."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Never print the full matched secret in logs; show redacted form only."
+    },
+    {
+      "id": "L1-SEC-002",
+      "title": "Enforce placeholder-only policy for templates and generated configs",
+      "category": "security",
+      "description": "Problem/Objective: Even without scanning, templates should never include real credentials.\nMain Features: Provide standard placeholder conventions and validate that certain fields use placeholders (e.g., ${ENV_VAR}).\nScope/Boundaries: Do not attempt to validate every tool-specific field; only enforce for files generated by test adapter in M0.\nSuccess Criteria: Generated files contain placeholders (e.g., YOUR_API_KEY_HERE) rather than hard-coded secrets.",
+      "objective": "Ensure the project starts with safe defaults and clear placeholder guidance.",
+      "result": "Templates and generated outputs follow placeholder conventions; documentation indicates where users must add secrets manually (outside repo).",
+      "steps": [
+        "Define placeholder strings and patterns in core (e.g., `${ENV_VAR}`, `YOUR_API_KEY_HERE`).",
+        "Add a small validator for test adapter outputs that demonstrates the rule.",
+        "Document the convention in a short README section (see DOC task)."
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-USER-001",
+      "title": "Implement user-scope write guard (refuse without explicit flag)",
+      "category": "user-scope",
+      "description": "Problem/Objective: Writing to user directories is high-risk and must be consent-gated.\nMain Features: If any plan action is Scope::User, refuse to apply unless a specific CLI flag is set (future: + consent).\nScope/Boundaries: In M0, always refuse user-scope actions (even if flag provided), but ensure the guard exists.\nSuccess Criteria: A plan containing user-scope actions fails with a clear message and a specific exit code.",
+      "objective": "Prevent accidental user-level modifications during M0 while keeping the architecture ready for later consent-gated merges.",
+      "result": "Apply engine detects Scope::User actions and aborts with a clear error and exit code (e.g., 2).",
+      "steps": [
+        "Add Scope checks in `apply_plan` and `plan` rendering.",
+        "Return a typed error `UserScopeNotAllowed` from core.",
+        "Add tests verifying refusal behavior."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-E2E-001",
+      "title": "Implement `macc plan` command to render summary + diffs without writing",
+      "category": "e2e",
+      "description": "Problem/Objective: Users need a safe way to see what would change before applying.\nMain Features: `macc plan` runs resolve->plan->preview and prints summary/diffs; never writes to disk.\nScope/Boundaries: No interactive prompts; output to stdout only.\nSuccess Criteria: `macc plan --tools test` shows a file list + diff output and exits 0 without creating backups.",
+      "objective": "Provide a read-only preview workflow to support safe review and CI checks.",
+      "result": "`macc plan` produces stable output and does not modify the filesystem (except reading existing files).",
+      "steps": [
+        "Implement core entrypoint `build_plan(resolved)` that collects adapter plans.",
+        "Implement core entrypoint `preview_plan(plan, root)` that produces summary + diffs.",
+        "Wire CLI `macc plan` to these functions.",
+        "Add integration test ensuring no `.macc/backups/` created by plan."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-E2E-002",
+      "title": "Implement `macc apply` end-to-end (resolve -> plan -> security -> preview(optional) -> apply)",
+      "category": "e2e",
+      "description": "Problem/Objective: M0 must deliver the core functionality: generating project config safely.\nMain Features: `macc apply` runs the full pipeline and writes files atomically with backups.\nScope/Boundaries: No user-level merges; no real tool adapters; use test adapter.\nSuccess Criteria: `macc apply --tools test` creates expected files, backups on overwrite, and is idempotent.",
+      "objective": "Deliver the M0 acceptance: init + apply with safe writes and deterministic output.",
+      "result": "`macc apply` works reliably on a fresh project and on subsequent runs; it writes only project-scoped files and creates backups when overwriting.",
+      "steps": [
+        "Wire `macc apply` to resolve config and build ActionPlan from adapters.",
+        "Run secret scan on all planned writes before applying.",
+        "If `--dry-run` is provided, behave like `macc plan` and exit 0.",
+        "Apply the plan with atomic writes and backups.",
+        "Print an apply report."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+        "id": "L1-TEST-001",
+        "title": "Unit tests: project discovery and path safety validation",
+        "category": "tests",
+        "description": "Problem/Objective: Core path logic is security-sensitive; regressions can cause writes outside the project.\nMain Features: Add unit tests for project discovery and plan path validation.\nScope/Boundaries: Do not add end-to-end CLI tests here; focus on core unit tests.\nSuccess Criteria: Tests cover: root found, not found, and unsafe path rejection.",
+        "objective": "Lock down root discovery and path safety behavior with fast unit tests.",
+        "result": "Unit tests exist and pass, covering main edge cases for path discovery and plan path validation.",
+        "steps": [
+          "Create temp directory trees and `.macc/macc.yaml` fixtures.",
+          "Test discovery from nested directories.",
+          "Test behavior when `.macc/macc.yaml` missing.",
+          "Test that absolute paths and `..` traversal are rejected in plan builder.",
+          "Ensure all project-scoped paths are correctly anchored to the root."
+        ],
+        "priority": 1,
+        "passes": true,
+        "notes": ""
+      },
+    {
+      "id": "L1-TEST-002",
+      "title": "Unit tests: YAML parsing and validation error messages",
+      "category": "tests",
+      "description": "Problem/Objective: Config parsing failures must be readable and stable.\nMain Features: Add tests for invalid yaml, unknown keys, missing required keys.\nScope/Boundaries: Do not add schema for all tools; just validate minimal canonical schema behavior.\nSuccess Criteria: Tests assert that errors mention the config file path and contain key context.",
+      "objective": "Ensure config parsing/validation remains reliable as the schema evolves.",
+      "result": "Unit tests exist for parse and validation failures, with assertions on message content (path + key info).",
+      "steps": [
+        "Add fixtures for invalid yaml syntax and unknown fields.",
+        "Ensure errors wrap file path context.",
+        "Add snapshot-style checks for error messages (optional)."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-TEST-003",
+      "title": "Unit tests: secret scan detection + redaction",
+      "category": "tests",
+      "description": "Problem/Objective: Secret scanning must not leak secrets in logs.\nMain Features: Verify detection patterns and verify output redaction.\nScope/Boundaries: Do not attempt comprehensive coverage of all secret formats; only test a few high-confidence patterns.\nSuccess Criteria: Tests confirm that the full token is NOT included in the finding message.",
+      "objective": "Prevent regressions where logs accidentally print sensitive strings.",
+      "result": "Secret scan tests verify correct detection and redaction behavior for representative patterns.",
+      "steps": [
+        "Create test strings containing fake 'sk-' tokens and AWS-like keys.",
+        "Assert that findings exist and are categorized correctly.",
+        "Assert that the output message contains only redacted versions.",
+        "Verify that the full token is NOT included in the redacted_match or error details."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-TEST-004",
+      "title": "Integration test: `macc init` creates canonical config and folders (idempotent)",
+      "category": "tests",
+      "description": "Problem/Objective: Init is the first user touchpoint and must be stable.\nMain Features: Validate filesystem outputs and idempotence.\nScope/Boundaries: Do not test apply outputs here.\nSuccess Criteria: After running init twice, files are unchanged unless `--force` was used.",
+      "objective": "Verify the project bootstrap behavior works reliably in a fresh repo.",
+      "result": "Integration test confirms `.macc/macc.yaml`, `.macc/backups/`, and `.macc/tmp/` are created and init is idempotent.",
+      "steps": [
+        "Create temp project directory.",
+        "Run core init function (or CLI invocation if feasible in tests).",
+        "Assert required paths exist.",
+        "Run init again and assert no changes (or stable content)."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-TEST-005",
+      "title": "Integration test: plan/apply with TestAdapter (diffs + backups + idempotence)",
+      "category": "tests",
+      "description": "Problem/Objective: M0 success hinges on end-to-end correctness of plan/apply.\nMain Features: Ensure `macc plan` does not write; `macc apply` writes; second apply is idempotent; backups are created on overwrite.\nScope/Boundaries: Do not involve external tools or network.\nSuccess Criteria: Tests verify expected files, correct statuses, backup creation, and no user-scope writes.",
+      "objective": "Guarantee M0 pipeline reliability via deterministic integration tests.",
+      "result": "Integration tests validate the full pipeline on a temp directory using `TestAdapter`: plan output, apply output, backups, and idempotence.",
+      "steps": [
+        "Create temp project and run init.",
+        "Run plan and assert no backups directory created beyond baseline.",
+        "Run apply and assert generated files exist.",
+        "Modify a generated file, run apply again, and assert backup created.",
+        "Run apply third time and assert no changes (unchanged statuses)."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L1-DOC-001",
+      "title": "Write minimal README section for M0 commands (init/plan/apply) and safety rules",
+      "category": "docs",
+      "description": "Problem/Objective: Without clear usage notes, users and AI agents will misuse commands (especially around secrets and backups).\nMain Features: Document how to run `macc init`, `macc plan`, `macc apply`, what gets written, and the no-secrets rule.\nScope/Boundaries: Do not write full project documentation; only the M0 subset.\nSuccess Criteria: README includes examples and explicitly states backup locations and that user-level writes are disabled in M0.",
+      "objective": "Provide unambiguous instructions for M0 usage and safety expectations.",
+      "result": "README documents M0 workflow, output locations, backups, idempotence expectation, and no-secrets policy with placeholders.",
+      "steps": [
+        "Add usage examples for init/plan/apply (with `--cwd` and `--tools test`).",
+        "Explain backup path `.macc/backups/<timestamp>/...`.",
+        "State that user-level files are not modified in M0.",
+        "State the no-secrets policy and placeholder conventions."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    }
+  ]
+}

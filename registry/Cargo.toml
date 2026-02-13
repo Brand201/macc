@@ -1,0 +1,10 @@
+[package]
+name = "macc-registry"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macc-core = { path = "../core" }
+macc-adapter-claude = { path = "../adapters/claude" }
+macc-adapter-codex = { path = "../adapters/codex" }
+macc-adapter-gemini = { path = "../adapters/gemini" }

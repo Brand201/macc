@@ -1,0 +1,63 @@
+{
+  "schema_version": "1.0",
+  "type": "skills",
+  "updated_at": "2026-01-30",
+  "entries": [
+    {
+      "id": "create-plan",
+      "name": "Create Plan",
+      "description": "Produces a structured implementation plan from a request.",
+      "tags": [
+        "planning",
+        "workflow",
+        "bmad"
+      ],
+      "selector": {
+        "subpath": "skills/.experimental/create-plan"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/openai/skills.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "implement",
+      "name": "Implement",
+      "description": "Guides an agent through implementing a feature with tests and validation.",
+      "tags": [
+        "implementation",
+        "testing",
+        "workflow"
+      ],
+      "selector": {
+        "subpath": "skills/implement"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/Nirusan/claude-config.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "security-check",
+      "name": "Security Check example",
+      "description": "Performs basic security checks for common issues and unsafe operations.",
+      "tags": [
+        "security",
+        "review"
+      ],
+      "selector": {
+        "subpath": "skills/security-check"
+      },
+      "source": {
+        "kind": "http",
+        "url": "https://example.invalid/macc/skills-bundle.zip",
+        "ref": "",
+        "checksum": "sha256:REPLACE_WITH_REAL_SHA256"
+      }
+    }
+  ]
+}

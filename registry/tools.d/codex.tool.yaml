@@ -1,0 +1,146 @@
+api_version: v1
+id: codex
+display_name: Codex
+description: Project-level settings for Codex CLI.
+gitignore:
+  - .codex/
+  - AGENTS.md
+performer:
+  runner: adapters/codex/codex.performer.sh
+  command: codex
+  args: ["exec", "--color", "never", "-"]
+  prompt:
+    mode: stdin
+  session:
+    enabled: true
+    scope: worktree
+    init_prompt: "Bonjour"
+    extract_regex: "session[[:space:]]+id:[[:space:]]*([[:alnum:]-]+)"
+    resume:
+      command: codex
+      args: ["exec", "resume", "{session_id}"]
+  retry:
+    command: codex
+    args: ["--model", "gpt-5.1-codex-max", "exec", "--color", "never", "-"]
+defaults:
+  approval_policy: never
+  sandbox_mode: workspace-write
+install:
+  confirm_message: "Codex CLI install requires an OpenAI account/API key. Continue?"
+  commands:
+    - command: npm
+      args: ["install", "-g", "@openai/codex"]
+  post_install:
+    command: codex
+    args: []
+fields:
+  - id: model
+    label: Model
+    kind:
+      type: enum
+      options: [gpt-5.2-codex, gpt-5.2, gpt-5.1-codex-max, gpt-5.1-codex-mini, gpt-5.1-codex, gpt-5.1, gpt-5-codex, gpt-5-codex-mini, gpt-5]
+    help: Codex model id (e.g., gpt-5.2).
+    pointer: /tools/config/codex/model
+    default: "gpt-5.2-codex"
+  - id: model_reasoning_effort
+    label: Reasoning Effort
+    kind:
+      type: enum
+      options: [low, medium, high]
+    help: Reasoning effort (e.g., low, medium, high).
+    pointer: /tools/config/codex/model_reasoning_effort
+    default: "medium"
+  - id: approval_policy
+    label: Approval Policy
+    kind:
+      type: enum
+      options: [never, on-request, on-failure, untrusted]
+    help: Approval policy (e.g., on-request, never).
+    pointer: /tools/config/codex/approval_policy
+    default: "never"
+  - id: sandbox_mode
+    label: Sandbox Mode
+    kind:
+      type: enum
+      options: [workspace-write, read-only, danger-full-access]
+    help: Sandbox mode for Codex (e.g., workspace-write).
+    pointer: /tools/config/codex/sandbox_mode
+    default: "workspace-write"
+  #- id: web_search
+  #  label: Feature Web Search
+  #  kind:
+  #    type: enum
+  #    options: ["cached", "live", "disabled"]
+  #  help: Codex enables web search by default for local tasks and serves results from a web search cache.
+  #  pointer: /tools/config/codex/web_search
+  #  default: "cached"
+  #- id: shell_environment_include_only
+  #  label: Shell Env Include Only
+  #  kind:
+  #    type: array
+  #  help: Comma-separated environment variables to include (e.g., PATH,HOME).
+  #  pointer: /tools/config/codex/shell_environment_policy/include_only
+  #  default: ["PATH","HOME"]
+  #- id: features_exec_policy
+  #  label: Feature Exec Policy
+  #  kind:
+  #    type: bool
+  #  help: Enforce rules checks for shell/unified_exec. Default=true.
+  #  pointer: /tools/config/codex/features/exec_policy
+  #  default: true
+  - id: features_undo
+    label: Feature Undo
+    kind:
+      type: bool
+    help: Enable undo via per-turn git ghost snapshots
+    pointer: /tools/config/codex/features/undo
+    default: true
+  - id: features_shell_snapshot
+    label: Feature Shell Snapshot
+    kind:
+      type: bool
+    help: Enable shell snapshot feature. Default=false.
+    pointer: /tools/config/codex/features/shell_snapshot
+    default: false
+  - id: profile_deep_review_model
+    label: Profile Deep Review Model
+    kind:
+      type: enum
+      options: [gpt-5.2-codex, gpt-5.2, gpt-5.1-codex-max, gpt-5.1-codex-mini, gpt-5.1-codex, gpt-5.1, gpt-5-codex, gpt-5-codex-mini, gpt-5]
+    help: Model for the deep-review profile.
+    pointer: /tools/config/codex/profiles/deep-review/model
+    default: "gpt-5.2-codex"
+  - id: profile_deep_review_model_reasoning_effort
+    label: Profile Deep Review Reasoning
+    kind:
+      type: enum
+      options: [low, medium, high]
+    help: Reasoning effort for deep-review profile.
+    pointer: /tools/config/codex/profiles/deep-review/model_reasoning_effort
+    default: "medium"
+  - id: profile_deep_review_approval_policy
+    label: Profile Deep Review Approval
+    kind:
+      type: enum
+      options: [never, on-request, on-failure, untrusted]
+    help: Approval policy for deep-review profile.
+    pointer: /tools/config/codex/profiles/deep-review/approval_policy
+    default: "never"
+  - id: rules_enabled
+    label: Rules
+    kind:
+      type: bool
+    help: Generate AGENTS.md when enabled.
+    pointer: /tools/config/codex/rules_enabled
+    default: true
+  - id: skills
+    label: Skills
+    kind:
+      type: action
+      action: open_skills
+      target_pointer: /tools/config/codex/skills
+    help: Open Codex skills selector.
+doctor:
+  - kind: which
+    value: codex
+    severity: error

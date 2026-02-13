@@ -1,0 +1,19 @@
+{
+  "lot": "Test Lot",
+  "version": "1.0",
+  "generated_at": "2026-02-05",
+  "timezone": "UTC",
+  "priority_mapping": {
+    "p0": "P0"
+  },
+  "tasks": [
+    {
+      "id": "TASK-ONLY",
+      "title": "Single task",
+      "state": "todo",
+      "priority": "p0",
+      "dependencies": [],
+      "exclusive_resources": []
+    }
+  ]
+}

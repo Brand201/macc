@@ -1,0 +1,40 @@
+{
+	"lot": "Lot 1 — Infrastructure (Foundation)",
+	"version": "1.0",
+	"generated_at": "2026-01-20",
+	"timezone": "Europe/Paris",
+	"priority_mapping": {
+		"0": "P0 / This task should not be done in parallel with another.",
+		"1": "P1 / Must-have for MVP",
+		"2": "P2 / Should-have for MVP",
+		"4": "P3 / Nice-to-have (MVP+) or preparatory",
+		"5": "P4 / Lowest priority / can defer"
+	},
+	"assumptions": [
+		"Target is a 3-node Kubernetes cluster (NODE1/NODE2/NODE3) as per Lot 1 prerequisites. A 4th worker node is optional and out of scope for Lot 1 unless explicitly enabled.",
+		"Bootstrap is executed on NODE1 and orchestrates actions on NODE2/NODE3 over SSH with non-interactive sudo.",
+		"Infrastructure is deployed using GitOps (Argo CD) with an 'app-of-apps' root application.",
+		"All tasks aim to be small enough to complete in < 1 day by a single AI agent."
+	],
+	"tasks": [
+		{
+			"id": "L1-INFRA-006",
+			"title": "Create monorepo infrastructure layout and conventions",
+			"category": "repo-structure",
+			"description": "Problem/Goal: The infrastructure code needs a predictable repository structure so the bootstrap script and ArgoCD app-of-apps can reference manifests deterministically.\nKey actions: Define directories, naming conventions, and required baseline files (root Argo application, manifests folders, scripts folder).\nOut of scope: Implementing application microservices; only infra scaffolding.\nSuccess criteria: A new clone of the repo contains the expected infra paths and placeholder manifests referenced by bootstrap (e.g., infra/apps/root-application.yaml).",
+			"objective": "Create a clear, stable infra directory layout aligned with GitOps (Argo CD) and bootstrap expectations.",
+			"result": "Repo contains: /infra/apps/root-application.yaml, /infra/manifests/** (cert-manager, metallb, etc.), /scripts/bootstrap.sh (or equivalent), and /docs/infra/README.md with usage notes. Paths match what automation will apply.",
+			"steps": [
+				"Create directories: infra/apps, infra/manifests, infra/charts (optional), scripts, docs/infra.",
+				"Add infra/apps/root-application.yaml placeholder with ArgoCD Application resource (app-of-apps pattern).",
+				"Create infra/manifests subfolders: cert-manager, metallb, secrets, postgres, minio, observability.",
+				"Add a minimal docs/infra/README.md explaining intent and file locations.",
+				"Ensure paths used later by bootstrap are stable and documented."
+			],
+			"notes": "Must align with the bootstrap applying infra/apps/root-application.yaml.",
+			"exclusive_resources": ["deps-lockfile"],
+			"dependencies": ["L1-INFRA-001", "L1-INFRA-005"],
+			"priority": "0"
+		}
+	]
+}

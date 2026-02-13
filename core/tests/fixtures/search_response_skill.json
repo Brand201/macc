@@ -1,0 +1,19 @@
+{
+  "items": [
+    {
+      "id": "skill-1",
+      "name": "Skill 1",
+      "description": "Desc 1",
+      "tags": ["tag1"],
+      "selector": {
+        "subpath": "path/1"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://example.com/repo.git",
+        "ref": "main",
+        "subpaths": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+[package]
+name = "macc-adapter-codex"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+inventory = "0.3"
+macc-core = { path = "../../core" }
+macc-adapter-shared = { path = "../shared" }
+toml = "0.8"
+serde_json = "1.0.149"

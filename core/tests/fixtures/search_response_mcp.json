@@ -1,0 +1,20 @@
+{
+  "items": [
+    {
+      "id": "mcp-1",
+      "name": "MCP 1",
+      "description": "Desc 1",
+      "tags": ["tag1"],
+      "selector": {
+        "subpath": "path/1"
+      },
+      "source": {
+        "kind": "http",
+        "url": "https://example.com/file.zip",
+        "ref": "",
+        "checksum": "sha256:abc",
+        "subpaths": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,595 @@
+{
+	"lot": "Lot 2 — MACC v0.2 (Full TUI + Ralph + MCP Templates + Consented Merges)",
+	"version": "0.2",
+	"generated_at": "2026-01-30",
+	"timezone": "Europe/Paris",
+	"priority_mapping": {
+		"1": "P0 / Must-have for v0.2",
+		"2": "P1 / Should-have for v0.2",
+		"4": "P2 / Nice-to-have / preparatory",
+		"5": "P3 / Lowest priority / can defer"
+	},
+	"assumptions": [
+		"v0.1 already provides a working CLI with project-level apply/planning (no TUI), and at least one adapter (Claude) can render project files.",
+		"MACC is implemented in Rust (stable) and uses ratatui + crossterm for the TUI.",
+		"User-level file writes are never performed without explicit confirmation; backups are created and writes are atomic.",
+		"MCP templates never contain secrets; values are placeholders using environment variable syntax where applicable.",
+		"All tasks aim to be small enough to complete in < 1 day by a single AI agent."
+	],
+	"tasks": [
+		{
+			"id": "L2-PLAN-001",
+			"title": "Define v0.2 acceptance criteria and in-repo checklist",
+			"category": "planning",
+			"description": "Problem/Objective: v0.2 adds a TUI flow, MCP templates, consented merges, and ralph automation. Without a crisp checklist, implementation will drift.\nMain Features: Create a single, versioned checklist (done-when) for v0.2.\nScope/Boundaries: Do not implement any runtime behavior; documentation only.\nSuccess Criteria: A `docs/v0.2-checklist.md` exists and is referenced from README; items map to concrete commands and expected files.",
+			"objective": "Create a single source of truth for what 'v0.2 done' means so AI agents can work independently.",
+			"result": "A new file `docs/v0.2-checklist.md` enumerates: TUI screens, consent rules, backup locations, MCP output files, and ralph script behavior; it references exact commands to verify.",
+			"steps": [
+				"Create `docs/v0.2-checklist.md` with sections: TUI, Apply/Preview, User-level merges, MCP, Ralph, Tests, Docs.",
+				"For each section, define: command to run, expected filesystem outputs, and success assertions.",
+				"Add link to the checklist in `README.md` (or `docs/README.md`)."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "Keep it short and executable (like a QA checklist)."
+		},
+		{
+			"id": "L2-TUI-001",
+			"title": "Add ratatui TUI binary target with minimal event loop",
+			"category": "tui-foundation",
+			"description": "Problem/Objective: MACC needs an interactive TUI entry point; currently only CLI flows exist.\nMain Features: Add a `macc tui` command (or separate binary target) that opens a terminal UI and exits cleanly.\nScope/Boundaries: No multi-screen navigation yet; just a single placeholder view.\nSuccess Criteria: Running `macc tui` opens a screen, handles resize, and quits on `q` or `Esc` without leaving terminal in a broken state.",
+			"objective": "Create the smallest possible TUI shell that can be iterated on safely.",
+			"result": "A runnable `macc tui` command exists; it renders a placeholder screen and restores terminal state on exit (even on panic).",
+			"steps": [
+				"Add dependencies `ratatui` and `crossterm` (and any minimal helpers).",
+				"Implement terminal init/restore (raw mode, alternate screen) with RAII guard.",
+				"Implement an event loop that handles: key press, tick, resize.",
+				"Render a placeholder frame with app title and 'Press q to quit'.",
+				"Add a smoke test plan in `docs/v0.2-checklist.md`."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Must ensure terminal cleanup via Drop/guard."
+		},
+		{
+			"id": "L2-TUI-002",
+			"title": "Create TUI screen router and shared app state model",
+			"category": "tui-foundation",
+			"description": "Problem/Objective: v0.2 needs multiple screens (settings, skills, MCP, preview/apply). Without a router/state model, screens will become tightly coupled.\nMain Features: Define `Screen` enum + navigation actions; shared `AppState` containing loaded config and selections.\nScope/Boundaries: Do not implement any specific screen UI yet.\nSuccess Criteria: The TUI can switch between two placeholder screens (e.g., Home ↔ About) using keyboard shortcuts, with state persisted across screens.",
+			"objective": "Provide a scalable architecture so adding a new tool screen is mostly additive.",
+			"result": "A `tui` module with `AppState`, `Screen`, and a small navigation reducer exists; it supports pushing/popping screens and persists selection state.",
+			"steps": [
+				"Create `tui/state.rs` with `AppState` (loaded config, working copy, errors, notices).",
+				"Create `tui/screen.rs` with `Screen` enum and per-screen view/controller traits (or match-based handlers).",
+				"Implement navigation actions: Next/Prev, Push/Pop, GoTo.",
+				"Add two placeholder screens to validate navigation plumbing.",
+				"Document keybindings for navigation in code comments (English)."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Keep the boundary clean: screens render based on state; they emit actions/events."
+		},
+		{
+			"id": "L2-CONFIG-001",
+			"title": "Load existing project config into TUI state on startup",
+			"category": "config",
+			"description": "Problem/Objective: When TUI starts, it must reflect the project's existing `.macc/macc.yaml` so the UI is not empty by default.\nMain Features: Detect repo root, locate `.macc/macc.yaml`, parse and populate `AppState`.\nScope/Boundaries: Do not edit files; read-only.\nSuccess Criteria: If `.macc/macc.yaml` exists, TUI shows current enabled tools and selections; if missing, a clear error banner is shown with recovery instructions.",
+			"objective": "Ensure the TUI is driven by the real project configuration and supports returning users.",
+			"result": "TUI boot loads `.macc/macc.yaml` into `AppState.working_config` and sets default screen based on availability (e.g., Home with warning if config missing).",
+			"steps": [
+				"Implement repo-root detection (reuse existing CLI logic if present).",
+				"Load `.macc/macc.yaml` (or configured path), parse into canonical config struct.",
+				"Populate `AppState` with both original and working copy config.",
+				"If file missing/invalid: set `AppState.error` with actionable text.",
+				"Add unit tests: valid config, missing file, invalid YAML."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "This matches the requirement: show existing project config at TUI launch."
+		},
+		{
+			"id": "L2-CONFIG-002",
+			"title": "Persist TUI changes back to `.macc/macc.yaml` deterministically",
+			"category": "config",
+			"description": "Problem/Objective: After user changes selections in TUI and hits Apply, the canonical config must be updated.\nMain Features: Serialize working config to YAML with stable ordering; write atomically.\nScope/Boundaries: Do not apply tool artifacts yet; only write `.macc/macc.yaml`.\nSuccess Criteria: After saving, re-opening TUI shows identical config; git diff is minimal and deterministic.",
+			"objective": "Make the canonical config the single source of truth for future apply runs.",
+			"result": "A `save_config()` writes `.macc/macc.yaml` atomically and deterministically; repeated saves produce byte-identical output if no changes.",
+			"steps": [
+				"Define YAML serialization rules (field order, indentation, newline).",
+				"Implement atomic write: write temp file then rename; keep permissions reasonable.",
+				"Only write when content changed (no noisy churn).",
+				"Add unit test: serialize->parse->serialize idempotence (golden string).",
+				"Add failure handling: surface error in TUI status banner."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Reuse existing atomic write helper if already present."
+		},
+		{
+			"id": "L2-TUI-003",
+			"title": "Implement 'Tools' screen to enable/disable tools in config",
+			"category": "tui-screens",
+			"description": "Problem/Objective: Users need to toggle which tools (Claude/Codex/Gemini) are enabled from one place.\nMain Features: List tools; toggle enabled; show basic status (configured vs missing).\nScope/Boundaries: No installation of tools; no downloads.\nSuccess Criteria: Toggling a tool updates working config; saving persists it; navigation to tool-specific screens is enabled only when tool is enabled.",
+			"objective": "Provide the entry screen for configuring which AI tools MACC manages.",
+			"result": "A Tools screen renders available tools with toggles and updates `working_config.tools.*.enabled` fields.",
+			"steps": [
+				"Define a `ToolId` list (claude, codex, gemini) from tool registry.",
+				"Render a selectable list with checkbox/toggle per tool.",
+				"On toggle: mutate `AppState.working_config`.",
+				"Disable tool-specific navigation when tool not enabled.",
+				"Add a small help footer: keys to toggle, back, next."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Must be easy to extend when adding a new tool."
+		},
+		{
+			"id": "L2-TUI-004",
+			"title": "Implement Claude Settings screen (model/language/permissions preset)",
+			"category": "tui-screens",
+			"description": "Problem/Objective: Claude configuration must be editable via TUI in v0.2 (model, language, permissions presets).\nMain Features: Form inputs for model alias, language, permissions preset selection.\nScope/Boundaries: Do not write secrets; do not touch user-level files.\nSuccess Criteria: Editing values updates working config and affects preview of generated `.claude/settings.json`.",
+			"objective": "Enable configuring core Claude settings via the TUI.",
+			"result": "A Claude Settings screen edits: model alias, language, and permissions preset; these flow into the planning/preview pipeline.",
+			"steps": [
+				"Add form widgets for model (enum) and language (enum/string).",
+				"Add permissions preset list (e.g., safe/dev/strict) mapped to allow/deny templates.",
+				"Update `working_config.tools.claude` fields on change.",
+				"Validate inputs and show inline errors.",
+				"Add unit tests for reducer logic (input -> config)."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Claude plan lists this as a required screen."
+		},
+		{
+			"id": "L2-TUI-005",
+			"title": "Implement Skills selection screen (Claude) backed by a built-in catalog",
+			"category": "tui-screens",
+			"description": "Problem/Objective: v0.2 requires selecting which skills to generate for Claude.\nMain Features: List skills with description; multi-select; persist into config.\nScope/Boundaries: No remote downloads; built-in skills only.\nSuccess Criteria: Selecting skills updates `working_config.tools.claude.skills`; preview/apply will generate only selected skills.",
+			"objective": "Let users choose which Claude skills are generated for the repo.",
+			"result": "A Skills screen supports multi-select and stores chosen skills into config; selection is reflected in planning output.",
+			"steps": [
+				"Define a minimal built-in Claude skills catalog (id, name, description).",
+				"Render multi-select list with description panel.",
+				"Update config list on toggle; maintain stable ordering (sort by id).",
+				"Add Select all / none shortcuts (optional).",
+				"Add unit tests: toggling selection produces expected config."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "External catalogs can be added later."
+		},
+		{
+			"id": "L2-TUI-006",
+			"title": "Implement Agents selection screen (Claude)",
+			"category": "tui-screens",
+			"description": "Problem/Objective: v0.2 requires selecting which agents/sub-agents to generate for Claude.\nMain Features: Multi-select agents; show purpose; persist to config.\nScope/Boundaries: Do not generate files in this task.\nSuccess Criteria: Selected agents list is stored in config and influences preview/apply outputs for `.claude/agents/*`.",
+			"objective": "Expose Claude agent generation selection in TUI.",
+			"result": "An Agents screen multi-selects agents and updates config, ready for planning/rendering.",
+			"steps": [
+				"Define minimal built-in agents catalog (id, name, description).",
+				"Render list + description panel; toggle selection.",
+				"Update `working_config.tools.claude.agents` on change.",
+				"Ensure stable ordering (sort by id).",
+				"Add unit tests for selection reducer."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "Priority 2 because skills/settings are higher impact initially."
+		},
+		{
+			"id": "L2-TUI-007",
+			"title": "Implement MCP Servers selection screen (tool-agnostic list)",
+			"category": "tui-screens",
+			"description": "Problem/Objective: v0.2 includes MCP templates; users must pick which MCP servers are desired.\nMain Features: List MCP server templates, select/deselect, show auth notes, mark requires secret.\nScope/Boundaries: Do not ask for or store secrets.\nSuccess Criteria: Selected MCP servers are stored in canonical config and appear in preview for `.mcp.json` (and tool-specific settings where supported).",
+			"objective": "Allow selection of MCP servers in a central TUI screen.",
+			"result": "An MCP selection screen updates config selection and is reflected in planning output.",
+			"steps": [
+				"Define MCP server template metadata (id, purpose, auth type, env var placeholders).",
+				"Render list with selection toggle; show details panel.",
+				"Persist selected server IDs into config.",
+				"Display warning badge for servers requiring API keys.",
+				"Add unit tests for selection persistence."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "MCP templates are explicitly called out for v0.2."
+		},
+		{
+			"id": "L2-PLAN-002",
+			"title": "Expose a plan API returning deterministic file operations for preview",
+			"category": "apply-planning",
+			"description": "Problem/Objective: The TUI needs a preview step listing what files would be written/merged before applying.\nMain Features: A pure function (or service) that takes resolved config and returns a deterministic list of file operations + content.\nScope/Boundaries: No filesystem writes; no user prompts.\nSuccess Criteria: Given a config, plan output is deterministic and includes enough data to render file lists and diffs.",
+			"objective": "Make the apply engine consumable by both CLI and TUI as a pure planning layer.",
+			"result": "A `plan_operations(resolved_config) -> Vec<PlannedOp>` exists and can be called from TUI to preview changes.",
+			"steps": [
+				"Define `PlannedOp`: target path, scope (project/user), kind (write/merge/delete), before/after (optional), metadata (backup required, consent required).",
+				"Refactor apply logic so content rendering happens in planning, not only in writing.",
+				"Ensure planning is deterministic (stable ordering by path and op type).",
+				"Add unit tests for a minimal config: plan contains expected files.",
+				"Document the API for other tools/screens."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Needed for Preview & Apply screens."
+		},
+		{
+			"id": "L2-TUI-008",
+			"title": "Implement Preview screen: list planned file operations (no diff view yet)",
+			"category": "tui-screens",
+			"description": "Problem/Objective: Users must see what will change before applying.\nMain Features: Render a scrollable list of planned ops (path + scope + action), with counts.\nScope/Boundaries: Do not show file diffs yet; do not apply.\nSuccess Criteria: Preview screen shows a stable list; selecting an item shows basic metadata (scope, backup, consent).",
+			"objective": "Provide an understandable preview of planned changes.",
+			"result": "Preview screen displays planned operations and summarizes counts (project writes, user merges, etc.).",
+			"steps": [
+				"Call the plan API when entering Preview screen (cache in state).",
+				"Render list with columns: action, scope, path.",
+				"Add a details panel showing op metadata (requires consent, backup placeholders).",
+				"Add Refresh plan keybinding to recompute after config changes.",
+				"Handle errors gracefully (plan failure displayed in banner)."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Diff view comes in the next task."
+		},
+		{
+			"id": "L2-DIFF-001",
+			"title": "Implement diff generator for text and JSON planned operations",
+			"category": "diff",
+			"description": "Problem/Objective: Preview is more useful if users can inspect diffs.\nMain Features: Unified diff for text; JSON pretty-print then diff; size caps.\nScope/Boundaries: Do not implement a full pager; just produce diff strings.\nSuccess Criteria: For a planned op with before/after, diff generator produces a stable, readable diff; huge diffs are truncated safely.",
+			"objective": "Enable TUI and CLI to present meaningful change previews.",
+			"result": "A diff module can generate (and truncate) diffs for planned operations, including JSON-aware diffing.",
+			"steps": [
+				"Implement `render_diff(op) -> DiffView` (text/json/unsupported).",
+				"Pretty-print JSON with stable ordering before diff.",
+				"Implement truncation policy (max bytes/lines) with a clear truncated marker.",
+				"Add unit tests: changed content -> diff contains expected hunks.",
+				"Ensure no secrets are printed (apply redaction if available)."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "Integrate with any existing diff work from v0.1 if present."
+		},
+		{
+			"id": "L2-TUI-009",
+			"title": "Extend Preview to show per-file diff for selected operation",
+			"category": "tui-screens",
+			"description": "Problem/Objective: Users need to inspect specific file diffs before consenting to apply.\nMain Features: When selecting an op, show its diff (with scrolling) using diff generator.\nScope/Boundaries: No syntax highlighting required.\nSuccess Criteria: Selecting an item shows a diff pane that can scroll; switching items updates diff; large diffs show a truncation notice.",
+			"objective": "Allow per-file review prior to applying changes.",
+			"result": "Preview screen includes a diff panel for the selected planned operation with scroll support.",
+			"steps": [
+				"Add diff panel UI and scrolling state (per selected op).",
+				"Call diff generator lazily (on selection) and cache results.",
+				"Add keybindings for scrolling (PgUp/PgDn or arrows).",
+				"Render truncation notice if diff is truncated.",
+				"Add minimal integration test for select op -> diff rendered."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "Keep UI performance acceptable with caching."
+		},
+		{
+			"id": "L2-USER-001",
+			"title": "Flag user-level operations as consent-required in plan output",
+			"category": "consent",
+			"description": "Problem/Objective: v0.2 requires consent-gated user-level merges/writes; TUI must know what requires confirmation.\nMain Features: Planning tags operations as project vs user and sets consent_required=true for user scope.\nScope/Boundaries: Do not implement prompting or writes.\nSuccess Criteria: Plan output clearly distinguishes project vs user ops and flags those requiring explicit consent.",
+			"objective": "Make consent requirements explicit and machine-readable for UI and CLI.",
+			"result": "Planned operations include scope + consent metadata used by Preview & Apply screens.",
+			"steps": [
+				"Extend PlannedOp with scope and consent_required fields.",
+				"Ensure all user-scope targets set consent_required=true by default.",
+				"Ensure project-scope ops set consent_required=false.",
+				"Add unit tests: user merge ops flagged correctly.",
+				"Update any existing plan serialization or debug output."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Never write user-level files without explicit confirmation."
+		},
+		{
+			"id": "L2-BACKUP-001",
+			"title": "Implement timestamped backup manager for user-level changes",
+			"category": "backups",
+			"description": "Problem/Objective: Before modifying user-level files, MACC must create backups.\nMain Features: Compute backup root, copy originals, keep mapping for restore; timestamped folder naming.\nScope/Boundaries: No restore command yet.\nSuccess Criteria: When applying user-level ops, originals are copied to ~/.macc/backups/<timestamp>/... before modifications.",
+			"objective": "Provide safety guarantees for user-level merges and reduce fear of trying MACC.",
+			"result": "A backup manager creates backup sets for user-level operations and returns backup paths for UI display.",
+			"steps": [
+				"Define backup root path (e.g., ~/.macc/backups/<timestamp>/).",
+				"Implement directory creation and file copy preserving permissions where feasible.",
+				"Return a report: which files were backed up and where.",
+				"Add unit tests using temp dirs (copy exists, content matches).",
+				"Ensure backup step is invoked before any user-level write/merge."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Core safety feature."
+		},
+		{
+			"id": "L2-IO-001",
+			"title": "Ensure atomic writes and 'replace only if changed' for all file writes",
+			"category": "io-safety",
+			"description": "Problem/Objective: Applying config should not partially write files or cause unnecessary churn.\nMain Features: Atomic write helper (temp + rename), content compare to skip unchanged writes.\nScope/Boundaries: Do not implement fancy locking.\nSuccess Criteria: Re-running apply with no config changes results in zero file modifications; partial write is impossible on crash between temp and rename.",
+			"objective": "Guarantee safe, idempotent file writes for both project and user scopes.",
+			"result": "All write operations use a shared safe write helper supporting atomic writes and unchanged-skip behavior.",
+			"steps": [
+				"Implement (or reuse) atomic_write(path, bytes) with temp file in same directory.",
+				"Implement write_if_changed(path, bytes) that compares existing content first.",
+				"Update apply code paths to use these helpers for every write.",
+				"Add unit tests: unchanged -> no rewrite; changed -> rewrite.",
+				"Document behavior in docs/v0.2-checklist.md."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Applies to both project and user scope outputs."
+		},
+		{
+			"id": "L2-MERGE-001",
+			"title": "Implement JSON merge for Claude user config (~/.claude.json) MCP servers",
+			"category": "user-merges",
+			"description": "Problem/Objective: Users may want MCP servers configured at user level; MACC must merge templates without deleting existing servers.\nMain Features: Read existing ~/.claude.json, merge MCP servers map, preserve unknown keys, write with backup+consent.\nScope/Boundaries: Do not write secrets; do not modify unrelated sections.\nSuccess Criteria: Existing user config remains intact; new MCP entries are added only if missing; backups are created; output JSON is stable.",
+			"objective": "Safely add MCP server entries to Claude user config while preserving user customizations.",
+			"result": "A merge function produces a merged JSON for ~/.claude.json and is applied only with explicit consent, with a backup created first.",
+			"steps": [
+				"Define merge rules: preserve existing keys; add missing MCP servers; never overwrite existing server definitions unless explicitly configured.",
+				"Implement parser tolerant to formatting; serialize with stable formatting (pretty).",
+				"Integrate backup manager for the user file.",
+				"Add unit tests: existing servers preserved; missing added; unrelated keys preserved.",
+				"Add error path: invalid JSON -> do not write; report actionable message."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Matches MCP rule: preserve existing user servers."
+		},
+		{
+			"id": "L2-MERGE-002",
+			"title": "Implement minimal user-level merge for Gemini settings MCP servers (opt-in)",
+			"category": "user-merges",
+			"description": "Problem/Objective: Some setups use user-level Gemini settings; provide minimal opt-in merge support with backups+consent.\nMain Features: Merge MCP server entries into ~/.gemini/settings.json (only mcpServers section) with backup+consent.\nScope/Boundaries: Opt-in only; do not touch other Gemini settings.\nSuccess Criteria: When enabled, the merge adds missing mcpServers entries and preserves existing settings; backup is created first.",
+			"objective": "Provide a safe, opt-in user-level merge path for Gemini MCP servers.",
+			"result": "A merge function exists and is gated behind explicit consent; it only touches mcpServers and preserves all other settings.",
+			"steps": [
+				"Add config flag for enabling Gemini user merge (default off).",
+				"Implement merge logic for mcpServers map only.",
+				"Integrate backup manager and atomic write.",
+				"Add tests: preserve existing, add missing, do not override by default.",
+				"Ensure secrets remain placeholders only."
+			],
+			"priority": 4,
+			"passes": true,
+			"notes": "Defer if scope/risk increases."
+		},
+		{
+			"id": "L2-TUI-010",
+			"title": "Implement Apply confirmation flow in TUI (project vs user scope consent)",
+			"category": "tui-apply",
+			"description": "Problem/Objective: Users must explicitly approve user-level changes; project-level changes may be applied after review.\nMain Features: Confirm dialog summarizing changes; separate consent for user-level operations; abort option.\nScope/Boundaries: No non-interactive flags.\nSuccess Criteria: TUI blocks applying if user-level ops exist and user has not confirmed; after confirmation, apply runs and reports success/errors.",
+			"objective": "Make applying changes safe and aligned with consent policy.",
+			"result": "An Apply flow exists in TUI that requires explicit user confirmation for any user-scope operations before proceeding.",
+			"steps": [
+				"Detect if planned ops include user-scope changes.",
+				"Render summary: counts by scope + backup location preview.",
+				"Require explicit consent action for user-scope ops (e.g., confirm key or type YES).",
+				"If declined: abort apply (or apply only project ops, but document choice).",
+				"Persist consent decision in session state for this run only."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Never write user-level files without explicit confirmation."
+		},
+		{
+			"id": "L2-APPLY-001",
+			"title": "Execute apply from TUI using planned operations and safe IO primitives",
+			"category": "tui-apply",
+			"description": "Problem/Objective: The TUI must apply planned changes after preview and consent.\nMain Features: Apply pipeline executing planned ops (write/merge) with backups and atomic writes; show progress.\nScope/Boundaries: No parallelization.\nSuccess Criteria: Applying from TUI produces the same outputs as CLI apply; on errors, it stops safely and reports which op failed.",
+			"objective": "Connect the new TUI flow to the existing apply engine in a safe, deterministic way.",
+			"result": "TUI can run apply and show a final summary: files written, merges performed, backups created, and any errors.",
+			"steps": [
+				"Implement apply_operations(ops) that executes in deterministic order.",
+				"For user-scope ops: enforce consent check before starting.",
+				"Create backups for user-scope ops prior to first write/merge.",
+				"Use atomic write / write-if-changed for all writes.",
+				"Render progress in TUI (current op / total) and final summary screen."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Prefer reusing existing CLI apply execution logic."
+		},
+		{
+			"id": "L2-MCP-001",
+			"title": "Add canonical MCP templates to config schema (no secrets)",
+			"category": "mcp",
+			"description": "Problem/Objective: MACC needs a canonical set of MCP server templates that can be selected and rendered.\nMain Features: Define schema entries for MCP servers (id, command, args, env placeholders, auth notes).\nScope/Boundaries: No network calls; no secret storage.\nSuccess Criteria: Config can represent selected MCP servers and their template definitions; YAML validates against schema.",
+			"objective": "Make MCP server templates first-class in MACC's canonical configuration.",
+			"result": "A structured MCP template list exists in code and config schema; selections reference template IDs.",
+			"steps": [
+				"Define MCP template struct in Rust (id, title, description, command, args, env_placeholders, auth).",
+				"Add schema validation rules (required fields, unique ids).",
+				"Add at least the servers listed in MACC.md using placeholder env vars only.",
+				"Add a unit test ensuring template ids are unique and stable.",
+				"Document no-secrets policy in the MCP schema docs."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "MCP templates are explicitly called out for v0.2."
+		},
+		{
+			"id": "L2-MCP-002",
+			"title": "Render project-level .mcp.json from selected MCP templates",
+			"category": "mcp",
+			"description": "Problem/Objective: v0.2 calls for MCP template generation in .mcp.json for project scope.\nMain Features: Generate .mcp.json with selected servers and env placeholders.\nScope/Boundaries: No secrets; do not auto-enable anything outside repo.\nSuccess Criteria: Running apply produces .mcp.json containing exactly the selected MCP servers; re-running is idempotent.",
+			"objective": "Provide a project-scoped MCP configuration file that tools can reference safely.",
+			"result": ".mcp.json is generated deterministically from selected MCP templates with placeholders and no secrets.",
+			"steps": [
+				"Define .mcp.json output schema and formatting.",
+				"Implement renderer from selected template ids -> JSON structure.",
+				"Ensure deterministic ordering of servers and keys.",
+				"Add unit tests for golden output for a sample selection.",
+				"Add .mcp.json to preview/apply plan when MCP selection is non-empty."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Core deliverable for v0.2."
+		},
+		{
+			"id": "L2-MCP-003",
+			"title": "Integrate .mcp.json into Claude apply outputs (project scope)",
+			"category": "mcp",
+			"description": "Problem/Objective: Claude workflows may need .mcp.json present in repo.\nMain Features: Include .mcp.json generation when Claude tool is enabled and MCP servers selected.\nScope/Boundaries: Do not require Claude CLI; do not modify ~/.claude.json here.\nSuccess Criteria: With Claude enabled and MCP servers selected, plan includes .mcp.json and apply writes it.",
+			"objective": "Ensure .mcp.json is part of the Claude project configuration output.",
+			"result": "Claude apply output includes .mcp.json when MCP selection is non-empty.",
+			"steps": [
+				"Update planning logic: if MCP selection non-empty and Claude enabled, add project op for .mcp.json.",
+				"Ensure .mcp.json appears in preview list and diff view.",
+				"Add an integration test verifying .mcp.json appears after apply in a temp repo.",
+				"Document how Claude should reference .mcp.json (if applicable) in generated docs.",
+				"Keep behavior deterministic and idempotent."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "User-level merge is handled separately."
+		},
+		{
+			"id": "L2-MCP-004",
+			"title": "Render selected MCP servers into Gemini workspace settings (.gemini/settings.json)",
+			"category": "mcp",
+			"description": "Problem/Objective: Gemini CLI supports MCP servers in workspace settings. MACC should render templates (no secrets) when MCP servers are selected.\nMain Features: Add mcpServers section to generated .gemini/settings.json using placeholders.\nScope/Boundaries: Do not write real keys; only placeholders.\nSuccess Criteria: Apply generates .gemini/settings.json containing selected MCP servers under mcpServers with placeholder env vars.",
+			"objective": "Provide consistent MCP integration for Gemini workspace config.",
+			"result": "Gemini adapter includes MCP server templates in its workspace settings output when selected.",
+			"steps": [
+				"Update Gemini settings renderer to include mcpServers from selected templates.",
+				"Ensure keys and ordering are deterministic.",
+				"Add unit test: sample selection produces expected JSON snippet.",
+				"Ensure other Gemini defaults remain correct.",
+				"Document secret handling: user populates env vars separately."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "Gemini plan describes rendering MCP templates into workspace settings."
+		},
+		{
+			"id": "L2-RALPH-001",
+			"title": "Define ralph workflow requirements and config knobs",
+			"category": "ralph",
+			"description": "Problem/Objective: Ralph automation requires a predictable sequence of steps and inputs.\nMain Features: Specify loop sequence, required files (memory-bank/, progress.md), and configurable knobs (N iterations, tool).\nScope/Boundaries: No script execution; docs + config schema only.\nSuccess Criteria: A doc page and config schema section define ralph behavior unambiguously.",
+			"objective": "Make ralph automation reproducible and configurable.",
+			"result": "A documented ralph workflow spec exists and config schema includes ralph options (iterations default, branch/worktree naming).",
+			"steps": [
+				"Add docs/ralph.md describing the exact sequence from MACC.md.",
+				"Add config schema section automation.ralph with fields: enabled, iterations_default, branch_name, stop_on_failure.",
+				"Ensure docs mention prerequisites and safety notes.",
+				"Add references in README and v0.2 checklist.",
+				"Keep spec tool-agnostic where possible."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "Ralph is explicitly called out in the v0.2 roadmap."
+		},
+		{
+			"id": "L2-RALPH-002",
+			"title": "Generate scripts/ralph.sh from template during apply (project scope)",
+			"category": "ralph",
+			"description": "Problem/Objective: v0.2 calls for scripts/ralph.sh <n> automation.\nMain Features: Generate a safe script that runs the ralph sequence for a chosen tool and worktree/branch strategy.\nScope/Boundaries: Do not run the script automatically.\nSuccess Criteria: After apply, scripts/ralph.sh exists, is executable, and contains the documented sequence with placeholders where needed.",
+			"objective": "Ship ralph as a reproducible, versioned project script.",
+			"result": "scripts/ralph.sh is generated deterministically and documented; it follows the specified loop and exits on failure by default.",
+			"steps": [
+				"Create a script template with strict mode (set -euo pipefail).",
+				"Implement iteration loop with parameter <n> defaulting to config or 1.",
+				"Include tool invocation placeholders in a safe, commented way.",
+				"Mark script executable (chmod) on generation where OS allows.",
+				"Add integration test: apply generates the script; verify it is non-empty."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "Keep it conservative: no destructive git actions without clear user intent."
+		},
+		{
+			"id": "L2-TUI-011",
+			"title": "Add global help / keybindings overlay in TUI",
+			"category": "tui-polish",
+			"description": "Problem/Objective: Without discoverable controls, TUI will be hard to use.\nMain Features: A toggleable overlay that lists keybindings for the current screen and global keys.\nScope/Boundaries: No external docs rendering.\nSuccess Criteria: Pressing ? toggles a help overlay; it updates based on current screen.",
+			"objective": "Improve usability and reduce documentation dependency.",
+			"result": "A help overlay exists and is accessible from any screen; it lists global navigation keys and per-screen actions.",
+			"steps": [
+				"Define a Keymap struct and per-screen keybinding descriptions.",
+				"Implement overlay component rendering at highest z-order.",
+				"Bind ? to toggle; bind Esc to close overlay first if open.",
+				"Ensure overlay content fits common terminal sizes.",
+				"Add minimal tests for keymap generation (optional)."
+			],
+			"priority": 4,
+			"passes": true,
+			"notes": "Nice-to-have but improves adoption."
+		},
+		{
+			"id": "L2-DOCTOR-001",
+			"title": "Surface basic tool availability checks in TUI (Claude/Codex/Gemini)",
+			"category": "doctor",
+			"description": "Problem/Objective: The TUI should signal whether a tool binary is available to run.\nMain Features: Detect binaries on PATH and show status badges.\nScope/Boundaries: Do not install tools; no network.\nSuccess Criteria: Tools screen shows installed or missing for each tool based on PATH detection.",
+			"objective": "Give users immediate feedback about their environment.",
+			"result": "Tool availability checks exist and are displayed in TUI; missing tools show an actionable hint.",
+			"steps": [
+				"Implement which-style checks for claude, codex, gemini binaries (configurable names).",
+				"Expose results in AppState and refresh on demand.",
+				"Display status badges in Tools screen.",
+				"Add unit tests for detection wrapper (mockable).",
+				"Document in README: what binaries are expected."
+			],
+			"priority": 4,
+			"passes": true,
+			"notes": "Defer if v0.2 scope becomes too large."
+		},
+		{
+			"id": "L2-TEST-001",
+			"title": "Add unit tests for TUI reducers and config persistence",
+			"category": "testing",
+			"description": "Problem/Objective: TUI logic will regress easily without tests, especially around config read/write.\nMain Features: Test pure reducers and serialization; avoid terminal rendering tests.\nScope/Boundaries: Do not snapshot terminal frames.\nSuccess Criteria: Tests validate: toggling selections updates config correctly; saving config is idempotent.",
+			"objective": "Increase confidence while iterating quickly on TUI behavior.",
+			"result": "Unit tests cover: tool toggles, skills selection, agents selection, MCP selection, and YAML save idempotence.",
+			"steps": [
+				"Refactor screen logic so reducers are pure functions where possible.",
+				"Add tests using sample configs and expected outputs.",
+				"Add golden tests for YAML serialization stability.",
+				"Run tests in CI (or local script) and document command.",
+				"Keep tests deterministic (no timestamps in output)."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "Focus on correctness of state changes, not UI rendering."
+		},
+		{
+			"id": "L2-TEST-002",
+			"title": "Add integration test: apply with MCP selection produces .mcp.json",
+			"category": "testing",
+			"description": "Problem/Objective: v0.2 must guarantee that MCP selection results in correct outputs.\nMain Features: Create temp repo, write .macc/macc.yaml with MCP selection, run apply, assert outputs.\nScope/Boundaries: Do not require external binaries.\nSuccess Criteria: Test verifies .mcp.json exists and contains expected server keys and placeholders.",
+			"objective": "Validate core v0.2 MCP generation behavior in a robust way.",
+			"result": "An integration test runs and asserts generated .mcp.json content for a known selection.",
+			"steps": [
+				"Create a temporary repo fixture (or temp dir with minimal layout).",
+				"Write a minimal .macc/macc.yaml enabling a tool and selecting MCP servers.",
+				"Run apply logic to generate files.",
+				"Assert .mcp.json exists and matches expected JSON (or subset check).",
+				"Ensure cleanup and deterministic results."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "Covers a key roadmap deliverable."
+		},
+		{
+			"id": "L2-DOCS-001",
+			"title": "Update README with v0.2 usage (TUI, consent/backups, MCP, ralph)",
+			"category": "documentation",
+			"description": "Problem/Objective: v0.2 introduces new capabilities that users need to discover and understand safely.\nMain Features: Document how to run TUI, how consent/backups work, MCP template philosophy, and ralph usage.\nScope/Boundaries: Do not write marketing fluff; focus on actionable steps.\nSuccess Criteria: README includes commands and expected files; warns about user-level changes and where backups are stored.",
+			"objective": "Provide clear operator documentation for v0.2 features.",
+			"result": "README describes: macc tui flow, preview/apply, user-level consent prompts, backup paths, .mcp.json, and scripts/ralph.sh usage.",
+			"steps": [
+				"Add a v0.2 section in README with quick-start steps.",
+				"Document consent rule and backup locations (project + user).",
+				"Document MCP selection: no secrets, placeholders, env var setup guidance.",
+				"Document ralph prerequisites and how to run scripts/ralph.sh.",
+				"Cross-link to detailed docs pages (docs/ralph.md, docs/v0.2-checklist.md)."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "Docs are essential for safe adoption."
+		}
+	]
+}

@@ -1,0 +1,239 @@
+api_version: v1
+id: gemini
+display_name: Gemini
+description: Workspace settings for Gemini CLI.
+gitignore:
+  - .gemini/
+  - GEMINI.md
+  - .geminiignore
+performer:
+  runner: adapters/gemini/gemini.performer.sh
+  command: gemini
+  args: ["--model", "gemini-3-flash-preview", "--sandbox", "false", "--approval-mode", "auto_edit"]
+  prompt:
+    mode: arg
+    arg: "--prompt"
+  session:
+    enabled: true
+    scope: worktree
+    init_prompt: "Hello"
+    extract_regex: "([0-9a-fA-F]{8}-[0-9a-fA-F-]{27})"
+    discover:
+      command: bash
+      args: ["-lc", "gemini --list-sessions 2>/dev/null | grep '\\[.*\\]' | tail -n 1 | sed 's/.*\\[\\(.*\\)\\].*/\\1/'"]
+    resume:
+      command: gemini
+      args: ["--resume", "{session_id}", "--model", "gemini-3-flash-preview", "--sandbox", "false", "--approval-mode", "auto_edit"]
+  retry:
+    command: gemini
+    args: ["--model", "gemini-3-pro", "--sandbox", "false", "--approval-mode", "auto_edit"]
+defaults:
+  approval_mode: auto_edit
+  sandbox: false
+install:
+  confirm_message: "Gemini CLI install requires a Google account/API key. Continue?"
+  commands:
+    - command: npm
+      args: ["install", "-g", "@google/gemini-cli"]
+  post_install:
+    command: gemini
+    args: []
+fields:
+  - id: model
+    label: Model
+    kind:
+      type: enum
+      options: [auto-gemini-3, gemini-3-pro-preview, gemini-3-flash-preview, auto-gemini-2.5, gemini-2.5-pro, gemini-2.5-flash]
+    help: Gemini model preset for workspace settings.
+    pointer: /tools/config/gemini/model/name
+    default: auto-gemini-2.5
+  #- id: general_vim_mode
+  #  label: Vim Mode
+  #  kind:
+  #    type: bool
+  #  help: Enable Vim keybindings.
+  #  pointer: /tools/config/gemini/general/vimMode
+  #  default: true
+  #- id: general_preferred_editor
+  #  label: Preferred Editor
+  #  kind:
+  #    type: enum
+  #    options: [code, vim, undefined]
+  #  help: Preferred editor command (e.g., code, vim).
+  #  pointer: /tools/config/gemini/general/preferredEditor
+  #  default: code
+  #- id: general_session_retention_enabled
+  #  label: Session Retention
+  #  kind:
+  #    type: bool
+  #  help: Enable automatic session cleanup.
+  #  pointer: /tools/config/gemini/general/sessionRetention/enabled
+  #  default: true
+  #- id: general_session_retention_max_age
+  #  label: Session Retention Max Age
+  #  kind:
+  #    type: text
+  #  help: Maximum age of sessions to keep (e.g., “30d”, “7d”, “24h”, “1w”).
+  #  pointer: /tools/config/gemini/general/sessionRetention/maxAge
+  #  default: 30d
+  #- id: general_session_retention_max_count
+  #  label: Session Retention Max Count
+  #  kind:
+  #    type: number
+  #  help: "Alternative: Maximum number of sessions to keep (most recent)"
+  #  pointer: /tools/config/gemini/general/sessionRetention/maxCount
+  #  default: 100
+  #- id: general_session_retention_min_retention
+  #  label: Session Retention Min Retention
+  #  kind:
+  #    type: text
+  #  help: "Minimum retention period (safety limit, defaults to “1d”)"
+  #  pointer: /tools/config/gemini/general/sessionRetention/minRetention
+  #  default: "1d"
+  - id: tools_approvalMode
+    label: Tools approvalMode
+    kind:
+      type: enum
+      options: ["default", "auto_edit", "plan", "yolo"]
+    help: "The default approval mode for tool execution. ‘default’ prompts for approval, ‘auto_edit’ auto-approves edit tools, and ‘plan’ is read-only mode."
+    pointer: /tools/config/gemini/tools/approvalMode
+    default: "default"
+  #- id: tools_sandbox
+  #  label: Tools Sandbox
+  #  kind:
+  #    type: enum
+  #    options: ["true", "false", docker, podman]
+  #  help: Sandbox execution environment. Set to a boolean to enable or disable the sandbox, or provide a string path to a sandbox profile. (Accepts true, false, docker, podman, or a custom command string).
+  #  pointer: /tools/config/gemini/tools/sandbox
+  #  default: "false"
+  #- id: tools_discovery_command
+  #  label: Tools Discovery Command
+  #  kind:
+  #    type: text
+  #  help: Defines a custom shell command for discovering tools from your project.
+  #  pointer: /tools/config/gemini/tools/discoveryCommand
+  #  default: ""
+  #- id: tools_call_command
+  #  label: Tools Call Command
+  #  kind:
+  #    type: text
+  #  help: Command for tool invocation.
+  #  pointer: /tools/config/gemini/tools/callCommand
+  #  default: ""
+  #- id: tools_exclude
+  #  label: Tools Exclude
+  #  kind:
+  #    type: array
+  #  help: Tool names to exclude from discovery. (e.g., ["dangerous_tool", "file_deleter"]).
+  #  pointer: /tools/config/gemini/tools/exclude
+  #  default: []
+  #- id: telemetry_enabled
+  #  label: Telemetry Enabled
+  #  kind:
+  #    type: bool
+  #  help: Enable telemetry.
+  #  pointer: /tools/config/gemini/telemetry/enabled
+  #  default: true
+  #- id: telemetry_target
+  #  label: Telemetry Target
+  #  kind:
+  #    type: enum
+  #    options: [local, gcp]
+  #  help: Telemetry target (e.g., local).
+  #  pointer: /tools/config/gemini/telemetry/target
+  #  default: local
+  #- id: telemetry_otlp_endpoint
+  #  label: Telemetry OTLP Endpoint
+  #  kind:
+  #    type: text
+  #  help: OTLP endpoint URL.
+  #  pointer: /tools/config/gemini/telemetry/otlpEndpoint
+  #  default: http://localhost:4317
+  #- id: telemetry_log_prompts
+  #  label: Telemetry Log Prompts
+  #  kind:
+  #    type: bool
+  #  help: Log prompts in telemetry.
+  #  pointer: /tools/config/gemini/telemetry/logPrompts
+  #  default: false
+  #- id: model_max_session_turns
+  #  label: Model Max Session Turns
+  #  kind:
+  #    type: number
+  #  help: Maximum number of user/model/tool turns to keep in a session. -1 means unlimited.
+  #  pointer: /tools/config/gemini/model/maxSessionTurns
+  #  default: -1
+  #- id: model_summarize_tool_output
+  #  label: Summarize Tool Output
+  #  kind:
+  #    type: text
+  #  help: "Enables or disables summarization of tool output. Configure per-tool token budgets (for example {“run_shell_command”: {“tokenBudget”: 2000}}). Currently only the run_shell_command tool supports summarization."
+  #  pointer: /tools/config/gemini/model/summarizeToolOutput
+  #  default: "{\"run_shell_command\":{\"tokenBudget\":100}}"
+  - id: context_file_name
+    label: Context File Name
+    kind:
+      type: array
+    help:  The name of the context file or files to load into memory. Accepts either a single string or an array of strings. (e.g., ["CONTEXT.md", "GEMINI.md"]).
+    pointer: /tools/config/gemini/context/fileName
+    default: ["GEMINI.md"]
+  #- id: context_include_directories
+  #  label: Context Include Directories
+  #  kind:
+  #    type: array
+  #  help: Additional directories to include in the workspace context.
+  #  pointer: /tools/config/gemini/context/includeDirectories
+  #  default: ["path/to/dir1", "~/path/to/dir2", "../path/to/dir3"]
+  #- id: context_load_from_include_directories
+  #  label: Load From Include Directories
+  #  kind:
+  #    type: bool
+  #  help: Load context from include directories.
+  #  pointer: /tools/config/gemini/context/loadFromIncludeDirectories
+  #  default: true
+  #- id: context_respect_git_ignore
+  #  label: Respect Git Ignore
+  #  kind:
+  #    type: bool
+  #  help: Respect .gitignore when discovering context.
+  #  pointer: /tools/config/gemini/context/fileFiltering/respectGitIgnore
+  #  default: false
+  #- id: advanced_excluded_env_vars
+  #  label: Excluded Env Vars
+  #  kind:
+  #    type: array
+  #  help: Environment variables to exclude from project context.
+  #  pointer: /tools/config/gemini/advanced/excludedEnvVars
+  #  default: ["DEBUG", "DEBUG_MODE", "NODE_ENV"]
+  - id: skills
+    label: Skills
+    kind:
+      type: action
+      action: open_skills
+      target_pointer: /tools/config/gemini/skills
+    help: "Open Gemini skills selector: Agent Skills allow you to extend Gemini CLI with specialized expertise"
+  - id: mcp_servers
+    label: MCP Servers
+    kind:
+      type: action
+      action: open_mcp
+      target_pointer: /selections/mcp
+    help: "An MCP server is an application that exposes tools and resources to the Gemini CLI through the Model Context Protocol, allowing it to interact with external systems and data sources."
+  - id: user_mcp_merge
+    label: User MCP merge
+    kind:
+      type: bool
+    help: Opt-in user-level MCP merge (consent required).
+    pointer: /tools/config/gemini/user_mcp_merge
+    default: false
+  - id: privacy_usage_statistics_enabled
+    label: Usage Statistics
+    kind:
+      type: bool
+    help: You can opt out of usage statistics collection at any time.
+    pointer: /tools/config/gemini/privacy/usageStatisticsEnabled
+    default: true
+doctor:
+  - kind: which
+    value: gemini
+    severity: error

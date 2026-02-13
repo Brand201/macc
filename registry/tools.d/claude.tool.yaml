@@ -1,0 +1,81 @@
+api_version: v1
+id: claude
+display_name: Claude
+description: Project-level settings for Claude Code.
+gitignore:
+  - .claude/
+  - CLAUDE.md
+performer:
+  runner: adapters/claude/claude.performer.sh
+  command: claude
+  args: ["--output-format", "text"]
+  prompt:
+    mode: arg
+    arg: "-p"
+  session:
+    enabled: true
+    scope: worktree
+    init_prompt: "Bonjour"
+    id_strategy: generated
+    resume:
+      command: claude
+      args: ["--session-id", "{session_id}", "--output-format", "text"]
+  retry:
+    command: claude
+    args: ["--model", "opus", "--output-format", "text"]
+defaults:
+  model: sonnet
+install:
+  confirm_message: "Claude Code install requires an Anthropic account/API key. Continue?"
+  commands:
+    - command: npm
+      args: ["install", "-g", "@anthropic-ai/claude-code"]
+  post_install:
+    command: claude
+    args: []
+fields:
+  - id: model
+    label: Model
+    kind:
+      type: enum
+      options: [sonnet, opus, haiku]
+    help: Claude model alias (e.g., sonnet, opus).
+    pointer: /tools/config/claude/model
+  - id: language
+    label: Language
+    kind:
+      type: enum
+      options: [English, French, Spanish, German, Japanese]
+    help: Primary language for prompts and output.
+    pointer: /tools/config/claude/language
+  - id: permissions
+    label: Permissions
+    kind:
+      type: enum
+      options: [safe, dev, strict]
+    help: Permissions preset for Claude settings.json.
+    pointer: /tools/config/claude/permissions
+  - id: rules_enabled
+    label: Rules
+    kind:
+      type: bool
+    help: Generate .claude/rules/*.md when enabled.
+    pointer: /tools/config/claude/rules_enabled
+  - id: skills
+    label: Skills
+    kind:
+      type: action
+      action: open_skills
+      target_pointer: /tools/config/claude/skills
+    help: Open Claude skills selector.
+  - id: agents
+    label: Agents
+    kind:
+      type: action
+      action: open_agents
+      target_pointer: /selections/agents
+    help: Open Claude agents selector.
+doctor:
+  - kind: which
+    value: claude
+    severity: error

@@ -1,0 +1,28 @@
+{
+  "lot": "Test Lot",
+  "version": "1.0",
+  "generated_at": "2026-02-05",
+  "timezone": "UTC",
+  "priority_mapping": {
+    "p0": "P0",
+    "p1": "P1"
+  },
+  "tasks": [
+    {
+      "id": "TASK-1",
+      "title": "Lock task one",
+      "state": "todo",
+      "priority": "p0",
+      "dependencies": [],
+      "exclusive_resources": ["lockfile"]
+    },
+    {
+      "id": "TASK-2",
+      "title": "Lock task two",
+      "state": "todo",
+      "priority": "p1",
+      "dependencies": [],
+      "exclusive_resources": ["lockfile"]
+    }
+  ]
+}

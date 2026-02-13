@@ -1,0 +1,449 @@
+{
+	"lot": "Lot 2 — Tool-agnostic CLI/TUI (ToolSpec registry + generic tests + adapter interface)",
+	"version": "0.2",
+	"generated_at": "2026-01-31",
+	"timezone": "Europe/Paris",
+	"priority_mapping": {
+		"1": "P0 / Must-have for this lot",
+		"2": "P1 / Should-have for this lot",
+		"4": "P2 / Nice-to-have / preparatory",
+		"5": "P3 / Lowest priority / can defer"
+	},
+	"assumptions": [
+		"This lot follows the MACC v1 doc goals: CLI/TUI must share the same canonical config, resolve, plan, diff, and apply engine; tool support is provided via adapters, and the UI must remain tool-transparent.",
+		"This lot targets removing hard-coded tool names and tool-specific branches from tui/ and cli/ (including tests), replacing them with a data-driven ToolSpec registry and a single engine interface.",
+		"Tool names and tool-specific behavior are allowed in adapter crates and registry data files, but not in tui/ or cli/ source or tests (unless commented out, but the default rule is: avoid them entirely).",
+		"Each task is designed for one AI agent in < 1 day; if it grows, it must be split."
+	],
+	"tasks": [
+		{
+			"id": "L2-AUDIT-001",
+			"title": "Audit and baseline scan for tool-name references in tui/ and cli/",
+			"category": "audit",
+			"description": "Problem/Objective: Identify every direct reference to specific tools in tui/ and cli/ code and tests.\nMain Features: Add a repeatable scan command (ripgrep) and capture baseline results.\nScope/Boundaries: Do not refactor yet; only inventory and document findings.\nSuccess Criteria: A checklist of file paths + offending strings and a short summary of patterns (hard-coded IDs, matches, docs in code, test fixtures).",
+			"objective": "Create an accurate refactor map and avoid missing tool-specific couplings.",
+			"result": "A tracked audit report file exists (e.g., docs/tool-agnostic-audit.md) listing occurrences and categories (code, tests, snapshots, fixtures).",
+			"steps": [
+				"Run a repository scan for common tool names and IDs across tui/ and cli/ (and their tests).",
+				"Classify findings: UI text, conditional logic, registry calls, tests/fixtures, golden outputs.",
+				"Record the baseline in docs/tool-agnostic-audit.md with exact paths and suggested fix strategy per category.",
+				"Add a short acceptance checklist: “0 occurrences in tui/ and cli/ after this lot.”"
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "This is the source of truth for what must be removed or data-driven."
+		},
+		{
+			"id": "L2-SCHEMA-001",
+			"title": "Define ToolSpec schema (YAML/JSON) and its Rust types in core",
+			"category": "core-schema",
+			"description": "Problem/Objective: The UI must be tool-agnostic, so tool metadata must be described via data files.\nMain Features: Create ToolSpec schema with versioning, fields, actions, capabilities, and optional doctor checks.\nScope/Boundaries: Do not implement loaders yet; only schema + Rust structs + validation rules.\nSuccess Criteria: A documented schema with examples and a Rust module that can parse and validate one ToolSpec.",
+			"objective": "Establish a stable contract between data (ToolSpec) and the UI/engine.",
+			"result": "A new module exists (e.g., macc-core/src/tool_api/spec.rs) defining ToolSpec + FieldSpec + DoctorCheckSpec + OutputSpec (optional), with serde parsing for YAML and JSON.",
+			"steps": [
+				"Create ToolSpec schema fields: api_version, id, display_name, capabilities, fields[].",
+				"Define FieldSpec: id, label, kind (bool|enum|text|action), pointer OR action target.",
+				"Define ActionSpec string format or structured action: e.g., type=skills/agents/mcp and target_pointer.",
+				"Define DoctorCheckSpec list (optional): kind=which|path_exists|custom, value, severity.",
+				"Add validation: api_version supported; id is kebab-case; pointers start with '/'; enum has >=1 option.",
+				"Write docs/TOOLSPEC.md including one minimal spec and one advanced spec example."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Keep schema minimal; add advanced features later. Version everything."
+		},
+		{
+			"id": "L2-SCHEMA-002",
+			"title": "Implement ToolSpec-to-ToolDescriptor conversion layer",
+			"category": "core-schema",
+			"description": "Problem/Objective: tui/ currently consumes ToolDescriptor/ToolField; we need a conversion from ToolSpec data.\nMain Features: Convert ToolSpec -> ToolDescriptor with FieldKind mapping and stable JSON pointer paths.\nScope/Boundaries: No file I/O; conversion only.\nSuccess Criteria: Given a parsed ToolSpec, conversion produces ToolDescriptor used by existing UI render logic.",
+			"objective": "Allow current UI and CLI code to remain generic while tool metadata becomes data-driven.",
+			"result": "A pure function (e.g., tool_api::spec::to_descriptor(&ToolSpec) -> ToolDescriptor) exists with unit tests.",
+			"steps": [
+				"Map spec field kinds to FieldKind::Bool/Enum/Text/Action.",
+				"Ensure action fields keep a structured string or introduce an enum to avoid magic prefixes.",
+				"Add unit tests for: bool field, enum field, action field, invalid pointer, invalid enum options."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Prefer structured action types to avoid string prefixes long-term."
+		},
+		{
+			"id": "L2-REGISTRY-001",
+			"title": "Create ToolSpec file layout and loader with overlay precedence",
+			"category": "registry",
+			"description": "Problem/Objective: ToolSpecs must live outside tui/ and cli/ and be loadable from standard locations.\nMain Features: Loader reads registry/tools.d/*.tool.yaml (or .json), plus project/user overlays.\nScope/Boundaries: No adapter planning here; only loading + merging ToolSpecs.\nSuccess Criteria: Loader returns a validated Vec<ToolSpec> and reports errors clearly.",
+			"objective": "Make tool discovery data-driven and scalable with minimal code changes for new tools.",
+			"result": "A loader exists (e.g., macc-registry or macc-core registry module) with default search paths and deterministic merge order.",
+			"steps": [
+				"Create directory convention: registry/tools.d/*.tool.yaml as built-in specs.",
+				"Add optional overlay dirs: .macc/tools.d (project) and ~/.config/macc/tools.d (user).",
+				"Define merge rule: same tool id can be overridden by higher-precedence layer; unknown tools are appended.",
+				"Support YAML and JSON parsing.",
+				"Return structured diagnostics listing the file and error on parse/validation failure.",
+				"Add tests using temp directories to verify precedence and determinism."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "This enables adding tools by adding a file (and optionally an adapter), not editing UI code."
+		},
+		{
+			"id": "L2-REGISTRY-002",
+			"title": "Refactor macc-registry::tool_descriptors() to use ToolSpec loader",
+			"category": "registry",
+			"description": "Problem/Objective: tui/ currently calls macc_registry::tool_descriptors(); this must become tool-agnostic and data-driven.\nMain Features: tool_descriptors() loads specs, converts to ToolDescriptor, returns sorted list.\nScope/Boundaries: Do not touch tui yet; just change registry output.\nSuccess Criteria: Existing tui builds and shows the same tools, but sourced from ToolSpec files.",
+			"objective": "Drop hard-coded tool descriptor lists and eliminate tool-name coupling from UI-facing APIs.",
+			"result": "macc_registry::tool_descriptors() is backed by ToolSpec files; no hard-coded tool names remain in that function.",
+			"steps": [
+				"Implement tool_descriptors() = load ToolSpecs -> to_descriptor -> sort by display_name.",
+				"Add stable ordering for deterministic UI/test behavior.",
+				"Update/replace existing hard-coded descriptors with ToolSpec files in registry/tools.d.",
+				"Add a minimal integration test verifying tool_descriptors() is non-empty and deterministic."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Tool names may exist in registry data, not in tui/ or cli/."
+		},
+		{
+			"id": "L2-CONFIG-001",
+			"title": "Introduce tool-extensible config storage (tools.config map) in CanonicalConfig",
+			"category": "core-config",
+			"description": "Problem/Objective: Adding tools should not require editing Rust structs for per-tool settings.\nMain Features: Move per-tool settings to tools.config[tool_id] as JSON/YAML values; keep tools.enabled as-is.\nScope/Boundaries: Keep existing config keys working (migration handled separately).\nSuccess Criteria: CanonicalConfig can store arbitrary tool settings without code changes, and JSON pointer paths can target them.",
+			"objective": "Make adding a new tool require adding a ToolSpec file (and adapter if needed), not editing config structs.",
+			"result": "CanonicalConfig contains tools.config: map<string, serde_json::Value> (or equivalent), and can serialize/deserialize with stable YAML output.",
+			"steps": [
+				"Update CanonicalConfig.tools struct to include config map keyed by tool id.",
+				"Ensure serde YAML output is stable and sorted (where feasible) for diff-friendliness.",
+				"Add unit tests: round-trip YAML with tools.enabled and tools.config.example fields.",
+				"Document the canonical structure in docs/CONFIG.md."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "This is a major enabler for tool-agnostic UI fields using JSON pointers."
+		},
+		{
+			"id": "L2-CONFIG-002",
+			"title": "Add config migration strategy for legacy per-tool fields",
+			"category": "core-config",
+			"description": "Problem/Objective: Existing configurations may store per-tool settings in dedicated structs/keys.\nMain Features: Provide a migration path to tools.config[tool_id] with minimal disruption and explicit messaging.\nScope/Boundaries: Migration should not guess secrets; only move known safe fields.\nSuccess Criteria: Loading a legacy config does not crash; it results in an equivalent resolved config and optionally writes a migrated config with user consent.",
+			"objective": "Avoid breaking users and keep the transition to tool-extensible config safe.",
+			"result": "A migration module exists (e.g., macc-core/src/config/migrate.rs) with unit tests and a CLI hook (optional) to apply migration.",
+			"steps": [
+				"Inspect current CanonicalConfig schema and identify legacy per-tool sections (if any).",
+				"Implement a migration function that produces a new CanonicalConfig plus warnings.",
+				"Add tests with legacy fixtures and expected migrated output fixtures.",
+				"Decide how migration is triggered: automatic with warning, or explicit `macc migrate` command."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "If no legacy per-tool sections exist, implement as a no-op with scaffolding for future."
+		},
+		{
+			"id": "L2-ENGINE-001",
+			"title": "Introduce a single Engine interface for CLI and TUI to call plan/apply/doctor",
+			"category": "core-engine",
+			"description": "Problem/Objective: tui/ and cli/ should not orchestrate tool-specific planning; they must call a shared engine.\nMain Features: Add Engine trait (or struct facade) in core: list tools, run doctor, build plan, apply plan.\nScope/Boundaries: Do not change adapter internals yet; wrap existing functions.\nSuccess Criteria: CLI/TUI can be refactored to call Engine methods without importing tool-specific modules.",
+			"objective": "Centralize orchestration and enforce tool transparency at the UI boundary.",
+			"result": "macc-core exposes an Engine facade (e.g., macc_core::engine::MaccEngine) that the CLI and TUI can use.",
+			"steps": [
+				"Define Engine API: list_tools(), doctor(), plan(canonical), apply(plan, consent).",
+				"Implement MaccEngine by composing existing core functions: resolve, fetch materialize, build_plan, apply_operations.",
+				"Return structured errors suitable for UI display.",
+				"Add unit tests using fixture config and a stub registry."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "The goal is to prevent UI code from needing to know adapters, tool ids, or planning details."
+		},
+		{
+			"id": "L2-ENGINE-002",
+			"title": "Provide an in-memory Engine/TestRegistry for generic UI tests",
+			"category": "testing-infra",
+			"description": "Problem/Objective: UI tests must be generic and not depend on real tools or external binaries.\nMain Features: Implement a TestEngine that loads fixture ToolSpecs and produces predictable plans.\nScope/Boundaries: No real filesystem writes; use temp dirs and stubbed operations.\nSuccess Criteria: tui/ and cli/ tests can run purely with fixtures and assert behavior without tool names.",
+			"objective": "Make tests stable, fast, and tool-agnostic by design.",
+			"result": "A test-only engine (behind cfg(test) or a test helper crate) exists with fixtures for ToolSpecs and plans.",
+			"steps": [
+				"Create fixture ToolSpecs (e.g., tools: fixture-tool-1, fixture-tool-2) with generic names.",
+				"Implement TestEngine.list_tools() from fixture specs.",
+				"Implement TestEngine.plan() returning deterministic PlannedOps (fake paths + content).",
+				"Add helpers to simulate diffs and consent gates.",
+				"Use this TestEngine in tui/ and cli/ tests."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "This is key to removing real tool references from UI tests."
+		},
+		{
+			"id": "L2-TUI-001",
+			"title": "Refactor TUI state to source tool descriptors via Engine/ToolSpecs only",
+			"category": "tui-refactor",
+			"description": "Problem/Objective: tui/ currently depends on macc_registry::tool_descriptors(); it must become transparent to tools.\nMain Features: Replace direct registry calls with Engine.list_tools() or a generic provider.\nScope/Boundaries: No feature changes; keep existing UI behavior.\nSuccess Criteria: tui/ compiles, runs, and shows tools based on ToolSpec data, without tool-name logic in tui/.",
+			"objective": "Ensure the TUI is a pure metadata-driven consumer.",
+			"result": "AppState initializes tool_descriptors from Engine-provided descriptors; tui/ no longer imports tool-name-specific modules.",
+			"steps": [
+				"Introduce an Engine instance into TUI initialization (or a provider function passed in).",
+				"Replace macc_registry::tool_descriptors() usage with Engine.list_tools().",
+				"Ensure sorting/deterministic order matches registry behavior.",
+				"Update any screens that assume a fixed set of tools.",
+				"Add a TUI unit test that loads fixture ToolSpecs and asserts the tool list renders."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "The end state: tui/ contains no real tool names and no tool-specific branches."
+		},
+		{
+			"id": "L2-TUI-002",
+			"title": "Move built-in skills/agents lists out of tui/ into core catalog",
+			"category": "tui-refactor",
+			"description": "Problem/Objective: tui/ should not own domain catalogs; it should read them from core so CLI and TUI remain consistent.\nMain Features: Relocate BUILTIN_SKILLS/BUILTIN_AGENTS to macc-core catalog module and expose getters.\nScope/Boundaries: Do not change which skills/agents exist; only move ownership.\nSuccess Criteria: No skill/agent catalog constants remain in tui/; selections still work.",
+			"objective": "Centralize catalog definitions and reduce UI coupling.",
+			"result": "tui/ imports catalogs from macc-core (e.g., macc_core::catalog::builtin_skills()).",
+			"steps": [
+				"Create macc-core catalog module for skills/agents (if not already present).",
+				"Move data definitions and expose as Vec/[] of structs.",
+				"Update tui state to reference core catalogs.",
+				"Update tests to use generic mock skills/agents if needed."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "This supports the doc requirement that CLI/TUI share the same source of truth."
+		},
+		{
+			"id": "L2-TUI-003",
+			"title": "Make TUI actions fully spec-driven (no hard-coded action prefixes)",
+			"category": "tui-refactor",
+			"description": "Problem/Objective: Action fields currently rely on string prefixes like 'skills:' or 'agents:'; this is brittle.\nMain Features: Replace string parsing with a typed Action enum derived from ToolSpec.\nScope/Boundaries: Keep existing screens; only change action dispatch internals.\nSuccess Criteria: No action parsing by string prefix remains; actions are typed and validated at spec load time.",
+			"objective": "Eliminate hidden conventions and make behaviors explicit in ToolSpecs.",
+			"result": "ToolField.kind carries FieldKind::Action(ActionKind) where ActionKind is an enum with structured payload (target pointer).",
+			"steps": [
+				"Define ActionKind enum: OpenSkills { target_pointer }, OpenAgents { target_pointer }, etc.",
+				"Update ToolSpec schema to represent actions structurally (not string prefixes).",
+				"Update conversion ToolSpec->ToolDescriptor to map actions to ActionKind.",
+				"Update TUI handle_action() to match on ActionKind.",
+				"Add tests for invalid action payloads and correct routing."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "This prevents future regressions when adding new action types."
+		},
+		{
+			"id": "L2-CLI-001",
+			"title": "Refactor CLI to use Engine facade and ToolSpecs (no tool-specific branches)",
+			"category": "cli-refactor",
+			"description": "Problem/Objective: cli/ must be transparent to tools and use the same engine as TUI.\nMain Features: Replace tool-specific logic in cli/ with engine calls and spec-driven behaviors.\nScope/Boundaries: Do not remove CLI features; only change wiring.\nSuccess Criteria: cli/ compiles, runs plan/apply/doctor using Engine; no tool names referenced in cli/ source/tests.",
+			"objective": "Keep CLI scalable when adding new tools and ensure uniform behavior across tools.",
+			"result": "cli/ imports only macc-core Engine APIs and reads ToolSpecs via registry/core, without referencing specific tool names.",
+			"steps": [
+				"Replace direct adapter/registry calls with Engine methods.",
+				"Ensure CLI output remains stable (or update snapshots).",
+				"Update CLI tests to use fixture ToolSpecs and TestEngine.",
+				"Run the tool-name scan to confirm cli/ is clean."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "This enforces the same abstraction boundary as the TUI."
+		},
+		{
+			"id": "L2-DOCTOR-001",
+			"title": "Make doctor checks spec-driven and UI-neutral",
+			"category": "core-doctor",
+			"description": "Problem/Objective: doctor checks may embed tool assumptions; they should be derived from ToolSpecs and generic checks.\nMain Features: Combine generic checks (project health) + ToolSpec-defined checks.\nScope/Boundaries: No tool-name branching in TUI/CLI; checks resolution happens in core.\nSuccess Criteria: doctor output includes checks for enabled tools based on specs, without UI changes when adding tools.",
+			"objective": "A scalable diagnostics system where adding a tool adds checks via data.",
+			"result": "macc-core doctor module can accept ToolSpecs (or descriptors) and produce ToolCheck list accordingly.",
+			"steps": [
+				"Define mapping from DoctorCheckSpec to ToolCheck runtime instances.",
+				"Add a function: checks_for_enabled_tools(config, tool_specs) -> Vec<ToolCheck>.",
+				"Keep generic baseline checks (filesystem, git, config validity).",
+				"Update TUI 'Refresh Tool Checks' to call the engine/doctor provider instead of hard-coded lists."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "If some checks must remain adapter-specific, keep them in adapters, but expose results via engine."
+		},
+		{
+			"id": "L2-TESTS-001",
+			"title": "Replace any tool-specific UI tests with fixture-based generic tests",
+			"category": "tests",
+			"description": "Problem/Objective: Tests must be generic regardless of tool; tool-specific tests in tui/cli must be removed.\nMain Features: Use mock ToolSpecs and TestEngine to drive tests.\nScope/Boundaries: Do not test real tool integration here; that belongs to adapters/core contract tests.\nSuccess Criteria: tui/ and cli/ tests contain zero specific tool names and only test generic behavior.",
+			"objective": "Make UI tests scalable and stable as tools are added.",
+			"result": "All UI tests run with mock tool fixtures (e.g., 'fixture-tool-1', 'fixture-tool-2') and assert navigation, editing, plan preview, and consent flow.",
+			"steps": [
+				"Create test fixtures: ToolSpecs + sample CanonicalConfig + expected planned ops.",
+				"Refactor tests to initialize state with TestEngine.",
+				"Remove/replace any snapshots referencing real tool names.",
+				"Add a CI step that fails if forbidden tool strings appear in tui/cli tests."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "This directly satisfies the user request about tests being generic."
+		},
+		{
+			"id": "L2-TESTS-002",
+			"title": "Add core contract tests that iterate all registered adapters generically",
+			"category": "tests",
+			"description": "Problem/Objective: Tool-specific behavior belongs in adapters; we still need generic guarantees.\nMain Features: Add contract tests that run the same assertions over every adapter without naming them.\nScope/Boundaries: No UI; tests run in core/adapters layer.\nSuccess Criteria: Contract tests run and validate non-panicking, deterministic plans, and scope labeling.",
+			"objective": "Ensure new tools/adapters conform automatically without modifying tests per tool.",
+			"result": "A contract test suite exists (e.g., macc-adapters/tests/contract.rs) that iterates adapters from the registry and runs shared assertions.",
+			"steps": [
+				"Expose adapter enumeration API from registry (no string matches in the test).",
+				"For each adapter: create a minimal resolved config and run plan generation.",
+				"Assert: deterministic output; operations have valid scopes; paths are normalized; no forbidden operations by default.",
+				"Add CI job to run contract tests."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "If adapters require fixtures, define generic fixtures (not tool-named) and map them by capability."
+		},
+		{
+			"id": "L2-GUARD-001",
+			"title": "Add CI guardrail: denylist tool-name references in tui/ and cli/",
+			"category": "guardrails",
+			"description": "Problem/Objective: Tool names can creep back into tui/ or cli/ over time.\nMain Features: Add a CI script/xtask to scan tui/ and cli/ (including tests) for forbidden strings.\nScope/Boundaries: Do not scan adapter/registry data directories.\nSuccess Criteria: CI fails if forbidden strings appear in tui/ or cli/; developers get a clear error message pointing to offending file and line.",
+			"objective": "Make the tool-transparent requirement enforceable and permanent.",
+			"result": "A repo script exists (e.g., scripts/check-ui-tool-transparency.sh or xtask) and is wired into CI.",
+			"steps": [
+				"Create a denylist (config file) with tool names/aliases to forbid in tui/ and cli/ paths.",
+				"Implement scanner that outputs file:line matches and fails with non-zero exit code.",
+				"Wire into CI and optionally pre-commit hooks.",
+				"Document the rule in docs/CONTRIBUTING.md."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "If you truly need exceptions, enforce them with explicit allowlist comments and keep them rare."
+		},
+		{
+			"id": "L2-DOCS-001",
+			"title": "Document how to add a new tool without modifying tui/ or cli/",
+			"category": "docs",
+			"description": "Problem/Objective: Contributors need a clear path to add tools with minimal file changes.\nMain Features: Write an end-to-end guide: add ToolSpec, add adapter (optional), run contract tests.\nScope/Boundaries: No marketing; purely technical and actionable.\nSuccess Criteria: A new contributor can add a mock tool using only data files and/or one adapter crate and see it appear in the UI automatically.",
+			"objective": "Codify the scalable workflow described in the MACC documentation goals.",
+			"result": "docs/ADDING_TOOLS.md exists and matches the architecture in MACC.md (core/tool_api + adapters + registry).",
+			"steps": [
+				"Describe ToolSpec file structure and where it lives (registry/tools.d and overlays).",
+				"Describe field kinds and JSON pointers into canonical config.",
+				"Describe adapter integration via registry enumeration and contract tests.",
+				"Include a minimal example: add 'fixture-tool-3' ToolSpec + see it in TUI list."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "This directly supports long-term scalability."
+		},
+		{
+			"id": "L2-REGISTRY-003",
+			"title": "Create initial generic ToolSpec fixtures for UI and core tests",
+			"category": "registry",
+			"description": "Problem/Objective: UI tests must not use real tool names.\nMain Features: Provide mock ToolSpecs with generic IDs and representative fields.\nScope/Boundaries: These are for tests; do not ship them as real tool specs unless desired.\nSuccess Criteria: Fixtures cover bool/enum/text/action fields and doctor checks.",
+			"objective": "Ensure broad coverage of UI behavior with minimal maintenance.",
+			"result": "A fixtures directory exists with at least two mock ToolSpecs and matching sample configs.",
+			"steps": [
+				"Create fixture-tool-1.tool.yaml with bool + enum + text field examples and one action.",
+				"Create fixture-tool-2.tool.yaml with different pointers and a different field ordering.",
+				"Add sample canonical configs that include tools.enabled and tools.config for these mocks.",
+				"Update TestEngine to load these fixtures in tests."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "Keep names generic; never use real tool names in these fixtures."
+		},
+		{
+			"id": "L2-UI-001",
+			"title": "Ensure all UI rendering uses display_name from ToolSpec (never id logic)",
+			"category": "tui-refactor",
+			"description": "Problem/Objective: UI must not format or special-case tool ids.\nMain Features: Always render display_name from descriptors, not derived values.\nScope/Boundaries: No UX redesign; only remove implicit assumptions.\nSuccess Criteria: No string formatting branches by tool id remain in tui/ or cli/ outputs.",
+			"objective": "Prevent tool leakage into UI and ensure consistent UX for any future tools.",
+			"result": "Tool list, settings screen, and preview labels rely on descriptor fields only.",
+			"steps": [
+				"Search for any formatting or branching based on tool id in tui/ and cli/.",
+				"Replace with metadata-driven rendering (display_name, field labels).",
+				"Update any snapshots to use mock tool names."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "This avoids subtle coupling like “if tool == X show extra field”."
+		},
+		{
+			"id": "L2-PATHS-001",
+			"title": "Standardize JSON pointer conventions for ToolSpec fields and selections",
+			"category": "core-config",
+			"description": "Problem/Objective: ToolSpecs reference canonical config via JSON pointers; conventions must be stable.\nMain Features: Define stable paths for tools.enabled, tools.config, and selections (skills/agents/mcp) and enforce them.\nScope/Boundaries: No new features; only standardization + validation.\nSuccess Criteria: docs/CONFIG.md includes the canonical paths; ToolSpec validation rejects pointers outside allowed roots if desired.",
+			"objective": "Prevent drift and reduce migration burden later.",
+			"result": "A documented pointer map and optional validation guard exists.",
+			"steps": [
+				"Define canonical roots: /tools/enabled, /tools/config/<id>/..., /selections/skills/<id> (or equivalent).",
+				"Update any existing ToolSpec files to match the convention.",
+				"Add validation helpers: pointer must start with one of the allowed roots (configurable).",
+				"Add unit tests for allowed/disallowed pointers."
+			],
+			"priority": 2,
+			"passes": true,
+			"notes": "If selections are not per-tool, adjust convention to match your actual config model."
+		},
+		{
+			"id": "L2-REFORMAT-001",
+			"title": "Make ToolSpec loading errors user-friendly in CLI and TUI",
+			"category": "ux",
+			"description": "Problem/Objective: If ToolSpecs fail to parse, users need actionable errors.\nMain Features: Convert parse/validation errors into messages that point to file + field + fix.\nScope/Boundaries: No complex diagnostics UI; simple messages.\nSuccess Criteria: Broken spec files produce a readable error panel (TUI) and readable stderr output (CLI).",
+			"objective": "Reduce friction for contributors and users customizing tool specs.",
+			"result": "Engine/registry returns structured diagnostics; UI renders them without exposing internal stack traces by default.",
+			"steps": [
+				"Create a RegistryError type with filename, line/column when possible, and validation message.",
+				"Ensure the engine surfaces these errors in plan/apply and list_tools flow.",
+				"Render errors in TUI notices/errors section and in CLI stderr.",
+				"Add tests with an intentionally broken ToolSpec fixture."
+			],
+			"priority": 4,
+			"passes": true,
+			"notes": "This is a quality-of-life improvement that helps scaling."
+		},
+		    {
+		      "id": "L2-REGISTRY-004",
+		      "title": "Minimize tool-add churn: adapter registration strategy (inventory or single registry file)",
+		      "category": "adapters",
+		      "description": "Problem/Objective: Adding a new adapter should touch as few files as possible.\nMain Features: Decide and implement adapter registration strategy: self-registration (preferred) or central registry.\nScope/Boundaries: Keep it simple and stable; avoid complex plugin loading in this lot.\nSuccess Criteria: Adding a new adapter requires minimal code edits (ideally only the adapter crate/module).",
+		      "objective": "Ensure the system stays scalable and refactorable as tools grow.",
+		      "result": "Adapter registry supports enumeration without modifying tui/cli; contract tests iterate all adapters automatically.",
+		      "steps": [
+		        "Evaluate self-registration approach vs central registry module trade-offs.",
+		        "Implement chosen approach in macc-core/tool_api or macc-registry.",
+		        "Update default_registry() to build ToolRegistry from registered adapters.",
+		        "Add tests verifying enumeration works and is deterministic."
+		      ],
+		      "priority": 4,
+		      "passes": true,
+		      "notes": "If you want zero-core-changes per adapter, self-registration is usually best."
+		    },		{
+			"id": "L2-CLEANUP-001",
+			"title": "Remove all remaining tool-name mentions from tui/ and cli/ (code + tests + fixtures)",
+			"category": "cleanup",
+			"description": "Problem/Objective: Enforce the rule that tui/ and cli/ are tool-transparent.\nMain Features: Replace any remaining mentions with mock fixtures or metadata-driven strings.\nScope/Boundaries: Do not change registry/adapters; focus only on tui/cli.\nSuccess Criteria: The CI denylist check passes; no occurrences remain.",
+			"objective": "Complete the refactor and guarantee future scalability.",
+			"result": "tui/ and cli/ contain zero tool name mentions; any necessary references live in registry data or adapters.",
+			"steps": [
+				"Re-run the audit scan from L2-AUDIT-001.",
+				"Fix remaining references: UI strings, tests, fixtures, snapshots.",
+				"Verify compilation and run tests locally/CI.",
+				"Update docs/tool-agnostic-audit.md to mark items resolved."
+			],
+			"priority": 1,
+			"passes": true,
+			"notes": "This is the explicit end-condition for the lot."
+		},
+		{
+			  "id": "L2-ACCEPT-001",
+			  "title": "Acceptance checklist and final verification for tool-agnostic UI",
+			  "category": "acceptance",
+			  "description": "Problem/Objective: Ensure the lot is complete and matches the MACC doc requirements.\nMain Features: Provide a checklist-based validation run.\nScope/Boundaries: No new features; verification only.\nSuccess Criteria: All checks pass: UI loads specs, generic tests pass, denylist passes, contract tests pass, docs updated.",
+			  "objective": "Close the lot with confidence and reproducibility.",
+			  "result": "docs/v0.2-tool-agnostic-checklist.md exists with a final run log and outcomes.",
+			  "steps": [
+			    "Run: unit tests (core/registry/tui/cli) and contract tests (adapters).",
+			    "Run: denylist scan in CI mode.",
+			    "Manually verify TUI: list tools from specs, open settings, edit fields, preview plan, apply with consent gate.",
+			    "Manually verify CLI: plan/apply/doctor use engine and show generic behavior.",
+			    "Record results in docs/v0.2-tool-agnostic-checklist.md."
+			  ],
+			  "priority": 2,
+			  "passes": true,
+			  "notes": "Make this the merge gate for the lot."
+			}	]
+}

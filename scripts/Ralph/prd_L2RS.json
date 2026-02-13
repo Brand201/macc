@@ -1,0 +1,530 @@
+{
+  "lot": "Lot 2 — Remote Skills & MCP Installation (Cases 1–6, No TUI)",
+  "version": "1.0",
+  "generated_at": "2026-01-30",
+  "tasks": [
+    {
+      "id": "L2-RS-001",
+      "title": "Define local catalog DB schemas (skills + mcp)",
+      "category": "catalog",
+      "description": "Problem/Objective: MACC needs simple project-local databases that map an entry id to a remote source and an optional subpath. Main Features: two JSON files, one for skills and one for MCPs, each with entries: {id,name,description,tags,selector{subpath},source{kind,url,ref,checksum}}. Scope/Boundaries: No TUI. No extra fields beyond what is required. Success Criteria: Rust structs deserialize/serialize exactly and validation errors are actionable.",
+      "objective": "Create the canonical minimal data models used everywhere in the pipeline (CLI, resolver, fetch, install).",
+      "result": "Rust structs exist for SkillsCatalog and McpCatalog with strict validation and deterministic JSON serialization.",
+      "steps": [
+        "using `catalog/skills.catalog.json` & `catalog/mcp.catalog.json` module with `Source { kind, url, ref, checksum }` and `Selector { subpath }`.",
+        "Create `SkillEntry` and `McpEntry` with required fields and serde derives.",
+        "Add unit tests with JSON fixtures for both files."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Keep the schema minimal: only `selector` and `source` nesting is allowed."
+    },
+    {
+      "id": "L2-RS-002",
+      "title": "Implement project paths for catalogs under .macc/catalog/",
+      "category": "catalog",
+      "description": "Problem/Objective: MACC must consistently locate the two catalog DB files in a project. Main Features: fixed paths `.macc/catalog/skills.catalog.json` and `.macc/catalog/mcp.catalog.json`. Scope/Boundaries: Project-level only. Success Criteria: functions resolve absolute paths from project root and create parent dirs if missing.",
+      "objective": "Standardize where catalog DBs live so all commands and apply logic share the same locations.",
+      "result": "Core exposes functions to compute catalog file paths and ensures `.macc/catalog/` exists.",
+      "steps": [
+        "Add path helpers: `skills_catalog_path(root)` and `mcp_catalog_path(root)`.",
+        "Ensure parent directory `.macc/catalog/` is created when needed.",
+        "Add unit tests using temp directories."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L2-RS-003",
+      "title": "Add load/save for catalogs with atomic writes",
+      "category": "catalog",
+      "description": "Problem/Objective: Catalogs must be updated safely without corruption. Main Features: load missing file as empty catalog; save via temp file + rename; stable formatting. Scope/Boundaries: No concurrency lock in this task. Success Criteria: save is atomic and deterministic; reload equals original in-memory data.",
+      "objective": "Provide safe persistence for catalog updates from CLI and future automation.",
+      "result": "Catalog read/write APIs exist and never partially write files.",
+      "steps": [
+        "Implement `load_skills_catalog` / `load_mcp_catalog` returning default empty catalogs if missing.",
+        "Implement `save_*_catalog_atomically` using temp + rename.",
+        "Serialize with pretty JSON and trailing newline.",
+        "Add tests for idempotent save and missing-file defaults."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Deterministic formatting is important for clean diffs."
+    },
+    {
+      "id": "L2-RS-004",
+      "title": "Implement catalog upsert and delete operations by id",
+      "category": "catalog",
+      "description": "Problem/Objective: Users will add/update entries over time. Main Features: upsert replaces or appends by id; delete removes by id; update updated_at. Scope/Boundaries: Single-writer assumption. Success Criteria: operations behave deterministically and persist via atomic save.",
+      "objective": "Enable CLI workflows to grow the local DB as the user downloads/imports new skills/MCPs.",
+      "result": "Upsert/delete helpers exist for both skills and MCP catalogs with tests.",
+      "steps": [
+        "Implement `upsert_skill_entry` and `upsert_mcp_entry` (replace entry with same id).",
+        "Implement `delete_skill_entry` and `delete_mcp_entry` (no-op or error on missing; decide policy).",
+        "Update root updated_at on modifications.",
+        "Add unit tests for update/replace/delete."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L2-RS-005",
+      "title": "CLI: add local catalog management commands for skills",
+      "category": "cli",
+      "description": "Problem/Objective: Without TUI, users need commands to manage skills catalog DB. Main Features: list, search (local), add (upsert), remove. Scope/Boundaries: No remote search in this task. Success Criteria: commands read/write `.macc/catalog/skills.catalog.json` and print clear output.",
+      "objective": "Make skills catalog usable from CLI only.",
+      "result": "Commands exist: `macc catalog skills list|search|add|remove`.",
+      "steps": [
+        "Add clap subcommands for `catalog skills`.",
+        "Implement `list` (print id, name, tags, source.kind).",
+        "Implement `search` filtering by id/name/description/tags (case-insensitive).",
+        "Implement `add` flags: --id --name --description --tags --subpath --kind git|http --url --ref --checksum.",
+        "Implement `remove --id`.",
+        "Wire to core load/upsert/delete/save."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Store tags as string array; parse `--tags` as CSV."
+    },
+    {
+      "id": "L2-RS-006",
+      "title": "CLI: add local catalog management commands for MCP",
+      "category": "cli",
+      "description": "Problem/Objective: Same as skills but for MCP catalog DB. Main Features: list, search, add (upsert), remove. Scope/Boundaries: No MCP install in this task. Success Criteria: commands update `.macc/catalog/mcp.catalog.json` atomically.",
+      "objective": "Make MCP catalog usable from CLI only.",
+      "result": "Commands exist: `macc catalog mcp list|search|add|remove`.",
+      "steps": [
+        "Add clap subcommands for `catalog mcp`.",
+        "Reuse shared parsing for source/selector.",
+        "Implement list/search/add/remove mirroring skills behavior.",
+        "Add unit tests for MCP catalog mutations."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L2-RS-007",
+      "title": "URL parsing: normalize Git sources including GitHub tree links (Case 5)",
+      "category": "url-parsing",
+      "description": "Problem/Objective: Users paste various Git URL forms; MACC must normalize them into {url, ref, selector.subpath}. Main Features: parse GitHub folder links like `.../tree/<ref>/<path>`. Scope/Boundaries: Parse-only (no network). Success Criteria: example URLs normalize correctly; errors are actionable.",
+      "objective": "Support Case 5 and remove ambiguity between repo URL vs folder link.",
+      "result": "Function `normalize_git_input(url)` returns normalized clone url + ref + subpath with comprehensive unit tests.",
+      "steps": [
+        "Implement parser for `https://github.com/<org>/<repo>/tree/<ref>/<subpath...>`.",
+        "Support plain repo URLs: `https://github.com/<org>/<repo>` and optional `.git` suffix.",
+        "Return empty subpath for repo-root installs.",
+        "Add unit tests for the provided examples and additional edge cases."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Be conservative: only rewrite when pattern is clearly a GitHub tree URL."
+    },
+    {
+      "id": "L2-RS-008",
+      "title": "URL parsing: validate HTTP sources and checksum format",
+      "category": "url-parsing",
+      "description": "Problem/Objective: HTTP zip links must be validated; checksums must be consistently represented. Main Features: accept http/https; parse `sha256:<64-hex>`. Scope/Boundaries: No download here. Success Criteria: invalid URLs/checksums are rejected with helpful messages.",
+      "objective": "Prevent malformed sources entering the catalogs and breaking installs later.",
+      "result": "HTTP source parser exists and enforces checksum format when provided.",
+      "steps": [
+        "Validate http/https scheme.",
+        "Parse checksum string with prefix `sha256:` and 64 hex characters.",
+        "For HTTP sources, store ref as empty string.",
+        "Add unit tests for valid and invalid checksum strings."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Checksum may be optional, but warn at install time when missing."
+    },
+    {
+      "id": "L2-RS-009",
+      "title": "Define cache keys and cache directory layout under .macc/cache",
+      "category": "fetch-cache",
+      "description": "Problem/Objective: Avoid re-downloading and enable multi-skill installs from one artifact. Main Features: stable cache key from source {kind,url,ref,checksum}. Scope/Boundaries: No offline mode yet. Success Criteria: same source maps to same cache path; different ref/checksum maps to different path.",
+      "objective": "Create a deterministic caching model used by both HTTP and Git materialization.",
+      "result": "Cache paths computed consistently: `.macc/cache/<key>/{raw,unpacked,repo}`.",
+      "steps": [
+        "Compute cache key as sha256 of canonical string `kind|url|ref|checksum`.",
+        "Create helper that returns the cache root for a given source.",
+        "Ensure `.macc/cache/` is in project `.gitignore`.",
+        "Add unit tests for stable keys."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L2-RS-010",
+      "title": "HTTP fetch: download zip to cache with atomic write + checksum verification (Case 1/2)",
+      "category": "fetch-cache",
+      "description": "Problem/Objective: Download zip artifacts from any server safely and deterministically. Main Features: download to temp then rename; verify sha256 when provided. Scope/Boundaries: No auth headers in this milestone. Success Criteria: checksum mismatch fails; valid cached artifact is reused.",
+      "objective": "Enable Case 1 and Case 2 inputs (zip downloads).",
+      "result": "Downloader stores `.macc/cache/<key>/raw/archive.zip` and verifies checksum when present.",
+      "steps": [
+        "Add HTTP client (reqwest) with timeouts.",
+        "Download bytes to temp file then rename atomically.",
+        "If checksum present, compute sha256 and compare; on mismatch delete and return error.",
+        "If cached archive exists and passes checksum, skip download.",
+        "Add unit tests for checksum verification logic (mock network or test pure hashing)."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L2-RS-011",
+      "title": "Zip extraction: implement safe unzip with Zip Slip defense (Case 1/2)",
+      "category": "fetch-cache",
+      "description": "Problem/Objective: Zip extraction is security-sensitive; must prevent path traversal. Main Features: reject absolute paths and `..`; extract only inside target dir; optionally reject symlinks. Scope/Boundaries: Zip only (no tar.gz). Success Criteria: crafted zip with `../evil` is rejected.",
+      "objective": "Safely extract downloaded zips into cache for later selection by subpath.",
+      "result": "Extractor produces `.macc/cache/<key>/unpacked/` safely or fails with a clear error.",
+      "steps": [
+        "Choose a ZIP library and implement extraction to `unpacked/`.",
+        "Normalize each entry path; ensure destination stays within unpack root.",
+        "Reject entries with absolute paths or parent traversal.",
+        "Decide symlink policy (recommended: reject).",
+        "Add unit test with a malicious zip slip entry."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "This is a must-have security task."
+    },
+    {
+      "id": "L2-RS-012",
+      "title": "Git fetch: clone/fetch/checkout into cache (Case 3/4/5 baseline)",
+      "category": "fetch-cache",
+      "description": "Problem/Objective: Git sources must be materialized into local working tree. Main Features: clone if missing; fetch if exists; checkout ref. Scope/Boundaries: sparse-checkout is separate task. Success Criteria: `.macc/cache/<key>/repo` exists at the expected ref.",
+      "objective": "Enable Case 3/4/5 inputs (git repository sources).",
+      "result": "Git materializer produces a checked-out repo in cache with clear errors on failures.",
+      "steps": [
+        "Use system `git` CLI (preferred).",
+        "If repo dir missing: `git clone <url> repo/`.",
+        "If repo exists: `git fetch --all --tags`.",
+        "Checkout ref (branch/tag/sha); if ref empty, use default branch behavior.",
+        "Add integration tests using a temp local git repo."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Prefer capturing stdout/stderr for actionable errors."
+    },
+    {
+      "id": "L2-RS-013",
+      "title": "Git sparse-checkout for subpaths (Case 4/5 folder-only download)",
+      "category": "fetch-cache",
+      "description": "Problem/Objective: Multi-skill repos can be large; only selected folders should be fetched when possible. Main Features: `git sparse-checkout set <paths...>`. Scope/Boundaries: Requires git CLI. Success Criteria: working tree contains only selected paths and install succeeds.",
+      "objective": "Satisfy the Case 5 requirement ('download folder directly if possible') using sparse-checkout.",
+      "result": "When selections contain subpaths, MACC performs sparse-checkout and materializes only required folders.",
+      "steps": [
+        "Implement `enable_sparse_checkout(repo_dir)`.",
+        "Implement `set_sparse_paths(repo_dir, subpaths[])`.",
+        "Run checkout ref after setting sparse paths.",
+        "Validate each selected subpath exists in working tree.",
+        "Add integration test with a local repo containing multiple folders."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Requires git CLI. Success Criteria: working tree contains only selected paths and install succeeds."
+    },
+    {
+      "id": "L2-RS-014",
+      "title": "Resolver: group selected entries into fetch units (multi-skill zip/repo)",
+      "category": "selection",
+      "description": "Problem/Objective: Case 2 and Case 4 require one artifact to contain multiple skills; only selected ones should be installed. Main Features: group by identical source to avoid multiple downloads/clones; keep per-entry subpath. Scope/Boundaries: No fetching here. Success Criteria: two skills sharing same zip/repo produce one fetch unit with two selections.",
+      "objective": "Enable efficient multi-skill installs by deduplicating fetches and preserving per-skill selectors.",
+      "result": "Resolver returns a list of fetch units `{source, selections:[{id, subpath, kind}]}` with tests.",
+      "steps": [
+        "Load skills and mcp catalogs.",
+        "Resolve requested ids to entries; error if missing id.",
+        "Group entries by source equality (kind+url+ref+checksum).",
+        "Deduplicate identical subpaths within a group.",
+        "Add unit tests for grouping behavior."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L2-RS-015",
+      "title": "Materialize pipeline step per fetch unit (HTTP unzip / Git checkout+sparse)",
+      "category": "materialize",
+      "description": "Problem/Objective: Install planning needs a local directory tree for each fetch unit. Main Features: for http: download+extract; for git: clone/checkout and sparse-checkout based on selections. Scope/Boundaries: No package interpretation here. Success Criteria: returns a stable root path where selections' subpaths can be accessed.",
+      "objective": "Provide a unified materialization stage that supports Cases 1–5 consistently.",
+      "result": "Materializer returns `{source_root_path, selections[]}` ready for install planning; cache is reused on subsequent runs.",
+      "steps": [
+        "For HTTP: ensure archive exists, extract safely, return unpacked root.",
+        "For Git: ensure repo exists, apply sparse paths if needed, checkout ref, return repo root.",
+        "Validate that each selection.subpath exists under returned root (or error).",
+        "Add unit/integration tests for both kinds."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L2-RS-016",
+      "title": "Skill package validation heuristics (no manifest required)",
+      "category": "packages",
+      "description": "Problem/Objective: Many skills may not ship a MACC manifest; MACC still needs minimal validation. Main Features: verify selection root exists; ensure at least one marker file exists (SKILL.md/README.md). Scope/Boundaries: No tool-specific parsing. Success Criteria: invalid folder errors clearly; valid folder passes.",
+      "objective": "Avoid installing the wrong folder (e.g., repo root) when a user misconfigures selector.subpath.",
+      "result": "Validator `validate_skill_folder(path)` exists with marker-based checks and tests.",
+      "steps": [
+        "Define marker list: SKILL.md, skill.md, README.md (configurable constant).",
+        "Ensure selected path exists and is a directory.",
+        "Ensure at least one marker file exists in that directory.",
+        "Add unit tests with temp directories."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Heuristics should be strict enough to catch mistakes, but not block legitimate skills."
+    },
+    {
+      "id": "L2-RS-017",
+      "title": "MCP package requires manifest parsing (macc.package.json required)",
+      "category": "packages",
+      "description": "Problem/Objective: MCP integration requires structured `.mcp.json` merges; guessing is unsafe. Main Features: require macc.package.json inside the selected folder; parse and validate minimal MCP manifest. Scope/Boundaries: No MCP install without manifest. Success Criteria: missing/invalid manifest fails; valid manifest produces merge payload.",
+      "objective": "Make MCP installs deterministic and safe.",
+      "result": "Parser exists that extracts MCP server JSON and merge target (e.g., mcpServers.<id>) from manifest.",
+      "steps": [
+        "Define minimal MCP manifest struct: type=mcp, id, version, mcp.server object, merge target info.",
+        "Load manifest from selected folder and validate required fields.",
+        "Ensure manifest id matches catalog entry id (or document policy).",
+        "Add unit tests: missing manifest, invalid JSON, valid manifest."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Manifest must not contain secrets; only placeholders are allowed."
+    },
+    {
+      "id": "L2-RS-018",
+      "title": "Install planning: expand directory into deterministic WriteFile actions",
+      "category": "install",
+      "description": "Problem/Objective: Apply engine writes files; installing a folder requires turning it into per-file actions. Main Features: recursive file enumeration with stable ordering; reject symlinks; create WriteFile actions with relative paths preserved. Scope/Boundaries: No symlink preservation. Success Criteria: installed folder structure matches source exactly after apply.",
+      "objective": "Install skill content safely using existing plan/apply semantics (atomic writes + backups).",
+      "result": "Utility that takes (src_dir, dest_root) and yields a stable list of WriteFile actions.",
+      "steps": [
+        "Walk files recursively and collect relative paths.",
+        "Sort paths for determinism.",
+        "Reject symlinks (recommended) and non-regular files.",
+        "Create WriteFile actions for each file with destination = dest_root + relpath.",
+        "Add unit tests with nested directories."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Determinism matters for repeatable plans and clean diffs."
+    },
+    {
+      "id": "L2-RS-019",
+      "title": "Skill install planner: install selected skill folders into Claude/Codex/Gemini",
+      "category": "install",
+      "description": "Problem/Objective: Skills must be placed in the correct tool locations. Main Features: destination mapping per tool; for each selected skill, copy folder contents into `.claude/skills/<id>/`, `.codex/skills/<id>/`, `.gemini/skills/<id>/`. Scope/Boundaries: Project scope only. Success Criteria: correct destination paths created and populated; idempotent re-run.",
+      "objective": "Support Cases 1–5 for skill installation into all supported tools.",
+      "result": "Planner generates ActionPlan actions for skill installs per tool based on selection + materialized root.",
+      "steps": [
+        "Implement `skill_dest_root(tool, id)` mapping for claude/codex/gemini.",
+        "For each resolved skill selection: compute selected_root = source_root/subpath.",
+        "Validate with heuristics.",
+        "Expand directory -> WriteFile actions into each selected tool dest root.",
+        "Add integration test: re-apply produces no changes."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "No TUI; tool selection is passed via CLI or config."
+    },
+    {
+      "id": "L2-RS-020",
+      "title": "MCP install planner: merge manifest payload into project .mcp.json",
+      "category": "install",
+      "description": "Problem/Objective: MCP servers must integrate via `.mcp.json` merges, preserving existing config. Main Features: generate a MergeJson (or equivalent) action that inserts `mcpServers.<id>`. Scope/Boundaries: Project scope only (no user config). Success Criteria: `.mcp.json` is created/updated and existing servers remain untouched.",
+      "objective": "Support MCP installs (Cases 1–5 for fetching, plus integration via manifest).",
+      "result": "Planner produces merge actions for `.mcp.json` using the parsed MCP manifest.",
+      "steps": [
+        "Define or reuse a JSON merge action in the plan/apply engine.",
+        "From MCP manifest, build JSON fragment `{mcpServers:{<id>:<server>}}`.",
+        "Plan merge into `.mcp.json` with backup + atomic write semantics.",
+        "Add tests merging into empty and existing `.mcp.json`."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+      {
+      "id": "L2-RS-021",
+      "title": "Integrate materialize + install planning into the core apply pipeline",
+      "category": "pipeline",
+      "description": "Problem/Objective: Remote installs require fetch/materialize before plan generation. Main Features: resolve selections -> group into fetch units -> materialize -> generate install actions -> apply safely. Scope/Boundaries: No TUI. Success Criteria: `macc apply` installs selected skills/MCP into correct locations and is idempotent.",
+      "objective": "Make remote skills/MCP installation a first-class part of `macc apply`.",
+      "result": "`macc apply` installs remote skills/MCP with preview/diff, backups, and atomic writes.",
+      "steps": [
+        "Load selected ids/tools from config/CLI.",
+        "Resolve ids to entries and group into fetch units.",
+        "Materialize each fetch unit (http unzip / git checkout+sparse).",
+        "Generate ActionPlan actions for skill installs and MCP merges.",
+        "Run secret scan on planned outputs before writing.",
+        "Apply plan with existing safety mechanisms."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Keep adapters side-effect-free; fetching happens before plan execution."
+    },
+      {
+        "id": "L2-RS-022",
+        "title": "Add CLI install commands (no TUI): `macc install skill` and `macc install mcp`",
+        "category": "cli",
+        "description": "Problem/Objective: Users need a direct CLI entrypoint to install a skill/MCP without editing config files manually. Main Features: `macc install skill --tool <claude|codex|gemini> --id <id>`; `macc install mcp --id <id>`. Scope/Boundaries: Project scope only. Success Criteria: installs succeed and use plan/apply engine.",
+        "objective": "Deliver a usable workflow now (no TUI) to validate Cases 1–6 end-to-end.",
+        "result": "Install commands exist and call the same resolver/materializer/planner pipeline used by apply.",
+        "steps": [
+          "Add clap subcommands `install skill` and `install mcp`.",
+          "Resolve id from local catalogs.",
+          "Materialize source and generate plan actions.",
+          "Apply plan and print summary (files written, destinations).",
+          "Add integration tests for installing one skill and one MCP from fixtures."
+        ],
+        "priority": 2,
+        "passes": true,
+        "notes": ""
+      },    {
+      "id": "L2-RS-023",
+      "title": "CLI: `macc catalog import-url` for GitHub tree links (Case 5)",
+      "category": "cli",
+      "description": "Problem/Objective: Users paste folder URLs; MACC should convert them into {source, selector} entries automatically. Main Features: parse GitHub tree URL and upsert into skills or MCP catalog. Scope/Boundaries: Parse-only; no fetching. Success Criteria: entry is created with correct url/ref/subpath and can be installed later.",
+      "objective": "Reduce friction for Case 5 by automating link normalization into the local DB.",
+      "result": "`macc catalog import-url --kind skill|mcp --id <id> --url <treeLink> ...` upserts an entry into the correct catalog file.",
+      "steps": [
+        "Add `catalog import-url` CLI command.",
+        "Parse URL via normalize_git parser to get repo url/ref/subpath.",
+        "Construct entry using provided metadata flags and computed selector/source.",
+        "Upsert and save atomically.",
+        "Add tests for example URLs and resulting catalog entry fields."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+        "id": "L2-RS-024",
+        "title": "REST search: define remote search response schema and client structs (Case 6)",
+        "category": "rest-catalog",
+        "description": "Problem/Objective: MACC must support searching a REST API for skills/MCP entries. Main Features: define JSON response with items[] entries matching local schema fields. Scope/Boundaries: No auth/pagination in this milestone. Success Criteria: client deserializes sample payloads to entries.",
+        "objective": "Standardize remote search payloads so the CLI can search and import results into local catalogs.",
+        "result": "Remote search response structs exist and parse fixtures successfully.",
+        "steps": [
+          "Define `RemoteSearchResponse { items: [...] }` where items match entry schema (id,name,description,tags,selector,source).",
+          "Add JSON fixtures for both skill and mcp responses.",
+          "Add unit tests deserializing fixtures."
+        ],
+        "priority": 2,
+        "passes": true,
+        "notes": ""
+      },
+    {
+      "id": "L2-RS-025",
+      "title": "REST search: implement HTTP client to query remote catalog server (Case 6)",
+      "category": "rest-catalog",
+      "description": "Problem/Objective: Perform remote searches without TUI. Main Features: GET `/search?kind=<skill|mcp>&q=<text>` with timeouts; handle errors. Scope/Boundaries: Public endpoints only. Success Criteria: returns items on 200; returns actionable error on non-200 or invalid JSON.",
+      "objective": "Enable CLI remote search that can discover entries beyond the local DB.",
+      "result": "Client function `remote_search(api_base, kind, q)` returns parsed entries or clear errors.",
+      "steps": [
+        "Implement HTTP GET with query parameters and timeouts.",
+        "Set user-agent `macc/<version>`.",
+        "Handle non-200 responses (include status and message excerpt).",
+        "Handle JSON parse errors with response context.",
+        "Add tests using mocked HTTP server if feasible."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L2-RS-026",
+      "title": "CLI: `macc catalog search-remote` with optional import into local DB (Case 6)",
+      "category": "cli",
+      "description": "Problem/Objective: Without TUI, users need to search remote API and optionally persist results locally. Main Features: `search-remote --api --kind --q [--add] [--add-ids]`. Scope/Boundaries: No interactive selection. Success Criteria: prints results; imports results into correct local file atomically.",
+      "objective": "Deliver the Case 6 workflow end-to-end: search remote → import to local DB → install by id.",
+      "result": "Command prints results and optionally upserts them into `skills.catalog.json` or `mcp.catalog.json`.",
+      "steps": [
+        "Add `catalog search-remote` CLI command and flags.",
+        "Call remote_search client and print id/name/tags/source.kind.",
+        "If `--add`: import all results; if `--add-ids`, import only matching ids.",
+        "Upsert into correct catalog file and save atomically.",
+        "Add tests for import filtering logic."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+      {
+        "id": "L2-RS-027",
+        "title": "Integration test: multi-skill ZIP installs only selected skill (Case 2)",
+        "category": "tests",
+        "description": "Problem/Objective: Prove Case 2 correctness (zip contains multiple skills, install only selected). Main Features: build zip fixture with two skills; set two catalog entries pointing to same zip with different selector.subpath; install one. Scope/Boundaries: No real network. Success Criteria: only selected destination exists.",
+        "objective": "Prevent regressions for selective installs from zip bundles.",
+        "result": "Test validates that only the selected skill folder is installed into tool directories.",
+        "steps": [
+          "Create temp project and zip fixture containing `skills/a/SKILL.md` and `skills/b/SKILL.md`.",
+          "Create two catalog entries with same HTTP source but different subpaths.",
+          "Run `macc install skill --tool claude --id a` (or apply selection).",
+          "Assert `.claude/skills/a/` exists and `.claude/skills/b/` does not."
+        ],
+        "priority": 1,
+        "passes": true,
+        "notes": ""
+      },
+    
+    {
+      "id": "L2-RS-028",
+      "title": "Integration test: multi-skill Git repo installs only selected skill with sparse-checkout (Case 4/5)",
+      "category": "tests",
+      "description": "Problem/Objective: Prove Case 4/5 correctness (repo contains multiple skills; install only selected; use sparse-checkout). Main Features: local git repo fixture; two skills; install one. Scope/Boundaries: Requires git CLI in CI. Success Criteria: only selected destination exists; optionally verify cache checkout excludes unselected folder.",
+      "objective": "Prevent regressions for selective installs from multi-skill repos and sparse-checkout behavior.",
+      "result": "Test validates selective install and (best-effort) sparse checkout folder-only materialization.",
+      "steps": [
+        "Create local git repo with `skills/a` and `skills/b` and commit.",
+        "Catalog entries share the same git source but differ in selector.subpath.",
+        "Run `macc install skill --tool codex --id a`.",
+        "Assert `.codex/skills/a/` exists and `.codex/skills/b/` does not.",
+        "Optionally assert cache working tree does not contain `skills/b` when sparse enabled."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "If sparse folder assertions are flaky across git versions, keep them best-effort and focus on install correctness."
+    },
+    {
+      "id": "L2-RS-029",
+      "title": "Security boundaries: reject symlinks, prevent zip path traversal, run secret scan before apply",
+      "category": "security",
+      "description": "Problem/Objective: Remote artifacts are untrusted; MACC must enforce safety boundaries. Main Features: zip slip defense (already), reject symlinks during extraction and/or folder expansion, never execute remote scripts, run secret scanning on planned outputs. Scope/Boundaries: Not full malware scanning. Success Criteria: symlink installs fail; secret scan blocks/warns; no code execution paths exist.",
+      "objective": "Make remote installs safe-by-default even when sources are arbitrary servers.",
+      "result": "Remote install pipeline enforces hard safety rules and fails with clear messages when violated.",
+      "steps": [
+        "During unzip and file-walk expansion, detect and reject symlinks by default.",
+        "Ensure no step runs scripts/hooks from downloaded content (data-only install).",
+        "Run existing secret scan module on planned file contents before apply write.",
+        "Add tests that create a symlink in a fixture and assert install fails."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "L2-RS-030",
+      "title": "Documentation: CLI-only workflows for Cases 1–6",
+      "category": "docs",
+      "description": "Problem/Objective: Users need clear instructions for catalogs, imports, installs, and remote search without a TUI. Main Features: document file locations, schema fields, and examples for each case. Scope/Boundaries: Keep concise. Success Criteria: user can follow steps to import a GitHub tree link, install a skill, and search/import from REST API.",
+      "objective": "Make the feature usable by humans and AI agents without ambiguity.",
+      "result": "Docs/README describe catalogs, commands, examples for Cases 1–6, and security constraints (checksum recommended, no scripts).",
+      "steps": [
+        "Document `.macc/catalog/skills.catalog.json` and `.macc/catalog/mcp.catalog.json` schema.",
+        "Provide examples for Case 1–2 (zip), Case 3–5 (git + tree links), Case 6 (REST search).",
+        "Document `catalog add`, `catalog import-url`, `catalog search-remote --add`, and `install` commands.",
+        "Add security notes: checksum, symlink rejection, no post-install scripts."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+claude
+gemini
+codex
+gpt-4
+gpt-3.5
+anthropic
+google
+openai
