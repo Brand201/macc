@@ -128,7 +128,10 @@ pub fn header_lines(ctx: &HeaderContext<'_>, t: &Theme) -> Vec<Line<'static>> {
                 Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(ctx.screen_title.to_string(), Style::default().fg(t.accent_dim)),
+            Span::styled(
+                ctx.screen_title.to_string(),
+                Style::default().fg(t.accent_dim),
+            ),
             Span::raw("  "),
             Span::styled("mode", Style::default().fg(t.muted)),
             Span::raw(": "),

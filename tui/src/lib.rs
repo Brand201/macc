@@ -312,8 +312,7 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
         status: state.status_line(),
         width: chunks[0].width,
     };
-    let title = Paragraph::new(header_lines(&header_ctx, &theme))
-    .block(panel("MACC"));
+    let title = Paragraph::new(header_lines(&header_ctx, &theme)).block(panel("MACC"));
     f.render_widget(title, chunks[0]);
 
     // Body
