@@ -44,6 +44,7 @@ MACC must provide:
 - Linux/macOS: `install.sh`
 - Windows: `install.ps1`
 - A `macc` command available in the PATH
+- Optional GitHub bootstrap via `curl -sSL .../scripts/install.sh | bash`
 
 ---
 
@@ -53,10 +54,11 @@ MACC must provide:
 **Goal**: install MACC and (optionally) detect/install AI tools.
 
 - The user runs:
-  - Linux/macOS: `./install.sh [options]`
+  - Linux/macOS: `./scripts/install.sh [options]` (or GitHub `curl -sSL` installer)
   - Windows: `./install.ps1 [options]`
 - The script:
   - installs the `macc` binary/command,
+  - installs `macc-uninstall` helper,
   - proposes installing/detecting supported tools,
   - configures user-level locations if chosen (with backup + consent).
 
@@ -103,7 +105,8 @@ For production-like usage, the recommended sequence is:
 
 #### 3.4.1 Blank machine bootstrap
 - Install system dependencies (`git`, `curl`, `jq`, build toolchain).
-- Install MACC via `./scripts/install.sh --release`.
+- Install MACC via `./scripts/install.sh --release` or:
+  - `curl -sSL https://raw.githubusercontent.com/Brand201/macc/master/scripts/install.sh | bash -s -- --release`
 - Verify binary in PATH with `macc --version`.
 
 #### 3.4.2 Tool installation and validation

@@ -22,7 +22,7 @@ use macc_core::plan::{PlannedOpKind, Scope};
 use macc_core::tool::{FieldDefault, FieldKind};
 use screen::Screen;
 use state::AppState;
-use ui::{compact_help_line, header_lines, panel, theme, wrapped_paragraph};
+use ui::{compact_help_line, header_lines, panel, theme, wrapped_paragraph, HeaderContext};
 
 /// RAII guard to ensure terminal state is restored on drop.
 struct TerminalGuard {
@@ -302,18 +302,17 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
             "warn"
         }
     );
-    let title = Paragraph::new(header_lines(
-        "[M][A][C][C]",
-        current_screen.title(),
-        state.interaction_mode_label(),
-        &project_label,
-        &config_status,
-        state.errors.len(),
-        state.status_line(),
-        chunks[0].width,
-        &theme,
-    ))
-    .block(panel("MACC"));
+    let header_ctx = HeaderContext {
+        app_name: "[M][A][C][C]",
+        screen_title: current_screen.title(),
+        mode: state.interaction_mode_label(),
+        project: &project_label,
+        config_label: &config_status,
+        errors: state.errors.len(),
+        status: state.status_line(),
+        width: chunks[0].width,
+    };
+    let title = Paragraph::new(header_lines(&header_ctx, &theme)).block(panel("MACC"));
     f.render_widget(title, chunks[0]);
 
     // Body

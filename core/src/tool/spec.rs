@@ -547,9 +547,7 @@ fn parse_array_default(value: &serde_json::Value) -> Option<Vec<String>> {
     if let Some(arr) = value.as_array() {
         let mut items = Vec::new();
         for entry in arr {
-            let Some(text) = entry.as_str() else {
-                return None;
-            };
+            let text = entry.as_str()?;
             items.push(text.to_string());
         }
         return Some(items);

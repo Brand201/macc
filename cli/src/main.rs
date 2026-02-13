@@ -6193,24 +6193,36 @@ exit 0
         let skill_b_dir = project_path.join(format!(".{}/skills/skill-b", tool_one));
         assert!(!skill_b_dir.exists(), "Skill B should NOT be installed");
 
-        // 6. Verify sparse checkout in cache
-        let cache_dir = project_path.join(".macc/cache");
+        // 6. Verify sparse checkout in cache (project cache or shared user cache)
         let mut found_cache = false;
-        if let Ok(entries) = std::fs::read_dir(cache_dir) {
-            for entry in entries.flatten() {
-                let repo_dir = entry.path().join("repo");
-                if repo_dir.exists() {
-                    found_cache = true;
-                    // In sparse checkout (cone mode), skills/a should exist, but skills/b should NOT be materialized
-                    assert!(repo_dir.join("skills/a").exists());
-                    assert!(
-                        !repo_dir.join("skills/b").exists(),
-                        "skills/b should NOT be materialized in sparse checkout"
-                    );
+        let mut found_sparse_match = false;
+        let mut cache_roots = vec![project_path.join(".macc/cache")];
+        if let Some(home) = std::env::var_os("HOME") {
+            cache_roots.push(std::path::PathBuf::from(home).join(".macc/cache"));
+        }
+        for cache_dir in cache_roots {
+            if let Ok(entries) = std::fs::read_dir(cache_dir) {
+                for entry in entries.flatten() {
+                    let repo_dir = entry.path().join("repo");
+                    if repo_dir.exists() {
+                        found_cache = true;
+                        // Look for the cache entry matching this test's sparse checkout.
+                        if repo_dir.join("skills/a").exists() {
+                            assert!(
+                                !repo_dir.join("skills/b").exists(),
+                                "skills/b should NOT be materialized in sparse checkout"
+                            );
+                            found_sparse_match = true;
+                        }
+                    }
                 }
             }
         }
         assert!(found_cache, "Cache entry for git repo should exist");
+        assert!(
+            found_sparse_match,
+            "Expected at least one sparse cache entry with skills/a"
+        );
 
         std::fs::remove_dir_all(&temp_base).ok();
         Ok(())

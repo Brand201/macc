@@ -51,7 +51,7 @@ fn plan_operations_returns_expected_write_ops() -> Result<()> {
         .as_ref()
         .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
         .unwrap_or_default();
-    assert!(gitignore_after.contains(".macc/tmp/"));
+    assert!(gitignore_after.contains(".macc/"));
     assert_eq!(gitignore_op.kind, macc_core::plan::PlannedOpKind::Write);
 
     let macs = &ops[3];

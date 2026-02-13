@@ -460,7 +460,7 @@ mod tests {
     fn test_engine_doctor() {
         let (paths, temp_dir) = create_test_paths();
         // Create a dummy tool spec file
-        let tools_d = paths.root.join("registry/tools.d");
+        let tools_d = paths.root.join(".macc/tools.d");
         fs::create_dir_all(&tools_d).unwrap();
         let spec = r#"
 api_version: v1
@@ -484,7 +484,7 @@ fields: []
     fn test_engine_list_tools() {
         let (paths, temp_dir) = create_test_paths();
         // Create a dummy tool spec file
-        let tools_d = paths.root.join("registry/tools.d");
+        let tools_d = paths.root.join(".macc/tools.d");
         fs::create_dir_all(&tools_d).unwrap();
         let spec = r#"
 api_version: v1

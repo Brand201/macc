@@ -13,10 +13,24 @@ MACC is a tool-agnostic configuration manager for AI coding assistants. It keeps
 
 ## Installation
 
-### Quick install (recommended)
+### Recommended: install from GitHub (`curl -sSL`)
 
 ```bash
-./scripts/install.sh
+curl -sSL https://raw.githubusercontent.com/Brand201/macc/master/scripts/install.sh | bash -s -- --release
+```
+
+Pinned release/tag example:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Brand201/macc/v0.1.0/scripts/install.sh | bash -s -- --release --ref v0.1.0
+```
+
+### Alternative: install from a local clone
+
+```bash
+git clone https://github.com/Brand201/macc.git
+cd macc
+./scripts/install.sh --release
 ```
 
 Options:
@@ -25,18 +39,35 @@ Options:
 - `--prefix <dir>`: install `macc` into a custom directory.
 - `--system`: install to `/usr/local/bin` (uses `sudo`).
 - `--no-path`: do not update shell profile `PATH`.
+- `--repo <url>`: install from another git repository URL.
+- `--ref <ref>`: install from branch/tag/commit (default: `master`).
 
 ### Uninstall
+
+Recommended:
+
+```bash
+macc-uninstall
+```
+
+Alternative from a local clone:
 
 ```bash
 ./scripts/uninstall.sh
 ```
 
+Uninstall directly from GitHub script:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Brand201/macc/master/scripts/uninstall.sh | bash
+```
+
 Options:
 
 - `--system`: remove `/usr/local/bin/macc`.
-- `--prefix <dir>`: remove `<dir>/macc`.
+- `--prefix <dir>`: remove `<dir>/macc` and `<dir>/macc-uninstall`.
 - `--clean-profile`: remove installer-added `PATH` lines from shell profiles.
+- `--keep-helper`: keep `macc-uninstall` while removing `macc`.
 
 ## Quick start
 
@@ -81,10 +112,16 @@ sudo apt-get update
 sudo apt-get install -y git curl jq build-essential pkg-config libssl-dev
 ```
 
-2. Clone MACC and install it:
+2. Install MACC (recommended: GitHub installer):
 
 ```bash
-git clone <your-macc-repo-url> macc
+curl -sSL https://raw.githubusercontent.com/Brand201/macc/master/scripts/install.sh | bash -s -- --release
+```
+
+Alternative (local clone):
+
+```bash
+git clone https://github.com/Brand201/macc.git
 cd macc
 ./scripts/install.sh --release
 ```

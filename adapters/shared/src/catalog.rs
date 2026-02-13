@@ -68,6 +68,7 @@ pub fn remote_search<T: DeserializeOwned>(
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
+    use std::net::Shutdown;
     use std::net::TcpListener;
     use std::thread;
 
@@ -93,7 +94,7 @@ mod tests {
         };
         let server_url = format!("http://127.0.0.1:{}", port);
 
-        thread::spawn(move || {
+        let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(&mut stream);
             let mut line = String::new();
@@ -120,6 +121,8 @@ mod tests {
                 response_body
             );
             stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            let _ = stream.shutdown(Shutdown::Both);
         });
 
         #[derive(serde::Deserialize, Debug, PartialEq)]
@@ -133,6 +136,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "s1");
         assert_eq!(results[0].name, "Skill 1");
+        server.join().unwrap();
     }
 
     #[test]
@@ -143,10 +147,22 @@ mod tests {
         };
         let server_url = format!("http://127.0.0.1:{}", port);
 
-        thread::spawn(move || {
+        let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            // Read full request headers before responding.
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
             let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nInvalid kind";
             stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            let _ = stream.shutdown(Shutdown::Both);
         });
 
         #[derive(serde::Deserialize, Debug)]
@@ -157,6 +173,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Search failed with status 400 Bad Request"));
         assert!(err_msg.contains("Invalid kind"));
+        server.join().unwrap();
     }
 
     #[test]
@@ -167,10 +184,22 @@ mod tests {
         };
         let server_url = format!("http://127.0.0.1:{}", port);
 
-        thread::spawn(move || {
+        let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            // Read full request headers before responding.
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
             let response = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nNot JSON";
             stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            let _ = stream.shutdown(Shutdown::Both);
         });
 
         #[derive(serde::Deserialize, Debug)]
@@ -181,5 +210,6 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         println!("Actual error: {}", err_msg);
         assert!(err_msg.contains("Failed to parse search response"));
+        server.join().unwrap();
     }
 }
