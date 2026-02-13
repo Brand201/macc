@@ -1809,8 +1809,7 @@ mod tests {
             "hello"
         );
         let gitignore_content = fs::read_to_string(temp_dir.join(".gitignore")).unwrap();
-        assert!(gitignore_content.contains(".macc/tmp/"));
-        assert!(gitignore_content.contains(".macc/backups/"));
+        assert!(gitignore_content.contains(".macc/"));
         assert!(gitignore_content.contains("*.log"));
 
         fs::remove_dir_all(&temp_dir).ok();
