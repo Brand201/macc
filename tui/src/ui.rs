@@ -107,31 +107,32 @@ pub fn compact_help_line(items: Vec<(&str, &str)>, max_chars: usize) -> String {
     out
 }
 
-pub fn header_lines(
-    app_name: &str,
-    screen_title: &str,
-    mode: &str,
-    project: &str,
-    config_label: &str,
-    errors: usize,
-    status: Option<(UiStatusLevel, String)>,
-    width: u16,
-    t: &Theme,
-) -> Vec<Line<'static>> {
-    let max = width.saturating_sub(6) as usize;
-    let project_short = truncate_middle(project, max.saturating_sub(12));
+pub struct HeaderContext<'a> {
+    pub app_name: &'a str,
+    pub screen_title: &'a str,
+    pub mode: &'a str,
+    pub project: &'a str,
+    pub config_label: &'a str,
+    pub errors: usize,
+    pub status: Option<(UiStatusLevel, String)>,
+    pub width: u16,
+}
+
+pub fn header_lines(ctx: &HeaderContext<'_>, t: &Theme) -> Vec<Line<'static>> {
+    let max = ctx.width.saturating_sub(6) as usize;
+    let project_short = truncate_middle(ctx.project, max.saturating_sub(12));
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
-                app_name.to_string(),
+                ctx.app_name.to_string(),
                 Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(screen_title.to_string(), Style::default().fg(t.accent_dim)),
+            Span::styled(ctx.screen_title.to_string(), Style::default().fg(t.accent_dim)),
             Span::raw("  "),
             Span::styled("mode", Style::default().fg(t.muted)),
             Span::raw(": "),
-            Span::styled(mode.to_string(), Style::default().fg(t.accent)),
+            Span::styled(ctx.mode.to_string(), Style::default().fg(t.accent)),
         ]),
         Line::from(vec![
             Span::styled("project", Style::default().fg(t.muted)),
@@ -140,22 +141,22 @@ pub fn header_lines(
             Span::raw("  "),
             Span::styled("config", Style::default().fg(t.muted)),
             Span::raw(": "),
-            Span::raw(config_label.to_string()),
+            Span::raw(ctx.config_label.to_string()),
             Span::raw("  "),
             Span::styled("errors", Style::default().fg(t.muted)),
             Span::raw(": "),
             Span::styled(
-                errors.to_string(),
-                Style::default().fg(if errors == 0 { t.good } else { t.bad }),
+                ctx.errors.to_string(),
+                Style::default().fg(if ctx.errors == 0 { t.good } else { t.bad }),
             ),
         ]),
     ];
 
-    if let Some((lvl, msg)) = status {
+    if let Some((lvl, msg)) = &ctx.status {
         lines.push(Line::from(vec![
             Span::styled("status", Style::default().fg(t.muted)),
             Span::raw(": "),
-            Span::styled(truncate_middle(&msg, max), status_style(lvl, t)),
+            Span::styled(truncate_middle(msg, max), status_style(*lvl, t)),
         ]));
     } else {
         lines.push(Line::from(vec![

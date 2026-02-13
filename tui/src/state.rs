@@ -757,12 +757,12 @@ impl AppState {
     }
 
     pub fn interaction_mode_label(&self) -> &'static str {
-        if self.current_screen() == Screen::ToolSettings && self.is_tool_field_editing() {
-            "edit"
-        } else if self.current_screen() == Screen::Automation && self.is_automation_field_editing()
+        let screen = self.current_screen();
+        if (screen == Screen::ToolSettings && self.is_tool_field_editing())
+            || (screen == Screen::Automation && self.is_automation_field_editing())
         {
             "edit"
-        } else if self.current_screen() == Screen::Apply {
+        } else if screen == Screen::Apply {
             "confirm"
         } else {
             "browse"
@@ -924,7 +924,7 @@ impl AppState {
 
     pub fn take_full_clear(&mut self) -> bool {
         let current = self.current_screen();
-        let needs_clear = self.last_screen.map_or(true, |prev| prev != current);
+        let needs_clear = self.last_screen != Some(current);
         self.last_screen = Some(current);
         needs_clear
     }
@@ -1213,7 +1213,7 @@ impl AppState {
             FieldKind::Bool => {
                 let current = self
                     .read_bool_at(&field.path)
-                    .or_else(|| match &field.default {
+                    .or(match &field.default {
                         Some(FieldDefault::Bool(value)) => Some(*value),
                         _ => None,
                     })
@@ -1407,7 +1407,7 @@ impl AppState {
         let idx = self.automation_field_index;
         let input = self.automation_field_input.trim().to_string();
         let result = match idx {
-            0 | 1 | 2 | 3 => {
+            0..=3 => {
                 if input.is_empty() {
                     Err("Value cannot be empty.".to_string())
                 } else {
@@ -1421,7 +1421,7 @@ impl AppState {
             }
             5 => self.set_automation_field_tool_caps(input),
             6 => self.set_automation_field_tool_specializations(input),
-            7 | 8 | 9 | 10 | 11 | 12 | 13 => match input.parse::<usize>() {
+            7..=13 => match input.parse::<usize>() {
                 Ok(value) => {
                     self.set_automation_field_usize(idx, value);
                     Ok(())
@@ -1653,7 +1653,7 @@ impl AppState {
             FieldKind::Bool => {
                 let current = self
                     .read_bool_at(&field.path)
-                    .or_else(|| match &field.default {
+                    .or(match &field.default {
                         Some(FieldDefault::Bool(value)) => Some(*value),
                         _ => None,
                     })
@@ -1666,21 +1666,21 @@ impl AppState {
             }
             FieldKind::Enum(ref options) => self
                 .read_string_at(&field.path)
-                .or_else(|| match &field.default {
+                .or(match &field.default {
                     Some(FieldDefault::Enum(value)) => Some(value.clone()),
                     _ => None,
                 })
                 .unwrap_or_else(|| options[0].to_string()),
             FieldKind::Text => self
                 .read_string_at(&field.path)
-                .or_else(|| match &field.default {
+                .or(match &field.default {
                     Some(FieldDefault::Text(value)) => Some(value.clone()),
                     _ => None,
                 })
                 .unwrap_or_default(),
             FieldKind::Number => self
                 .read_number_at(&field.path)
-                .or_else(|| match &field.default {
+                .or(match &field.default {
                     Some(FieldDefault::Number(value)) => Some(*value),
                     _ => None,
                 })
@@ -1688,7 +1688,7 @@ impl AppState {
                 .unwrap_or_default(),
             FieldKind::Array => self
                 .read_array_at(&field.path)
-                .or_else(|| match &field.default {
+                .or(match &field.default {
                     Some(FieldDefault::Array(value)) => Some(value.clone()),
                     _ => None,
                 })
@@ -2544,7 +2544,7 @@ impl AppState {
         let idx = self.automation_field_index;
         let input = self.automation_field_input.trim();
         match idx {
-            0 | 1 | 2 | 3 => {
+            0..=3 => {
                 if input.is_empty() {
                     Some("Value cannot be empty.".to_string())
                 } else {
@@ -2557,7 +2557,7 @@ impl AppState {
             6 => serde_json::from_str::<BTreeMap<String, Vec<String>>>(input)
                 .err()
                 .map(|e| format!("Invalid JSON: {}", e)),
-            7 | 8 | 9 | 10 | 11 | 12 | 13 => {
+            7..=13 => {
                 if input.parse::<usize>().is_err() {
                     Some("Invalid integer value.".to_string())
                 } else {
