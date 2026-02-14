@@ -18,8 +18,12 @@ tools:
     claude:
       model: sonnet
       language: English
+      context:
+        protect: true
     gemini:
       user_mcp_merge: true
+      context:
+        protect: true
 
   # Legacy/Flattened: Top-level keys are also mapped to tool IDs
   # (Supported for backward compatibility, but 'config' is preferred)
@@ -93,6 +97,27 @@ A list of tool IDs that are active for the project. Adapters for these tools wil
 
 ### `tools.config`
 A map where each key is a tool ID and the value is an arbitrary JSON/YAML object containing settings for that tool. This is the preferred way to store tool-specific configuration because it avoids naming collisions with core MACC fields and doesn't require updating MACC's internal Rust structs when a tool adds a new setting.
+
+Recommended context protection flag per tool:
+
+```yaml
+tools:
+  config:
+    codex:
+      context:
+        protect: true
+        fileName: AGENTS.md
+    claude:
+      context:
+        protect: true
+        fileName: CLAUDE.md
+    gemini:
+      context:
+        protect: true
+        fileName: GEMINI.md
+```
+
+When `context.protect: true` is set for a tool, `macc apply` will not overwrite an existing context file for that tool. This preserves files updated by `macc context` or manual edits.
 
 ### Legacy Flattened Settings
 For compatibility, MACC also supports placing tool settings directly under the `tools` key (e.g., `tools.claude:`). These are merged into the resolved configuration but may be deprecated in the future in favor of the `config` map.

@@ -1,37 +1,9 @@
 use crate::map::GeminiConfig;
 use macc_adapter_shared::render::format::render_json_pretty;
-use serde_json::{json, Map as JsonMap, Value as JsonValue};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 pub fn render_settings_json(config: &GeminiConfig) -> String {
-    let has_skills = !config.skills.is_empty() || !config.agents.is_empty();
-
-    let mut settings = json!(
-        {
-            "hasSeenIdeIntegrationNudge": true,
-            "ide": {
-                "enabled": true
-            },
-            "security": {
-                "disableYoloMode": false,
-            },
-            "general": {
-                "previewFeatures": true
-            },
-            "model": {
-                "name": "auto-gemini-3"
-            },
-            "privacy": {
-                "usageStatisticsEnabled": true
-            },
-            "tools": {
-                "approvalMode": "default",
-            },
-            "experimental": {
-                "skills": has_skills,
-                "plan": false
-            }
-        }
-    );
+    let mut settings = JsonValue::Object(JsonMap::new());
 
     let raw = sanitize_raw_config(&config.tool_config);
     merge_json(&mut settings, raw);
@@ -229,7 +201,9 @@ pub fn render_settings_json(config: &GeminiConfig) -> String {
     for (key, value) in &config.mcp_servers {
         mcp_servers.insert(key.clone(), value.clone());
     }
-    let _ = set_json_pointer(&mut settings, "/mcpServers", JsonValue::Object(mcp_servers));
+    if !mcp_servers.is_empty() {
+        let _ = set_json_pointer(&mut settings, "/mcpServers", JsonValue::Object(mcp_servers));
+    }
 
     render_json_pretty(&settings)
 }

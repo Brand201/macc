@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct ClaudeConfig {
     pub language: String,
     pub model: String,
-    pub permissions: String,
     pub standards_inline: BTreeMap<String, String>,
     pub standards_path: Option<String>,
     pub skills: Vec<String>,
@@ -22,8 +21,6 @@ struct ClaudeConfigSource {
     model: Option<String>,
     #[serde(default)]
     language: Option<String>,
-    #[serde(default)]
-    permissions: Option<String>,
     #[serde(default)]
     skills: Vec<String>,
     #[serde(default)]
@@ -52,8 +49,6 @@ impl ClaudeConfig {
 
         let model = source.model.unwrap_or_else(|| "sonnet".to_string());
 
-        let permissions = source.permissions.unwrap_or_else(|| "safe".to_string());
-
         let mut skills_set = BTreeSet::new();
         // Global selections
         for skill in &resolved.selections.skills {
@@ -78,7 +73,6 @@ impl ClaudeConfig {
         Self {
             language,
             model,
-            permissions,
             standards_inline: resolved.standards.inline.clone(),
             standards_path: resolved.standards.path.clone(),
             skills: skills_set.into_iter().collect(),

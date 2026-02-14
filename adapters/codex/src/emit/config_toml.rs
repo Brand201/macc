@@ -4,81 +4,90 @@ use serde_json::Value as JsonValue;
 use toml::Value;
 
 pub fn render_config_toml(config: &CodexToolConfig) -> String {
-    let mut root = toml::map::Map::new();
-    let model = config
-        .model
-        .clone()
-        .unwrap_or_else(|| "gpt-5.2-codex".to_string());
-    let approval_policy = config
-        .approval_policy
-        .clone()
-        .unwrap_or_else(|| "never".to_string());
-    let sandbox_mode = config
-        .sandbox_mode
-        .clone()
-        .unwrap_or_else(|| "workspace-write".to_string());
-    let model_reasoning_effort = config
-        .model_reasoning_effort
-        .clone()
-        .unwrap_or_else(|| "medium".to_string());
-
-    root.insert("model".to_string(), Value::String(model));
-    root.insert(
-        "approval_policy".to_string(),
-        Value::String(approval_policy),
-    );
-    root.insert("sandbox_mode".to_string(), Value::String(sandbox_mode));
-    root.insert(
-        "model_reasoning_effort".to_string(),
-        Value::String(model_reasoning_effort),
-    );
-
-    let mut features = toml::map::Map::new();
-    features.insert(
-        "undo".to_string(),
-        Value::Boolean(config.features_undo.unwrap_or(true)),
-    );
-    features.insert(
-        "shell_snapshot".to_string(),
-        Value::Boolean(config.features_shell_snapshot.unwrap_or(false)),
-    );
-    root.insert("features".to_string(), Value::Table(features));
-
-    let mut profile = toml::map::Map::new();
-    let profile_model = config
-        .profile_deep_review_model
-        .clone()
-        .unwrap_or_else(|| "gpt-5.2-codex".to_string());
-    let profile_model_reasoning = config
-        .profile_deep_review_model_reasoning_effort
-        .clone()
-        .unwrap_or_else(|| "medium".to_string());
-    let profile_approval_policy = config
-        .profile_deep_review_approval_policy
-        .clone()
-        .unwrap_or_else(|| "never".to_string());
-
-    profile.insert("model".to_string(), Value::String(profile_model));
-    profile.insert(
-        "model_reasoning_effort".to_string(),
-        Value::String(profile_model_reasoning),
-    );
-    profile.insert(
-        "approval_policy".to_string(),
-        Value::String(profile_approval_policy),
-    );
-
-    let mut profiles = toml::map::Map::new();
-    profiles.insert("deep-review".to_string(), Value::Table(profile));
-    root.insert("profiles".to_string(), Value::Table(profiles));
-
-    let mut merged = Value::Table(root);
+    let mut merged = Value::Table(toml::map::Map::new());
     let raw = sanitize_raw_config(&config.raw);
     if let Some(raw_toml) = json_to_toml(&raw) {
         merge_toml(&mut merged, raw_toml);
     }
 
+    set_toml_string(&mut merged, "model", config.model.as_deref());
+    set_toml_string(
+        &mut merged,
+        "approval_policy",
+        config.approval_policy.as_deref(),
+    );
+    set_toml_string(&mut merged, "sandbox_mode", config.sandbox_mode.as_deref());
+    set_toml_string(
+        &mut merged,
+        "model_reasoning_effort",
+        config.model_reasoning_effort.as_deref(),
+    );
+    set_toml_bool(&mut merged, &["features", "undo"], config.features_undo);
+    set_toml_bool(
+        &mut merged,
+        &["features", "shell_snapshot"],
+        config.features_shell_snapshot,
+    );
+    set_toml_string(
+        &mut merged,
+        "profiles.deep-review.model",
+        config.profile_deep_review_model.as_deref(),
+    );
+    set_toml_string(
+        &mut merged,
+        "profiles.deep-review.model_reasoning_effort",
+        config.profile_deep_review_model_reasoning_effort.as_deref(),
+    );
+    set_toml_string(
+        &mut merged,
+        "profiles.deep-review.approval_policy",
+        config.profile_deep_review_approval_policy.as_deref(),
+    );
+
     render_toml(&merged)
+}
+
+fn set_toml_string(root: &mut Value, dotted_path: &str, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    set_toml_value(
+        root,
+        &dotted_path.split('.').collect::<Vec<_>>(),
+        Value::String(value.to_string()),
+    );
+}
+
+fn set_toml_bool(root: &mut Value, path: &[&str], value: Option<bool>) {
+    let Some(value) = value else {
+        return;
+    };
+    set_toml_value(root, path, Value::Boolean(value));
+}
+
+fn set_toml_value(root: &mut Value, path: &[&str], value: Value) {
+    if path.is_empty() {
+        *root = value;
+        return;
+    }
+    let mut current = root;
+    for key in &path[..path.len() - 1] {
+        if !matches!(current, Value::Table(_)) {
+            *current = Value::Table(toml::map::Map::new());
+        }
+        let Value::Table(table) = current else {
+            return;
+        };
+        current = table
+            .entry((*key).to_string())
+            .or_insert_with(|| Value::Table(toml::map::Map::new()));
+    }
+    if !matches!(current, Value::Table(_)) {
+        *current = Value::Table(toml::map::Map::new());
+    }
+    if let Value::Table(table) = current {
+        table.insert(path[path.len() - 1].to_string(), value);
+    }
 }
 
 fn sanitize_raw_config(raw: &JsonValue) -> JsonValue {
