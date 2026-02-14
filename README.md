@@ -1,6 +1,10 @@
-# MACC (Multi-Assistant Code Config)
 
-MACC is a tool-agnostic configuration manager for AI coding assistants. It keeps one canonical project config (`.macc/macc.yaml`) and generates tool-specific files (Claude, Codex, Gemini, etc.) through adapters.
+# MACC
+
+MACC (Multi-Agentic Coding Config) is a agentic coding tool configuration manager. It generates tool-specific files (Claude code, Codex, Gemini Cli, etc.) via adapters.
+
+It also integrates an autonomous AI agent loop that runs Installed agentic coding tool. 
+They can run on the same project in parallel (using worktrees) repeatedly until all assigned tasks are completed. All of this is managed by a coordinator and can be done autonomously or semi-autonomously.
 
 ## What MACC provides
 
@@ -282,6 +286,8 @@ Hints are informational only and do not guarantee security.
 
 ### Worktrees
 
+Worktrees let MACC run multiple isolated task branches and tool sessions in parallel without contaminating each other, while keeping the main repo clean and reviewable.
+
 - `macc worktree create <slug> --tool <tool_id> [--count N] [--base BRANCH] [--scope CSV] [--feature LABEL] [--skip-apply] [--allow-user-scope]`
 - `macc worktree list`
 - `macc worktree status`
@@ -296,6 +302,8 @@ Hints are informational only and do not guarantee security.
 - `macc worktree prune`
 
 ### Coordinator
+
+Coordinator orchestrates the end-to-end automation cycle: it reads the task registry, dispatches work to tools, tracks state transitions, and reconciles/cleans up until convergence.
 
 - `macc coordinator` (default full cycle: sync -> dispatch -> advance -> reconcile -> cleanup in loop until convergence)
 - `macc coordinator [run|dispatch|advance|sync|status|reconcile|unlock|cleanup|stop]`
