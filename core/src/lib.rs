@@ -1217,6 +1217,7 @@ pub fn clear(paths: &ProjectPaths) -> Result<ClearReport> {
     });
 
     let mut report = ClearReport::default();
+    let mut removed_paths: Vec<PathBuf> = Vec::new();
     for rel in entries {
         let full = paths.root.join(&rel);
         if !full.exists() {
@@ -1228,12 +1229,51 @@ pub fn clear(paths: &ProjectPaths) -> Result<ClearReport> {
             std::fs::remove_file(&full)
         };
         match result {
-            Ok(_) => report.removed += 1,
+            Ok(_) => {
+                report.removed += 1;
+                removed_paths.push(full);
+            }
             Err(_) => report.skipped += 1,
         }
     }
 
+    cleanup_empty_parents(paths, &removed_paths);
+
     Ok(report)
+}
+
+fn cleanup_empty_parents(paths: &ProjectPaths, removed: &[PathBuf]) {
+    let mut candidates: HashSet<PathBuf> = HashSet::new();
+    for path in removed {
+        let mut current = path.parent();
+        while let Some(dir) = current {
+            if dir == paths.root {
+                break;
+            }
+            candidates.insert(dir.to_path_buf());
+            current = dir.parent();
+        }
+    }
+
+    let mut candidates: Vec<PathBuf> = candidates.into_iter().collect();
+    candidates.sort_by(|a, b| {
+        let depth_a = a.components().count();
+        let depth_b = b.components().count();
+        depth_b.cmp(&depth_a).then_with(|| b.cmp(a))
+    });
+
+    for dir in candidates {
+        if !dir.exists() {
+            continue;
+        }
+        let is_empty = std::fs::read_dir(&dir)
+            .ok()
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(false);
+        if is_empty {
+            let _ = std::fs::remove_dir(&dir);
+        }
+    }
 }
 pub const BASELINE_IGNORE_ENTRIES: &[&str] = &[".macc/"];
 
@@ -2202,6 +2242,30 @@ mod tests {
         assert!(report.removed >= 1);
         assert!(!generated.exists());
         assert!(preexisting.exists());
+
+        fs::remove_dir_all(&temp_dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_clear_removes_empty_parent_dirs() -> Result<()> {
+        let temp_dir =
+            std::env::temp_dir().join(format!("macc_clear_dirs_test_{}", uuid_v4_like()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let paths = ProjectPaths::from_root(&temp_dir);
+
+        let nested = temp_dir.join("a/b/c");
+        fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("file.txt");
+        fs::write(&file, "data").unwrap();
+        record_managed_path(&paths, "a/b/c/file.txt")?;
+
+        let report = clear(&paths)?;
+        assert!(report.removed > 0);
+        assert!(!file.exists());
+        assert!(!nested.exists());
+        assert!(!temp_dir.join("a/b").exists());
+        assert!(!temp_dir.join("a").exists());
 
         fs::remove_dir_all(&temp_dir).ok();
         Ok(())
