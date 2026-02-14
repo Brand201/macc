@@ -52,6 +52,7 @@ impl Screen {
                 ("Space", "Toggle Tool"),
                 ("Enter", "Configure Tool"),
                 ("d", "Refresh Tool Checks"),
+                ("f", "Generate Tool Context"),
             ],
             Screen::Automation => vec![
                 ("Up/Down", "Navigate Settings"),

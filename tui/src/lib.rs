@@ -262,6 +262,11 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
                 state.begin_tool_install_confirmation();
             }
         }
+        KeyCode::Char('f') => {
+            if current_screen == Screen::Tools {
+                state.generate_context_for_selected_tool();
+            }
+        }
         _ => {}
     }
 }
@@ -1245,7 +1250,7 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
                     detail.push_str("\nError:\n");
                     detail.push_str(&msg);
                 }
-                detail.push_str("\n\nShortcuts:\nSpace - Toggle\nEnter - Configure\n'i' - Install missing tool\n'd' - Refresh checks");
+                detail.push_str("\n\nShortcuts:\nSpace - Toggle\nEnter - Configure\n'i' - Install missing tool\n'd' - Refresh checks\n'f' - Generate context file");
                 if state.is_tool_install_confirmation_open() {
                     detail.push_str(
                         "\n\nInstall confirmation pending: press 'y' to install, 'n' to cancel.",

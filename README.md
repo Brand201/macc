@@ -260,6 +260,10 @@ macc clear
 
 - `macc tui`: open interactive UI.
 - `macc tool install <tool_id> [-y|--yes]`: install local tool via ToolSpec install commands.
+- `macc context [--tool <tool_id>] [--from <file> ...] [--dry-run] [--print-prompt]`: generate/update tool context markdown files (for example `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`) using the corresponding installed tool.
+- In TUI `Tools` screen, press `f` to generate context for the selected tool.
+- To prevent `macc apply` from overwriting existing context files, set per-tool protection in `.macc/macc.yaml`:
+  - `tools.config.<tool_id>.context.protect: true`
 
 ### Catalog and installs
 

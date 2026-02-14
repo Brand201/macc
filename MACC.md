@@ -114,6 +114,9 @@ For production-like usage, the recommended sequence is:
 - Before install, users must confirm they already have account/API credentials.
 - After install, run login/API-key setup through the tool's own command flow.
 - Validate with `macc doctor`.
+- Generate/update tool-specific context files with:
+  - CLI: `macc context [--tool <tool_id>]`
+  - TUI: `Tools` screen, press `f` on a selected tool.
 
 #### 3.4.3 Project init
 - In target repo: `macc init`, then `macc tui`.

@@ -9,6 +9,7 @@ pub mod packages;
 pub mod plan;
 pub mod resolve;
 pub mod security;
+mod structured_merge;
 pub mod tool;
 pub mod user_backup;
 pub mod worktree;
@@ -20,8 +21,9 @@ pub use config::load_canonical_config;
 pub use engine::{Engine, MaccEngine, TestEngine};
 pub use resolve::{resolve, CliOverrides, ResolvedConfig};
 pub use security::Finding;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use structured_merge::StructuredToolMergePolicy;
 use thiserror::Error;
 pub use tool::{FieldKind, ToolAdapter, ToolDescriptor, ToolField, ToolRegistry};
 pub use user_backup::{find_user_home, UserBackupEntry, UserBackupManager, UserBackupReport};
@@ -387,16 +389,22 @@ pub fn init(paths: &ProjectPaths, force: bool) -> Result<()> {
     }
 
     if !paths.config_path.exists() || force {
-        let default_tools = {
+        let (available_specs, default_tools) = {
             let search_paths = crate::tool::ToolSpecLoader::default_search_paths(&paths.root);
             let loader = crate::tool::ToolSpecLoader::new(search_paths);
             let (specs, _) = loader.load_all_with_embedded();
-            specs.first().map(|s| s.id.clone()).into_iter().collect()
+            let enabled: Vec<String> = specs.first().map(|s| s.id.clone()).into_iter().collect();
+            (specs, enabled)
         };
+        let mut tool_config = BTreeMap::new();
+        for spec in available_specs {
+            tool_config.insert(spec.id, serde_json::json!({"context": {"protect": true}}));
+        }
         let default_config = config::CanonicalConfig {
             version: Some("v1".to_string()),
             tools: config::ToolsConfig {
                 enabled: default_tools,
+                config: tool_config,
                 ..Default::default()
             },
             standards: config::StandardsConfig::default(),
@@ -965,6 +973,8 @@ where
     let total_ops = operations.len();
     let mut report = ApplyReport::new();
     let mut backup_created = false;
+    let structured_merge_policy = StructuredToolMergePolicy::from_project(paths);
+    let protected_context_paths = load_protected_context_paths(paths).unwrap_or_default();
     let needs_user_scope = operations.iter().any(|op| op.scope == plan::Scope::User);
     let user_backup_manager = if allow_user_scope && needs_user_scope {
         Some(UserBackupManager::try_new()?)
@@ -997,8 +1007,21 @@ where
             }
             plan::PlannedOpKind::Write | plan::PlannedOpKind::Merge => {
                 let existing = plan::read_existing(&full_path);
+                if protected_context_paths.contains(&path) && existing.exists {
+                    report.outcomes.insert(path, plan::ActionStatus::Unchanged);
+                    continue;
+                }
                 let status = if let Some(content) = &op.after {
-                    let findings = security::scan_bytes(&path, content);
+                    let effective_content = if op.kind == plan::PlannedOpKind::Write {
+                        structured_merge_policy.merge_bytes_for_path(
+                            &path,
+                            existing.bytes.as_deref(),
+                            content,
+                        )
+                    } else {
+                        content.clone()
+                    };
+                    let findings = security::scan_bytes(&path, &effective_content);
                     for finding in &findings {
                         if finding.severity == security::Severity::Warning {
                             println!(
@@ -1009,7 +1032,7 @@ where
                     }
 
                     if is_sensitive_file(&path) {
-                        let content_str = std::str::from_utf8(content).unwrap_or("");
+                        let content_str = std::str::from_utf8(&effective_content).unwrap_or("");
                         if !security::contains_placeholder(content_str) {
                             println!(
                                 "    [SECURITY WARNING] {} - Missing placeholders in sensitive file",
@@ -1018,7 +1041,8 @@ where
                         }
                     }
 
-                    let status_guess = plan::compute_write_status(&path, content, &existing);
+                    let status_guess =
+                        plan::compute_write_status(&path, &effective_content, &existing);
                     let should_backup_project = status_guess != plan::ActionStatus::Unchanged
                         && existing.exists
                         && op.scope == plan::Scope::Project;
@@ -1044,7 +1068,7 @@ where
                         paths,
                         &path,
                         &full_path,
-                        content,
+                        &effective_content,
                         &existing,
                         |_| Ok(()),
                     )?;
@@ -1097,6 +1121,80 @@ where
     }
 
     Ok(report)
+}
+
+fn load_protected_context_paths(paths: &ProjectPaths) -> Result<HashSet<String>> {
+    let canonical = load_canonical_config(&paths.config_path)?;
+    let loader = crate::tool::ToolSpecLoader::new(
+        crate::tool::ToolSpecLoader::default_search_paths(&paths.root),
+    );
+    let (specs, _) = loader.load_all_with_embedded();
+    let spec_by_id: BTreeMap<String, crate::tool::ToolSpec> = specs
+        .into_iter()
+        .map(|spec| (spec.id.clone(), spec))
+        .collect();
+
+    let mut protected = HashSet::new();
+    for tool_id in &canonical.tools.enabled {
+        let tool_cfg = canonical
+            .tools
+            .config
+            .get(tool_id)
+            .or_else(|| canonical.tools.settings.get(tool_id));
+        if !context_protect_enabled(tool_cfg) {
+            continue;
+        }
+
+        let mut files = tool_cfg
+            .map(context_file_names_from_config)
+            .unwrap_or_default();
+
+        if files.is_empty() {
+            if let Some(spec) = spec_by_id.get(tool_id) {
+                files.extend(
+                    spec.gitignore
+                        .iter()
+                        .filter(|entry| entry.to_ascii_lowercase().ends_with(".md"))
+                        .cloned(),
+                );
+            }
+        }
+
+        if files.is_empty() {
+            files.push(format!(
+                "{}.md",
+                tool_id.to_ascii_uppercase().replace('-', "_")
+            ));
+        }
+
+        for file in files {
+            if let Some(normalized) = normalize_relative_path(&file) {
+                protected.insert(normalized);
+            }
+        }
+    }
+    Ok(protected)
+}
+
+fn context_protect_enabled(value: Option<&serde_json::Value>) -> bool {
+    value
+        .and_then(|cfg| cfg.pointer("/context/protect"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn context_file_names_from_config(value: &serde_json::Value) -> Vec<String> {
+    let Some(file_name) = value.pointer("/context/fileName") else {
+        return Vec::new();
+    };
+    match file_name {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 pub fn clear(paths: &ProjectPaths) -> Result<ClearReport> {
@@ -1817,6 +1915,51 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_respects_context_protect_flag_for_existing_file() -> Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("macc_ctx_protect_{}", uuid_v4_like()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let paths = ProjectPaths::from_root(&temp_dir);
+        init(&paths, false)?;
+
+        let mut cfg = load_canonical_config(&paths.config_path)?;
+        cfg.tools.enabled = vec!["test".to_string()];
+        cfg.tools.config.insert(
+            "test".to_string(),
+            serde_json::json!({
+                "context": {
+                    "protect": true,
+                    "fileName": "AGENTS.md"
+                }
+            }),
+        );
+        let mut yaml = cfg
+            .to_yaml()
+            .map_err(|e| MaccError::Validation(e.to_string()))?;
+        yaml.push('\n');
+        atomic_write(&paths, &paths.config_path, yaml.as_bytes())?;
+
+        let target = temp_dir.join("AGENTS.md");
+        fs::write(&target, "manual content\n").unwrap();
+
+        let mut plan = plan::ActionPlan::new();
+        plan.add_action(plan::Action::WriteFile {
+            path: "AGENTS.md".into(),
+            content: b"generated content\n".to_vec(),
+            scope: plan::Scope::Project,
+        });
+
+        let report = apply_plan(&paths, &mut plan, false)?;
+        assert_eq!(
+            report.outcomes.get("AGENTS.md"),
+            Some(&plan::ActionStatus::Unchanged)
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "manual content\n");
+
+        fs::remove_dir_all(&temp_dir).ok();
+        Ok(())
+    }
+
+    #[test]
     fn test_ensure_gitignore() -> Result<()> {
         let temp_dir = std::env::temp_dir().join(format!("macc_git_test_{}", uuid_v4_like()));
         fs::create_dir_all(&temp_dir).unwrap();
@@ -1871,6 +2014,34 @@ mod tests {
         for entry in BASELINE_IGNORE_ENTRIES {
             assert!(content.contains(entry));
         }
+
+        fs::remove_dir_all(&temp_dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_init_sets_context_protect_defaults() -> Result<()> {
+        let temp_dir =
+            std::env::temp_dir().join(format!("macc_init_ctx_defaults_{}", uuid_v4_like()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let paths = ProjectPaths::from_root(&temp_dir);
+
+        init(&paths, false)?;
+        let cfg = load_canonical_config(&paths.config_path)?;
+        assert!(
+            !cfg.tools.config.is_empty(),
+            "expected tool config defaults to be populated"
+        );
+        let any_protected = cfg.tools.config.values().any(|tool_cfg| {
+            tool_cfg
+                .pointer("/context/protect")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        });
+        assert!(
+            any_protected,
+            "expected at least one tool to have context.protect=true by default"
+        );
 
         fs::remove_dir_all(&temp_dir).ok();
         Ok(())

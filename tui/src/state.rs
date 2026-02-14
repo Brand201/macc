@@ -1069,9 +1069,18 @@ impl AppState {
     }
 
     pub fn begin_tool_install_confirmation(&mut self) {
-        let Some(descriptor) = self.tool_descriptors.get(self.selected_tool_index) else {
+        let Some(descriptor) = self.selected_tool_descriptor() else {
             return;
         };
+        let tool_id = descriptor.id.clone();
+        let has_install_steps = descriptor.install.is_some();
+        let status = self
+            .tool_checks
+            .iter()
+            .find(|tc| tc.tool_id.as_deref() == Some(tool_id.as_str()))
+            .map(|tc| tc.status.clone())
+            .unwrap_or(macc_core::doctor::ToolStatus::Missing);
+
         if self.project_paths.is_none() {
             self.errors
                 .push("Cannot install tool: no project is loaded.".to_string());
@@ -1082,35 +1091,122 @@ impl AppState {
             );
             return;
         }
-        if descriptor.install.is_none() {
-            self.errors.push(format!(
-                "Tool '{}' does not define install steps.",
-                descriptor.id
-            ));
+        if !has_install_steps {
+            self.errors
+                .push(format!("Tool '{}' does not define install steps.", tool_id));
             self.set_status(
                 UiStatusLevel::Error,
-                format!("Tool '{}' has no install steps.", descriptor.id),
+                format!("Tool '{}' has no install steps.", tool_id),
                 Some(Duration::from_secs(5)),
             );
             return;
         }
-        let status = self
-            .tool_checks
-            .iter()
-            .find(|tc| tc.tool_id.as_deref() == Some(descriptor.id.as_str()))
-            .map(|tc| tc.status.clone())
-            .unwrap_or(macc_core::doctor::ToolStatus::Missing);
         if matches!(status, macc_core::doctor::ToolStatus::Installed) {
             self.notices
-                .push(format!("Tool '{}' is already installed.", descriptor.id));
+                .push(format!("Tool '{}' is already installed.", tool_id));
             self.set_status(
                 UiStatusLevel::Info,
-                format!("Tool '{}' is already installed.", descriptor.id),
+                format!("Tool '{}' is already installed.", tool_id),
                 Some(Duration::from_secs(4)),
             );
             return;
         }
-        self.tool_install_confirm_id = Some(descriptor.id.clone());
+        self.tool_install_confirm_id = Some(tool_id);
+    }
+
+    pub fn generate_context_for_selected_tool(&mut self) {
+        let Some(descriptor) = self.selected_tool_descriptor() else {
+            self.set_status(
+                UiStatusLevel::Error,
+                "No tool selected.",
+                Some(Duration::from_secs(4)),
+            );
+            return;
+        };
+        let tool_id = descriptor.id.clone();
+
+        let Some(paths) = self.project_paths.clone() else {
+            self.errors
+                .push("Cannot generate context: no project is loaded.".to_string());
+            self.set_status(
+                UiStatusLevel::Error,
+                "Cannot generate context: no project is loaded.",
+                Some(Duration::from_secs(5)),
+            );
+            return;
+        };
+
+        let exe = match env::current_exe() {
+            Ok(path) => path,
+            Err(e) => {
+                self.errors
+                    .push(format!("Failed to resolve executable path: {}", e));
+                self.set_status(
+                    UiStatusLevel::Error,
+                    "Failed to resolve executable path.",
+                    Some(Duration::from_secs(6)),
+                );
+                return;
+            }
+        };
+
+        self.set_status(
+            UiStatusLevel::Info,
+            format!("Generating context for '{}'...", tool_id),
+            Some(Duration::from_secs(3)),
+        );
+
+        let output = std::process::Command::new(exe)
+            .arg("--cwd")
+            .arg(&paths.root)
+            .arg("context")
+            .arg("--tool")
+            .arg(&tool_id)
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => {
+                self.notices
+                    .push(format!("Context generation completed for '{}'.", tool_id));
+                self.set_status(
+                    UiStatusLevel::Success,
+                    format!("Generated context for '{}'.", tool_id),
+                    Some(Duration::from_secs(4)),
+                );
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let detail = if !stderr.trim().is_empty() {
+                    stderr.trim().to_string()
+                } else if !stdout.trim().is_empty() {
+                    stdout.trim().to_string()
+                } else {
+                    format!("exit status {}", output.status)
+                };
+                let actionable = format_actionable_error(&detail);
+                self.errors.push(format!(
+                    "Context generation failed for '{}': {}",
+                    tool_id, actionable
+                ));
+                self.set_status(
+                    UiStatusLevel::Error,
+                    format!("Context generation failed for '{}'.", tool_id),
+                    Some(Duration::from_secs(8)),
+                );
+            }
+            Err(e) => {
+                self.errors.push(format!(
+                    "Failed to run context generation for '{}': {}",
+                    tool_id, e
+                ));
+                self.set_status(
+                    UiStatusLevel::Error,
+                    format!("Failed to run context generation for '{}'.", tool_id),
+                    Some(Duration::from_secs(8)),
+                );
+            }
+        }
     }
 
     pub fn cancel_tool_install_confirmation(&mut self) {
@@ -1641,6 +1737,16 @@ impl AppState {
     pub fn current_tool_descriptor(&self) -> Option<&ToolDescriptor> {
         let id = self.current_tool_id.as_deref()?;
         self.tool_descriptors.iter().find(|d| d.id == id)
+    }
+
+    pub fn selected_tool_descriptor(&self) -> Option<&ToolDescriptor> {
+        let selected_index = self
+            .filtered_tool_indices()
+            .into_iter()
+            .find(|idx| *idx == self.selected_tool_index)
+            .or_else(|| self.filtered_tool_indices().first().copied())
+            .unwrap_or(self.selected_tool_index);
+        self.tool_descriptors.get(selected_index)
     }
 
     pub fn current_tool_field(&self) -> Option<&ToolField> {
