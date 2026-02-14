@@ -17,7 +17,7 @@ use std::process::exit;
 
 #[derive(Parser)]
 #[command(name = "macc")]
-#[command(about = "MACC (Multi-Assistant Code Config)", long_about = None)]
+#[command(about = "MACC (Multi-Agentic Coding Config)", long_about = None)]
 #[command(version)]
 struct Cli {
     /// Working directory
