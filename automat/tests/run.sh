@@ -99,6 +99,27 @@ EOS
   echo "$bin_dir"
 }
 
+test_dependency_gating() {
+  local repo registry output
+  repo="$(setup_repo)"
+  registry="$repo/task_registry.json"
+  output="$(
+    PATH="$(make_stub_macc "$repo"):$PATH" \
+    PRD_FILE="${FIXTURES}/prd_deps_blocked.json" \
+    TASK_REGISTRY_FILE="$registry" \
+    REPO_DIR="$repo" \
+    MAX_DISPATCH=2 \
+    "$SCRIPT"
+  )"
+  local claimed_a claimed_b
+  claimed_a="$(jq -r '.tasks[] | select(.id=="TASK-A") | .state' "$registry")"
+  claimed_b="$(jq -r '.tasks[] | select(.id=="TASK-B") | .state' "$registry")"
+  assert_eq "in_progress" "$claimed_a" "base task should dispatch first"
+  assert_eq "todo" "$claimed_b" "dependent task should remain todo"
+  rm -rf "$repo"
+}
+
+
 test_dependency_ready() {
   local repo registry
   repo="$(setup_repo)"
@@ -310,6 +331,7 @@ require_cmd jq
 require_cmd bash
 
 lint_shell
+test_dependency_gating
 test_dependency_ready
 test_lock_contention
 test_rerun_idempotency

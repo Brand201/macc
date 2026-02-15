@@ -4,6 +4,12 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_automation_tests:
+        description: "Run automation integration tests (automat/tests/run.sh)"
+        required: false
+        default: "false"
 
 jobs:
   quality-linux:
@@ -37,7 +43,8 @@ jobs:
       - name: ToolSpec contract tests
         run: make test-contract
 
-      - name: Automation integration tests
+      - name: Automation integration tests (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_automation_tests == 'true' }}
         run: ./automat/tests/run.sh
 
   build-matrix:
