@@ -72,7 +72,6 @@ automation:
     coordinator_tool: codex
     reference_branch: main
     prd_file: prd.json
-    task_registry_file: task_registry.json
     tool_priority: [codex, claude, gemini]
     max_parallel_per_tool:
       codex: 3
@@ -158,7 +157,8 @@ Controls coordinator runtime defaults for `.macc/automation/coordinator.sh`.
 - `coordinator_tool`: fixed tool for coordinator phase hooks (`review`/`fix`/`integrate`).
 - `reference_branch`: default git base/reference branch used when a task does not define `base_branch`.
 - `prd_file`: PRD source path (default commonly `prd.json`).
-- `task_registry_file`: registry file path (default commonly `task_registry.json`).
+- Task registry path is fixed to `.macc/automation/task/task_registry.json`.
+- `task_registry_file` (legacy): ignored by current coordinator runtime.
 - `tool_priority`: preferred tool order for task assignment.
 - `max_parallel_per_tool`: per-tool concurrency limits.
 - `tool_specializations`: category-to-tools routing map.

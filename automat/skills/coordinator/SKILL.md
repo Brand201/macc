@@ -15,7 +15,7 @@ The Coordinator Agent is the only agent allowed to **approve** and **merge** to 
 ## Operating Model (Non-Negotiable)
 ### Single-Writer Rule
 - **PRD is read-only during execution.**
-- Runtime state must live in a **separate registry** (`task_registry.json`).
+- Runtime state must live in a **separate registry** (`.macc/automation/task/task_registry.json`).
 - Only the Coordinator updates runtime registry state (single writer).
 
 ### Script-First Rule (MACC)
@@ -51,7 +51,7 @@ The Coordinator Agent is the only agent allowed to **approve** and **merge** to 
 ## Inputs and Outputs
 ### Inputs
 - `prd.json` (planning/backlog; immutable during execution)
-- `task_registry.json` (runtime state machine)
+- `.macc/automation/task/task_registry.json` (runtime state machine)
 - Git repository with protected `main/master`
 - CI status checks and merge queue status
 - Worktree root: `.macc/worktree/`
@@ -286,7 +286,7 @@ Invocation contract:
 - `--worktree <path>`
 - `--task-id <id>`
 - `--tool <tool>`
-- `--registry <task_registry.json>`
+- registry path is fixed to `.macc/automation/task/task_registry.json`
 - `--prd <worktree.prd.json>`
 - `--mode implement`
 

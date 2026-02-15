@@ -3,14 +3,15 @@ set -euo pipefail
 
 # coordinator.sh
 # - Reads PRD tasks
-# - Maintains task_registry.json
+# - Maintains .macc/automation/task/task_registry.json
 # - Dispatches READY tasks to dedicated MACC worktrees
 # - Applies dependency gating + exclusive resource locking
 # - Assigns at most one task per worktree
 
 PRD_FILE="${PRD_FILE:-prd.json}"
-TASK_REGISTRY_FILE="${TASK_REGISTRY_FILE:-task_registry.json}"
 REPO_DIR="${REPO_DIR:-.}"
+TASK_REGISTRY_REL_PATH=".macc/automation/task/task_registry.json"
+TASK_REGISTRY_FILE=""
 AGENT_ID="${AGENT_ID:-agentA}"
 DEFAULT_TOOL="${DEFAULT_TOOL:-codex}"
 DEFAULT_BASE_BRANCH="${DEFAULT_BASE_BRANCH:-master}"
@@ -145,7 +146,7 @@ Commands:
 
 Env vars:
   PRD_FILE            Path to PRD JSON (default: prd.json)
-  TASK_REGISTRY_FILE  Path to task registry JSON (default: task_registry.json)
+  Task registry is fixed at \$REPO_DIR/.macc/automation/task/task_registry.json
   REPO_DIR            Path to git repository (default: .)
   AGENT_ID            Coordinator/agent identifier (default: agentA)
   DEFAULT_TOOL        Tool used when task does not declare one (default: codex)
@@ -301,6 +302,7 @@ ensure_repo_valid() {
 
 lock_acquire() {
   COORD_LOCK_DIR="${TASK_REGISTRY_FILE}.lock"
+  mkdir -p "$(dirname "$COORD_LOCK_DIR")"
   local start_ts now_ts elapsed
   start_ts="$(date +%s)"
 
@@ -1788,7 +1790,6 @@ main() {
     case "$1" in
       dispatch|advance|sync|status|reconcile|unlock|cleanup) command="$1"; shift ;;
       --prd) PRD_FILE="$2"; shift 2 ;;
-      --registry) TASK_REGISTRY_FILE="$2"; shift 2 ;;
       --repo) REPO_DIR="$2"; shift 2 ;;
       --transition) transition_task_id="$2"; shift 2 ;;
       --state) transition_state="$2"; shift 2 ;;
@@ -1814,6 +1815,8 @@ main() {
       requires_sync="true"
       ;;
   esac
+
+  TASK_REGISTRY_FILE="${REPO_DIR%/}/${TASK_REGISTRY_REL_PATH}"
 
   need_cmd git
   need_cmd jq

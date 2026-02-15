@@ -183,9 +183,6 @@ enum Commands {
         /// Override PRD file path
         #[arg(long)]
         prd: Option<String>,
-        /// Override task registry file path
-        #[arg(long)]
-        registry: Option<String>,
         /// Fixed tool for coordinator phase hooks (review/fix/integrate)
         #[arg(long)]
         coordinator_tool: Option<String>,
@@ -1196,7 +1193,7 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                 let (task_id, prd_path) =
                     resolve_worktree_task_context(&paths.root, &worktree_path, &metadata.id)?;
                 let performer_path = ensure_performer(&paths.root, &worktree_path)?;
-                let registry_path = paths.root.join("task_registry.json");
+                let registry_path = paths.root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
 
                 let status = std::process::Command::new(&performer_path)
                     .current_dir(&worktree_path)
@@ -1351,7 +1348,6 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             remove_worktrees,
             remove_branches,
             prd,
-            registry,
             coordinator_tool,
             reference_branch,
             tool_priority,
@@ -1382,7 +1378,6 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
 
             let env_cfg = CoordinatorEnvConfig {
                 prd: prd.clone(),
-                registry: registry.clone(),
                 coordinator_tool: coordinator_tool.clone(),
                 reference_branch: reference_branch.clone(),
                 tool_priority: tool_priority.clone(),
@@ -1930,7 +1925,6 @@ fn resolve_worktree_task_context(
 
 struct CoordinatorEnvConfig {
     prd: Option<String>,
-    registry: Option<String>,
     coordinator_tool: Option<String>,
     reference_branch: Option<String>,
     tool_priority: Option<String>,
@@ -1945,6 +1939,8 @@ struct CoordinatorEnvConfig {
     stale_changes_requested_seconds: Option<usize>,
     stale_action: Option<String>,
 }
+
+const COORDINATOR_TASK_REGISTRY_REL_PATH: &str = ".macc/automation/task/task_registry.json";
 
 fn apply_coordinator_env(
     command: &mut std::process::Command,
@@ -1961,13 +1957,7 @@ fn apply_coordinator_env(
     {
         command.env("PRD_FILE", value);
     }
-    if let Some(value) = env_cfg
-        .registry
-        .clone()
-        .or_else(|| coordinator.and_then(|c| c.task_registry_file.clone()))
-    {
-        command.env("TASK_REGISTRY_FILE", value);
-    }
+    command.env("TASK_REGISTRY_FILE", COORDINATOR_TASK_REGISTRY_REL_PATH);
     if let Some(value) = env_cfg
         .coordinator_tool
         .clone()
@@ -2107,7 +2097,9 @@ fn coordinator_action_hint(action: &str) -> &'static str {
         "reconcile" | "cleanup" => {
             "Run `macc worktree prune` and retry; if locks remain, run `macc coordinator unlock --all`."
         }
-        "unlock" => "Inspect lock owners in task_registry.json then retry dispatch.",
+        "unlock" => {
+            "Inspect lock owners in .macc/automation/task/task_registry.json then retry dispatch."
+        }
         "sync" => "Check PRD/registry JSON validity and rerun `macc coordinator sync`.",
         _ => "Inspect logs with `macc logs tail --component coordinator`.",
     }
@@ -2174,12 +2166,7 @@ fn run_coordinator_full_cycle(
     coordinator: Option<&macc_core::config::CoordinatorConfig>,
     env_cfg: &CoordinatorEnvConfig,
 ) -> Result<()> {
-    let registry_path = env_cfg
-        .registry
-        .clone()
-        .or_else(|| coordinator.and_then(|c| c.task_registry_file.clone()))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| repo_root.join("task_registry.json"));
+    let registry_path = repo_root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
 
     let timeout_seconds = env_cfg
         .timeout_seconds
@@ -5371,7 +5358,8 @@ mod tests {
     fn test_coordinator_run_full_cycle_converges() -> macc_core::Result<()> {
         let root = std::env::temp_dir().join(format!("macc_cli_coord_run_{}", uuid_v4_like()));
         std::fs::create_dir_all(&root).unwrap();
-        let registry = root.join("task_registry.json");
+        let registry = root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
+        std::fs::create_dir_all(registry.parent().expect("registry parent")).unwrap();
         fs::write(
             &registry,
             r#"{
@@ -5423,13 +5411,11 @@ esac
 
         let canonical = macc_core::config::CanonicalConfig::default();
         let coordinator_cfg = macc_core::config::CoordinatorConfig {
-            task_registry_file: Some(registry.to_string_lossy().to_string()),
             timeout_seconds: Some(10),
             ..Default::default()
         };
         let env_cfg = CoordinatorEnvConfig {
             prd: None,
-            registry: None,
             coordinator_tool: None,
             reference_branch: None,
             tool_priority: None,
@@ -5462,7 +5448,8 @@ esac
     fn test_coordinator_run_detects_no_progress() -> macc_core::Result<()> {
         let root = std::env::temp_dir().join(format!("macc_cli_coord_stall_{}", uuid_v4_like()));
         std::fs::create_dir_all(&root).unwrap();
-        let registry = root.join("task_registry.json");
+        let registry = root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
+        std::fs::create_dir_all(registry.parent().expect("registry parent")).unwrap();
         fs::write(
             &registry,
             r#"{
@@ -5492,13 +5479,11 @@ exit 0
 
         let canonical = macc_core::config::CanonicalConfig::default();
         let coordinator_cfg = macc_core::config::CoordinatorConfig {
-            task_registry_file: Some(registry.to_string_lossy().to_string()),
             timeout_seconds: Some(10),
             ..Default::default()
         };
         let env_cfg = CoordinatorEnvConfig {
             prd: None,
-            registry: None,
             coordinator_tool: None,
             reference_branch: None,
             tool_priority: None,
@@ -5601,8 +5586,10 @@ exit 0
 }"#,
         )
         .unwrap();
+        let stop_registry = root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
+        std::fs::create_dir_all(stop_registry.parent().expect("registry parent")).unwrap();
         std::fs::write(
-            root.join("task_registry.json"),
+            stop_registry,
             r#"{
   "schema_version":1,
   "tasks":[],
@@ -5637,7 +5624,6 @@ exit 0
                     remove_worktrees: true,
                     remove_branches: true,
                     prd: None,
-                    registry: None,
                     coordinator_tool: None,
                     reference_branch: None,
                     tool_priority: None,
