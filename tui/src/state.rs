@@ -149,6 +149,7 @@ pub struct AppState {
     pub coordinator_last_refresh: Option<Instant>,
     pub coordinator_running_action: Option<String>,
     pub coordinator_last_result: Option<String>,
+    pub coordinator_spinner_tick: u64,
     pub search_query: String,
     pub search_editing: bool,
     pub undo_stack: Vec<CanonicalConfig>,
@@ -222,6 +223,7 @@ impl AppState {
             coordinator_last_refresh: None,
             coordinator_running_action: None,
             coordinator_last_result: None,
+            coordinator_spinner_tick: 0,
             search_query: String::new(),
             search_editing: false,
             undo_stack: Vec::new(),
@@ -853,6 +855,15 @@ impl AppState {
             .map(|p| p.started_at.elapsed().as_secs())
     }
 
+    pub fn coordinator_spinner_frame(&self) -> &'static str {
+        if !self.is_coordinator_running() {
+            return "";
+        }
+        let frames = ["|", "/", "-", "\\"];
+        let idx = (self.coordinator_spinner_tick as usize) % frames.len();
+        frames[idx]
+    }
+
     pub fn tick(&mut self) {
         if let Some(status) = &self.ui_status {
             if let Some(expire) = status.expires_at {
@@ -893,6 +904,7 @@ impl AppState {
                     self.refresh_coordinator_snapshot();
                 }
                 Ok(None) => {
+                    self.coordinator_spinner_tick = self.coordinator_spinner_tick.wrapping_add(1);
                     let should_refresh = self
                         .coordinator_last_refresh
                         .map(|ts| ts.elapsed() >= Duration::from_secs(1))
