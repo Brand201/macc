@@ -46,8 +46,63 @@ note() {
   printf '%s\n' "$msg"
 }
 
+spinner_enabled() {
+  if [[ -n "${CI:-}" || -n "${MACC_NO_SPINNER:-}" ]]; then
+    return 1
+  fi
+  if [[ -n "${COORD_TERM_FD:-}" ]]; then
+    [[ -t "${COORD_TERM_FD}" ]]
+  else
+    [[ -t 1 ]]
+  fi
+}
+
+spinner_start() {
+  local msg="$1"
+  local fd
+  if [[ -n "${COORD_TERM_FD:-}" ]]; then
+    fd="$COORD_TERM_FD"
+  else
+    fd=1
+  fi
+  if ! spinner_enabled; then
+    return 0
+  fi
+  SPINNER_MSG="$msg"
+  (
+    local frames='|/-\'
+    local i=0
+    while true; do
+      local ch="${frames:i%4:1}"
+      printf '\r[%s] %s' "$ch" "$SPINNER_MSG" >&"$fd"
+      i=$((i + 1))
+      sleep 0.1
+    done
+  ) &
+  SPINNER_PID=$!
+}
+
+spinner_stop() {
+  local msg="$1"
+  local fd
+  if [[ -n "${COORD_TERM_FD:-}" ]]; then
+    fd="$COORD_TERM_FD"
+  else
+    fd=1
+  fi
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" >/dev/null 2>&1 || true
+    wait "$SPINNER_PID" >/dev/null 2>&1 || true
+    SPINNER_PID=""
+    if spinner_enabled; then
+      printf '\r[done] %s\n' "$msg" >&"$fd"
+    fi
+  fi
+}
+
 on_exit() {
   local rc=$?
+  spinner_stop "Coordinator stopped."
   if [[ "$rc" -ne 0 && -n "${COORD_TERM_FD:-}" && -n "${COORD_LOG_FILE:-}" ]]; then
     printf 'Coordinator failed. See log: %s\n' "$COORD_LOG_FILE" >&"$COORD_TERM_FD"
   fi
@@ -1809,7 +1864,9 @@ main() {
   ensure_registry_file
   ensure_registry_valid
   if [[ "$requires_sync" == "true" ]]; then
+    spinner_start "Syncing registry"
     sync_registry_from_prd
+    spinner_stop "Registry synced"
     ensure_registry_valid
   fi
 
@@ -1818,7 +1875,9 @@ main() {
     exit 0
   fi
 
+  spinner_start "Cleaning stale tasks"
   cleanup_stale_tasks
+  spinner_stop "Cleanup complete"
 
   if [[ "$command" == "cleanup" ]]; then
     note "Cleanup complete."
@@ -1889,13 +1948,17 @@ main() {
   fi
 
   if [[ "$command" == "reconcile" ]]; then
+    spinner_start "Reconciling registry"
     reconcile_registry
+    spinner_stop "Reconcile complete"
     note "Reconcile complete."
     exit 0
   fi
 
   if [[ "$command" == "advance" ]]; then
+    spinner_start "Advancing active tasks"
     advance_active_tasks
+    spinner_stop "Advance complete"
     exit 0
   fi
 
@@ -1904,7 +1967,9 @@ main() {
     exit 0
   fi
 
+  spinner_start "Dispatching ready tasks"
   dispatch_ready_tasks
+  spinner_stop "Dispatch complete"
 }
 
 main "$@"

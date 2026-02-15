@@ -1103,12 +1103,13 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
 
             let status_line = if state.is_coordinator_running() {
                 format!(
-                    "Running: {} ({}s)",
+                    "Running: {} ({}s) {}",
                     state
                         .coordinator_running_action
                         .as_deref()
                         .unwrap_or("unknown"),
-                    state.coordinator_elapsed_seconds().unwrap_or(0)
+                    state.coordinator_elapsed_seconds().unwrap_or(0),
+                    state.coordinator_spinner_frame()
                 )
             } else {
                 "Idle".to_string()

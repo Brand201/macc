@@ -25,6 +25,7 @@ task_log_file=""
 PERFORMER_MAX_ITERATIONS="${PERFORMER_MAX_ITERATIONS:-50}"
 PERFORMER_TOOL_MAX_ATTEMPTS="${PERFORMER_TOOL_MAX_ATTEMPTS:-2}"
 PERFORMER_SLEEP_SECONDS="${PERFORMER_SLEEP_SECONDS:-2}"
+PERFORMER_SPINNER="${PERFORMER_SPINNER:-true}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -102,6 +103,47 @@ log_task_line() {
   local msg="$1"
   if [[ -n "$task_log_file" ]]; then
     printf '%s\n' "$msg" >>"$task_log_file"
+  fi
+}
+
+spinner_enabled() {
+  if [[ -n "${CI:-}" || -n "${MACC_NO_SPINNER:-}" ]]; then
+    return 1
+  fi
+  if [[ "${PERFORMER_SPINNER}" != "true" ]]; then
+    return 1
+  fi
+  [[ -t 2 ]]
+}
+
+spinner_start() {
+  local msg="$1"
+  if ! spinner_enabled; then
+    return 0
+  fi
+  SPINNER_MSG="$msg"
+  (
+    local frames='|/-\'
+    local i=0
+    while true; do
+      local ch="${frames:i%4:1}"
+      printf '\r[%s] %s' "$ch" "$SPINNER_MSG" >&2
+      i=$((i + 1))
+      sleep 0.1
+    done
+  ) &
+  SPINNER_PID=$!
+}
+
+spinner_stop() {
+  local msg="$1"
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" >/dev/null 2>&1 || true
+    wait "$SPINNER_PID" >/dev/null 2>&1 || true
+    SPINNER_PID=""
+    if spinner_enabled; then
+      printf '\r[done] %s\n' "$msg" >&2
+    fi
   fi
 }
 
@@ -215,6 +257,7 @@ run_tool() {
   log_task_line ""
   log_task_line '```text'
   set +e
+  spinner_start "Running ${tool} (attempt ${attempt}/${max_attempts})"
   "$script" \
     --prompt-file "$prompt_file" \
     --tool-json "$tool_json" \
@@ -224,6 +267,7 @@ run_tool() {
     --attempt "$attempt" \
     --max-attempts "$max_attempts" >>"$task_log_file" 2>&1
   local status=$?
+  spinner_stop "Runner finished (${tool})"
   set -e
   log_task_line '```'
   log_task_line ""
