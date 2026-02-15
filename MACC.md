@@ -426,7 +426,7 @@ MCP servers may be provided via remote packages (Git/HTTP) using §8.5. The pack
 ### 12.2 Coordinator + Performer (worktree orchestration)
 
 MACC automation is split into:
-1) `coordinator.sh` (project-level orchestrator): reads PRD, maintains `task_registry.json`, dispatches READY tasks by constraints (`priority`, `dependencies`, `exclusive_resources`, `category`, `id`), and tracks transitions.
+1) `coordinator.sh` (project-level orchestrator): reads PRD, maintains `.macc/automation/task/task_registry.json`, dispatches READY tasks by constraints (`priority`, `dependencies`, `exclusive_resources`, `category`, `id`), and tracks transitions.
 2) `performer.sh` (worktree-level executor): runs in a single worktree and delegates to the tool-specific runner from `.macc/tool.json`.
 3) `runners/<tool>.performer.sh`: tool-specific execution strategy.
 

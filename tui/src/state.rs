@@ -157,7 +157,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    const AUTOMATION_FIELD_COUNT: usize = 15;
+    const AUTOMATION_FIELD_COUNT: usize = 14;
+    const COORDINATOR_TASK_REGISTRY_REL_PATH: &'static str =
+        ".macc/automation/task/task_registry.json";
 
     pub fn automation_field_count(&self) -> usize {
         Self::AUTOMATION_FIELD_COUNT
@@ -419,20 +421,7 @@ impl AppState {
 
     fn coordinator_registry_path(&self) -> Option<PathBuf> {
         let paths = self.project_paths.as_ref()?;
-        let from_cfg = self
-            .working_copy
-            .as_ref()
-            .and_then(|wc| wc.automation.coordinator.as_ref())
-            .and_then(|c| c.task_registry_file.clone())
-            .filter(|s| !s.trim().is_empty());
-        let path = from_cfg
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("task_registry.json"));
-        if path.is_absolute() {
-            Some(path)
-        } else {
-            Some(paths.root.join(path))
-        }
+        Some(paths.root.join(Self::COORDINATOR_TASK_REGISTRY_REL_PATH))
     }
 
     fn read_registry_snapshot(
@@ -509,11 +498,10 @@ impl AppState {
                 cmd.env("PRD_FILE", v);
             }
         }
-        if let Some(v) = &cfg.task_registry_file {
-            if !v.is_empty() {
-                cmd.env("TASK_REGISTRY_FILE", v);
-            }
-        }
+        cmd.env(
+            "TASK_REGISTRY_FILE",
+            Self::COORDINATOR_TASK_REGISTRY_REL_PATH,
+        );
         if let Some(v) = &cfg.coordinator_tool {
             if !v.is_empty() {
                 cmd.env("COORDINATOR_TOOL", v);
@@ -1355,18 +1343,17 @@ impl AppState {
             0 => "Coordinator Tool",
             1 => "Reference Branch",
             2 => "PRD File",
-            3 => "Task Registry File",
-            4 => "Tool Priority (CSV)",
-            5 => "Max Parallel Per Tool (JSON)",
-            6 => "Tool Specializations (JSON)",
-            7 => "Max Dispatch",
-            8 => "Max Parallel",
-            9 => "Timeout Seconds",
-            10 => "Phase Runner Max Attempts",
-            11 => "Stale Claimed Seconds",
-            12 => "Stale In Progress Seconds",
-            13 => "Stale Changes Requested Seconds",
-            14 => "Stale Action",
+            3 => "Tool Priority (CSV)",
+            4 => "Max Parallel Per Tool (JSON)",
+            5 => "Tool Specializations (JSON)",
+            6 => "Max Dispatch",
+            7 => "Max Parallel",
+            8 => "Timeout Seconds",
+            9 => "Phase Runner Max Attempts",
+            10 => "Stale Claimed Seconds",
+            11 => "Stale In Progress Seconds",
+            12 => "Stale Changes Requested Seconds",
+            13 => "Stale Action",
             _ => "",
         }
     }
@@ -1376,18 +1363,17 @@ impl AppState {
             0 => "Fixed tool for coordinator phase hooks (review/fix/integrate). Empty means task/default tool.",
             1 => "Default git branch used when task.base_branch is not set (default: main).",
             2 => "Path to PRD JSON used by coordinator.sh (default: prd.json).",
-            3 => "Path to task registry JSON (default: task_registry.json).",
-            4 => "Tool priority order as comma-separated values, e.g. tool-a,tool-b,tool-c.",
-            5 => "Per-tool concurrency caps as JSON object, e.g. {\"tool-a\":3,\"tool-b\":2}.",
-            6 => "Category routing as JSON object, e.g. {\"frontend\":[\"tool-b\",\"tool-c\"]}.",
-            7 => "Total tasks to dispatch per run, 0 means no cap.",
-            8 => "Maximum concurrent performer runs.",
-            9 => "Lock wait timeout in seconds, 0 disables timeout.",
-            10 => "Max attempts for phase runner fallback.",
-            11 => "Auto-stale timeout for claimed tasks in seconds, 0 disables.",
-            12 => "Auto-stale timeout for in_progress tasks in seconds, 0 disables.",
-            13 => "Auto-stale timeout for changes_requested tasks in seconds, 0 disables.",
-            14 => "Action for stale tasks: abandon, todo, blocked.",
+            3 => "Tool priority order as comma-separated values, e.g. tool-a,tool-b,tool-c.",
+            4 => "Per-tool concurrency caps as JSON object, e.g. {\"tool-a\":3,\"tool-b\":2}.",
+            5 => "Category routing as JSON object, e.g. {\"frontend\":[\"tool-b\",\"tool-c\"]}.",
+            6 => "Total tasks to dispatch per run, 0 means no cap.",
+            7 => "Maximum concurrent performer runs.",
+            8 => "Lock wait timeout in seconds, 0 disables timeout.",
+            9 => "Max attempts for phase runner fallback.",
+            10 => "Auto-stale timeout for claimed tasks in seconds, 0 disables.",
+            11 => "Auto-stale timeout for in_progress tasks in seconds, 0 disables.",
+            12 => "Auto-stale timeout for changes_requested tasks in seconds, 0 disables.",
+            13 => "Action for stale tasks: abandon, todo, blocked.",
             _ => "",
         }
     }
@@ -1408,52 +1394,49 @@ impl AppState {
                 .and_then(|c| c.prd_file.clone())
                 .unwrap_or_else(|| "prd.json".to_string()),
             3 => coordinator
-                .and_then(|c| c.task_registry_file.clone())
-                .unwrap_or_else(|| "task_registry.json".to_string()),
-            4 => coordinator
                 .map(|c| c.tool_priority.join(", "))
                 .unwrap_or_default(),
-            5 => coordinator
+            4 => coordinator
                 .map(|c| {
                     serde_json::to_string(&c.max_parallel_per_tool)
                         .unwrap_or_else(|_| "{}".to_string())
                 })
                 .unwrap_or_else(|| "{}".to_string()),
-            6 => coordinator
+            5 => coordinator
                 .map(|c| {
                     serde_json::to_string(&c.tool_specializations)
                         .unwrap_or_else(|_| "{}".to_string())
                 })
                 .unwrap_or_else(|| "{}".to_string()),
-            7 => coordinator
+            6 => coordinator
                 .and_then(|c| c.max_dispatch)
                 .unwrap_or(0)
                 .to_string(),
-            8 => coordinator
+            7 => coordinator
                 .and_then(|c| c.max_parallel)
                 .unwrap_or(1)
                 .to_string(),
-            9 => coordinator
+            8 => coordinator
                 .and_then(|c| c.timeout_seconds)
                 .unwrap_or(0)
                 .to_string(),
-            10 => coordinator
+            9 => coordinator
                 .and_then(|c| c.phase_runner_max_attempts)
                 .unwrap_or(1)
                 .to_string(),
-            11 => coordinator
+            10 => coordinator
                 .and_then(|c| c.stale_claimed_seconds)
                 .unwrap_or(0)
                 .to_string(),
-            12 => coordinator
+            11 => coordinator
                 .and_then(|c| c.stale_in_progress_seconds)
                 .unwrap_or(0)
                 .to_string(),
-            13 => coordinator
+            12 => coordinator
                 .and_then(|c| c.stale_changes_requested_seconds)
                 .unwrap_or(0)
                 .to_string(),
-            14 => coordinator
+            13 => coordinator
                 .and_then(|c| c.stale_action.clone())
                 .unwrap_or_else(|| "abandon".to_string()),
             _ => String::new(),
@@ -1483,14 +1466,14 @@ impl AppState {
     }
 
     pub fn toggle_automation_field(&mut self) {
-        if self.automation_field_index == 14 {
-            let current = self.automation_field_display_value(14);
+        if self.automation_field_index == 13 {
+            let current = self.automation_field_display_value(13);
             let next = match current.as_str() {
                 "abandon" => "todo",
                 "todo" => "blocked",
                 _ => "abandon",
             };
-            self.set_automation_field_string(14, next.to_string());
+            self.set_automation_field_string(13, next.to_string());
             return;
         }
         self.begin_automation_field_edit();
@@ -1503,7 +1486,7 @@ impl AppState {
         let idx = self.automation_field_index;
         let input = self.automation_field_input.trim().to_string();
         let result = match idx {
-            0..=3 => {
+            0..=2 => {
                 if input.is_empty() {
                     Err("Value cannot be empty.".to_string())
                 } else {
@@ -1511,25 +1494,25 @@ impl AppState {
                     Ok(())
                 }
             }
-            4 => {
+            3 => {
                 self.set_automation_field_tool_priority(input);
                 Ok(())
             }
-            5 => self.set_automation_field_tool_caps(input),
-            6 => self.set_automation_field_tool_specializations(input),
-            7..=13 => match input.parse::<usize>() {
+            4 => self.set_automation_field_tool_caps(input),
+            5 => self.set_automation_field_tool_specializations(input),
+            6..=12 => match input.parse::<usize>() {
                 Ok(value) => {
                     self.set_automation_field_usize(idx, value);
                     Ok(())
                 }
                 Err(_) => Err("Invalid integer value.".to_string()),
             },
-            14 => {
+            13 => {
                 let value = input.to_lowercase();
                 if !matches!(value.as_str(), "abandon" | "todo" | "blocked") {
                     Err("stale_action must be one of: abandon, todo, blocked.".to_string())
                 } else {
-                    self.set_automation_field_string(14, value);
+                    self.set_automation_field_string(13, value);
                     Ok(())
                 }
             }
@@ -1569,8 +1552,7 @@ impl AppState {
                 0 => coordinator.coordinator_tool = Some(value),
                 1 => coordinator.reference_branch = Some(value),
                 2 => coordinator.prd_file = Some(value),
-                3 => coordinator.task_registry_file = Some(value),
-                14 => coordinator.stale_action = Some(value),
+                13 => coordinator.stale_action = Some(value),
                 _ => {}
             }
         }
@@ -1580,13 +1562,13 @@ impl AppState {
         self.snapshot_before_config_change();
         if let Some(coordinator) = self.coordinator_config_mut() {
             match idx {
-                7 => coordinator.max_dispatch = Some(value),
-                8 => coordinator.max_parallel = Some(value),
-                9 => coordinator.timeout_seconds = Some(value),
-                10 => coordinator.phase_runner_max_attempts = Some(value),
-                11 => coordinator.stale_claimed_seconds = Some(value),
-                12 => coordinator.stale_in_progress_seconds = Some(value),
-                13 => coordinator.stale_changes_requested_seconds = Some(value),
+                6 => coordinator.max_dispatch = Some(value),
+                7 => coordinator.max_parallel = Some(value),
+                8 => coordinator.timeout_seconds = Some(value),
+                9 => coordinator.phase_runner_max_attempts = Some(value),
+                10 => coordinator.stale_claimed_seconds = Some(value),
+                11 => coordinator.stale_in_progress_seconds = Some(value),
+                12 => coordinator.stale_changes_requested_seconds = Some(value),
                 _ => {}
             }
         }
@@ -2650,27 +2632,27 @@ impl AppState {
         let idx = self.automation_field_index;
         let input = self.automation_field_input.trim();
         match idx {
-            0..=3 => {
+            0..=2 => {
                 if input.is_empty() {
                     Some("Value cannot be empty.".to_string())
                 } else {
                     None
                 }
             }
-            5 => serde_json::from_str::<BTreeMap<String, usize>>(input)
+            4 => serde_json::from_str::<BTreeMap<String, usize>>(input)
                 .err()
                 .map(|e| format!("Invalid JSON: {}", e)),
-            6 => serde_json::from_str::<BTreeMap<String, Vec<String>>>(input)
+            5 => serde_json::from_str::<BTreeMap<String, Vec<String>>>(input)
                 .err()
                 .map(|e| format!("Invalid JSON: {}", e)),
-            7..=13 => {
+            6..=12 => {
                 if input.parse::<usize>().is_err() {
                     Some("Invalid integer value.".to_string())
                 } else {
                     None
                 }
             }
-            14 => {
+            13 => {
                 let value = input.to_lowercase();
                 if !matches!(value.as_str(), "abandon" | "todo" | "blocked") {
                     Some("Allowed: abandon | todo | blocked".to_string())
@@ -2719,7 +2701,7 @@ fn format_actionable_error(raw: &str) -> String {
     {
         (
             "The coordinator registry is malformed.",
-            "Run 'macc coordinator sync' to rebuild task_registry.json from PRD, then retry.",
+            "Run 'macc coordinator sync' to rebuild .macc/automation/task/task_registry.json from PRD, then retry.",
         )
     } else if lower.contains("not found") || lower.contains("no such file") {
         (
@@ -3624,7 +3606,7 @@ mod tests {
         state.working_copy = Some(CanonicalConfig::default());
         state.push_screen(Screen::Automation);
 
-        state.automation_field_index = 8; // Max Parallel
+        state.automation_field_index = 7; // Max Parallel
         state.automation_field_editing = true;
         state.automation_field_input = "abc".to_string();
         assert!(state.current_automation_field_validation().is_some());

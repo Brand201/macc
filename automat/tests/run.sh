@@ -102,11 +102,10 @@ EOS
 test_dependency_gating() {
   local repo registry output
   repo="$(setup_repo)"
-  registry="$repo/task_registry.json"
+  registry="$repo/.macc/automation/task/task_registry.json"
   output="$(
     PATH="$(make_stub_macc "$repo"):$PATH" \
     PRD_FILE="${FIXTURES}/prd_deps_blocked.json" \
-    TASK_REGISTRY_FILE="$registry" \
     REPO_DIR="$repo" \
     MAX_DISPATCH=2 \
     "$SCRIPT"
@@ -123,10 +122,9 @@ test_dependency_gating() {
 test_dependency_ready() {
   local repo registry
   repo="$(setup_repo)"
-  registry="$repo/task_registry.json"
+  registry="$repo/.macc/automation/task/task_registry.json"
   PATH="$(make_stub_macc "$repo"):$PATH" \
   PRD_FILE="${FIXTURES}/prd_deps.json" \
-  TASK_REGISTRY_FILE="$registry" \
   REPO_DIR="$repo" \
   MAX_DISPATCH=1 \
   "$SCRIPT" >/dev/null
@@ -139,10 +137,9 @@ test_dependency_ready() {
 test_lock_contention() {
   local repo registry
   repo="$(setup_repo)"
-  registry="$repo/task_registry.json"
+  registry="$repo/.macc/automation/task/task_registry.json"
   PATH="$(make_stub_macc "$repo"):$PATH" \
   PRD_FILE="${FIXTURES}/prd_locks.json" \
-  TASK_REGISTRY_FILE="$registry" \
   REPO_DIR="$repo" \
   MAX_DISPATCH=2 \
   "$SCRIPT" >/dev/null
@@ -155,10 +152,9 @@ test_lock_contention() {
 test_rerun_idempotency() {
   local repo registry
   repo="$(setup_repo)"
-  registry="$repo/task_registry.json"
+  registry="$repo/.macc/automation/task/task_registry.json"
   PATH="$(make_stub_macc "$repo"):$PATH" \
   PRD_FILE="${FIXTURES}/prd_single.json" \
-  TASK_REGISTRY_FILE="$registry" \
   REPO_DIR="$repo" \
   MAX_DISPATCH=1 \
   "$SCRIPT" >/dev/null 2>&1
@@ -166,7 +162,6 @@ test_rerun_idempotency() {
   first_state="$(jq -r '.tasks[] | select(.id=="TASK-ONLY") | .state' "$registry")"
   PATH="$(make_stub_macc "$repo"):$PATH" \
   PRD_FILE="${FIXTURES}/prd_single.json" \
-  TASK_REGISTRY_FILE="$registry" \
   REPO_DIR="$repo" \
   MAX_DISPATCH=1 \
   "$SCRIPT" >/dev/null 2>&1
@@ -179,7 +174,7 @@ test_rerun_idempotency() {
 test_failure_rollback() {
   local repo registry
   repo="$(setup_repo)"
-  registry="$repo/task_registry.json"
+  registry="$repo/.macc/automation/task/task_registry.json"
   PATH="$repo/bin:$PATH"
   mkdir -p "$repo/bin"
   cat >"$repo/bin/macc" <<'EOS'
@@ -190,7 +185,6 @@ EOS
   chmod +x "$repo/bin/macc"
 
   PRD_FILE="${FIXTURES}/prd_single.json" \
-  TASK_REGISTRY_FILE="$registry" \
   REPO_DIR="$repo" \
   MAX_DISPATCH=1 \
   "$SCRIPT" >/dev/null 2>&1
@@ -204,13 +198,12 @@ EOS
 test_transition_and_cleanup_cycle() {
   local repo registry
   repo="$(setup_repo)"
-  registry="$repo/task_registry.json"
+  registry="$repo/.macc/automation/task/task_registry.json"
   local stub_path
   stub_path="$(make_stub_macc "$repo")"
 
   PATH="$stub_path:$PATH" \
   PRD_FILE="${FIXTURES}/prd_single.json" \
-  TASK_REGISTRY_FILE="$registry" \
   REPO_DIR="$repo" \
   MAX_DISPATCH=1 \
   "$SCRIPT" dispatch >/dev/null
@@ -221,22 +214,22 @@ test_transition_and_cleanup_cycle() {
   jq '.tasks |= map(if .id=="TASK-ONLY" then .worktree = null else . end)' "$registry" >"${registry}.tmp"
   mv "${registry}.tmp" "$registry"
 
-  PATH="$stub_path:$PATH" REPO_DIR="$repo" TASK_REGISTRY_FILE="$registry" \
+  PATH="$stub_path:$PATH" REPO_DIR="$repo" \
     PRD_FILE="${FIXTURES}/prd_single.json" \
     "$SCRIPT" --transition TASK-ONLY --state pr_open --pr-url "http://example/pr/1" >/dev/null
-  PATH="$stub_path:$PATH" REPO_DIR="$repo" TASK_REGISTRY_FILE="$registry" \
+  PATH="$stub_path:$PATH" REPO_DIR="$repo" \
     PRD_FILE="${FIXTURES}/prd_single.json" \
     "$SCRIPT" --transition TASK-ONLY --state queued >/dev/null
-  PATH="$stub_path:$PATH" REPO_DIR="$repo" TASK_REGISTRY_FILE="$registry" \
+  PATH="$stub_path:$PATH" REPO_DIR="$repo" \
     PRD_FILE="${FIXTURES}/prd_single.json" \
     "$SCRIPT" --transition TASK-ONLY --state merged >/dev/null
 
-  PATH="$stub_path:$PATH" REPO_DIR="$repo" TASK_REGISTRY_FILE="$registry" \
+  PATH="$stub_path:$PATH" REPO_DIR="$repo" \
     PRD_FILE="${FIXTURES}/prd_single.json" \
     "$SCRIPT" reconcile >/dev/null
-  PATH="$stub_path:$PATH" REPO_DIR="$repo" TASK_REGISTRY_FILE="$registry" \
+  PATH="$stub_path:$PATH" REPO_DIR="$repo" \
     "$SCRIPT" cleanup >/dev/null
-  PATH="$stub_path:$PATH" REPO_DIR="$repo" TASK_REGISTRY_FILE="$registry" \
+  PATH="$stub_path:$PATH" REPO_DIR="$repo" \
     "$SCRIPT" unlock --all >/dev/null
 
   state="$(jq -r '.tasks[] | select(.id=="TASK-ONLY") | .state' "$registry")"
@@ -254,7 +247,8 @@ test_transition_and_cleanup_cycle() {
 test_advance_full_cycle_with_vcs_hook() {
   local repo registry hook
   repo="$(setup_repo)"
-  registry="$repo/task_registry.json"
+  registry="$repo/.macc/automation/task/task_registry.json"
+  mkdir -p "$(dirname "$registry")"
 
   cat >"$registry" <<'JSON'
 {
@@ -303,7 +297,6 @@ EOS
   chmod +x "$hook"
 
   REPO_DIR="$repo" \
-  TASK_REGISTRY_FILE="$registry" \
   COORDINATOR_VCS_HOOK="$hook" \
   "$SCRIPT" advance >/dev/null
 

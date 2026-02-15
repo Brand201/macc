@@ -309,11 +309,12 @@ Coordinator orchestrates the end-to-end automation cycle: it reads the task regi
 - `macc coordinator [run|dispatch|advance|sync|status|reconcile|unlock|cleanup|stop]`
 - `macc coordinator stop [--graceful] [--remove-worktrees] [--remove-branches]`
 - Coordinator options can override config at runtime:
-  - `--prd`, `--registry`, `--coordinator-tool`
+  - `--prd`, `--coordinator-tool`
   - `--tool-priority`, `--max-parallel-per-tool-json`, `--tool-specializations-json`
   - `--max-dispatch`, `--max-parallel`, `--timeout-seconds`
   - `--phase-runner-max-attempts`
   - `--stale-claimed-seconds`, `--stale-in-progress-seconds`, `--stale-changes-requested-seconds`, `--stale-action`
+- Task registry path is fixed to `.macc/automation/task/task_registry.json`.
 - Use `--` to forward raw args directly to `coordinator.sh`.
 
 ## TUI overview
