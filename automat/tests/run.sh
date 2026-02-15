@@ -119,6 +119,7 @@ test_dependency_gating() {
   rm -rf "$repo"
 }
 
+
 test_dependency_ready() {
   local repo registry
   repo="$(setup_repo)"

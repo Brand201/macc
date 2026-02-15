@@ -8,7 +8,6 @@ set -euo pipefail
 # - Applies dependency gating + exclusive resource locking
 # - Assigns at most one task per worktree
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRD_FILE="${PRD_FILE:-prd.json}"
 TASK_REGISTRY_FILE="${TASK_REGISTRY_FILE:-task_registry.json}"
 REPO_DIR="${REPO_DIR:-.}"
@@ -1358,8 +1357,7 @@ local_merge_branch_into_base() {
 
 advance_active_tasks() {
   local progressed="false"
-  local pass
-  for pass in $(seq 1 16); do
+  for _ in $(seq 1 16); do
     local pass_progressed="false"
     while IFS=$'\t' read -r task_id state; do
       [[ -n "$task_id" && -n "$state" ]] || continue
