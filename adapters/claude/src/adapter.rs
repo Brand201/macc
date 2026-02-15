@@ -106,13 +106,11 @@ fn install_remote_content(
     })
 }
 
-fn add_skills(plan: &mut ActionPlan, config: &ClaudeConfig, installed_skills: &BTreeSet<String>) {
+fn add_skills(_plan: &mut ActionPlan, config: &ClaudeConfig, installed_skills: &BTreeSet<String>) {
     for skill in &config.skills {
         if installed_skills.contains(skill) {
             continue;
         }
-        let content = render_skill_md(skill);
-        plan_builders::write_text(plan, format!(".claude/skills/{}/SKILL.md", skill), &content);
     }
 }
 
@@ -127,42 +125,6 @@ fn add_rules(plan: &mut ActionPlan, config: &ClaudeConfig) {
     for rule in rules::render_rules(config) {
         plan_builders::write_text(plan, rule.path, &rule.content);
     }
-}
-
-fn render_skill_md(name: &str) -> String {
-    let (goal, steps, done) = match name {
-        "create-plan" => (
-            "Produce a structured implementation plan from a user request.",
-            "1) Analyze the request and existing codebase.\n2) Identify required changes and affected files.\n3) Break down the task into small, reviewable steps.\n4) Format as a structured plan with clear objectives for each step.",
-            "A coherent, actionable implementation plan is presented.",
-        ),
-        "implement" => (
-            "End-to-end implementation workflow: read context, plan, implement, validate, review.",
-            "1) Read relevant docs and files (CLAUDE.md, existing code).\n2) Propose a short implementation plan.\n3) Implement small, safe changes.\n4) Validate via tests and linting.\n5) Provide a short review summary and suggested commit message.",
-            "Changes are implemented, validated, and reviewed.",
-        ),
-        "security-check" => (
-            "Perform basic security checks for common issues and unsafe operations.",
-            "1) Scan for hardcoded secrets (API keys, tokens).\n2) Identify unsafe file operations or path traversals.\n3) Check for outdated or vulnerable dependencies.\n4) Summarize findings with severity levels and mitigation steps.",
-            "Security scan is complete and all findings are reported or resolved.",
-        ),
-        _ => (
-            "Execute the workflow for this skill following MACC standards.",
-            "1) Clarify inputs and scope.\n2) Plan briefly.\n3) Execute safely.\n4) Summarize outcomes and next steps.",
-            "The workflow is completed with a clear summary.",
-        ),
-    };
-
-    let mut md = String::new();
-    md.push_str(&format!("# /{}\n\n", name));
-    md.push_str("## Goal\n");
-    md.push_str(goal);
-    md.push_str("\n\n## Steps\n");
-    md.push_str(steps);
-    md.push_str("\n\n## Done when\n");
-    md.push_str(done);
-    md.push('\n');
-    md
 }
 
 fn render_agent_md(name: &str) -> String {
