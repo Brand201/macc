@@ -4,16 +4,15 @@
   "updated_at": "2026-01-30",
   "entries": [
     {
-      "id": "create-plan",
-      "name": "Create Plan",
-      "description": "Produces a structured implementation plan from a request.",
+      "id": "dfigma-implement-designc",
+      "name": "figma implement design",
+      "description": "This skill provides a structured workflow for translating Figma designs into production-ready code with pixel-perfect accuracy.",
       "tags": [
-        "planning",
-        "workflow",
-        "bmad"
+        "implement",
+        "figma"
       ],
       "selector": {
-        "subpath": "skills/.experimental/create-plan"
+        "subpath": "skills/.curated/dfigma-implement-designc"
       },
       "source": {
         "kind": "git",
@@ -42,21 +41,213 @@
       }
     },
     {
-      "id": "security-check",
-      "name": "Security Check example",
-      "description": "Performs basic security checks for common issues and unsafe operations.",
+      "id": "figma",
+      "name": "figma",
+      "description": "Use the Figma MCP server for Figma-driven implementation. For setup and debugging details (env vars, config, verification), see references/figma-mcp-config.md.",
       "tags": [
-        "security",
-        "review"
+        "implement",
+        "figma"
       ],
       "selector": {
-        "subpath": "skills/security-check"
+        "subpath": "skills/.curated/figma"
       },
       "source": {
-        "kind": "http",
-        "url": "https://example.invalid/macc/skills-bundle.zip",
-        "ref": "",
-        "checksum": "sha256:REPLACE_WITH_REAL_SHA256"
+        "kind": "git",
+        "url": "https://github.com/openai/skills.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "fdevelop-web-gamea",
+      "name": "develop web game",
+      "description": "Build games in small steps and validate every change. Treat each iteration as: implement → act → pause → observe → adjust.",
+      "tags": [
+        "develop",
+        "web",
+        "game"
+      ],
+      "selector": {
+        "subpath": "skills/.curated/fdevelop-web-gamea"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/openai/skills.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "rust-async-patterns",
+      "name": "rust async patterns",
+      "description": "Production patterns for async Rust programming with Tokio runtime, including tasks, channels, streams, and error handling.",
+      "tags": [
+        "develop",
+        "rust"
+      ],
+      "selector": {
+        "subpath": "plugins/systems-programming/skills/rust-async-patterns"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/wshobson/agents.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "rust-cli-builder",
+      "name": "rust cli builder",
+      "description": "Plan and build production-ready Rust CLI tools using clap for argument parsing, with subcommands, config file support, colored output, and proper error handling.",
+      "tags": [
+        "rust",
+        "cli",
+        "clap",
+        "terminal",
+        "command-line",
+        "devtools"
+      ],
+      "selector": {
+        "subpath": "cli-tool/components/skills/development/rust-cli-builder"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/davila7/claude-code-templates.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "python-expert",
+      "name": "python expert",
+      "description": "Senior Python developer expertise for writing clean, efficient, and well-documented code.",
+      "tags": [
+        "Python",
+        "expert"
+      ],
+      "selector": {
+        "subpath": "awesome_agent_skills/python-expert"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/Shubhamsaboo/awesome-llm-apps.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "python-testing",
+      "name": "python testing",
+      "description": "Python testing strategies using pytest, TDD methodology, fixtures, mocking, parametrization, and coverage requirements.",
+      "tags": [
+        "Python",
+        "test"
+      ],
+      "selector": {
+        "subpath": ".cursor/skills/python-testing"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/affaan-m/everything-claude-code.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "k8s-manifest-generator",
+      "name": "k8s manifest generator",
+      "description": "Create production-ready Kubernetes manifests for Deployments, Services, ConfigMaps, and Secrets following best practices and security standards.",
+      "tags": [
+        "k8s",
+        "manifest",
+        "Kubernetes"
+      ],
+      "selector": {
+        "subpath": "plugins/kubernetes-operations/skills/k8s-manifest-generator"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/wshobson/agents.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "k8s-security-policies",
+      "name": "k8s security policies",
+      "description": "Implement Kubernetes security policies including NetworkPolicy, PodSecurityPolicy, and RBAC for production-grade security.",
+      "tags": [
+        "k8s",
+        "security",
+        "Kubernetes",
+        "policies"
+      ],
+      "selector": {
+        "subpath": "plugins/kubernetes-operations/skills/k8s-security-policies"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/wshobson/agents.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "kubernetes-architect",
+      "name": "kubernetes architect",
+      "description": "Expert Kubernetes architect specializing in cloud-native infrastructure, advanced GitOps workflows (ArgoCD/Flux), and enterprise container orchestration.",
+      "tags": [
+        "k8s",
+        "Kubernetes",
+        "parchitects"
+      ],
+      "selector": {
+        "subpath": "skills/kubernetes-architect"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/sickn33/antigravity-awesome-skills.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "devops-iac-engineer",
+      "name": "devops iac engineer",
+      "description": "Implements infrastructure as code using Terraform, Kubernetes, and cloud platforms. Designs scalable architectures, CI/CD pipelines, and observability solutions.",
+      "tags": [
+        "CI/CD",
+        "Kubernetes",
+        "architectures"
+      ],
+      "selector": {
+        "subpath": "cli-tool/components/skills/development/devops-iac-engineer"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/davila7/claude-code-templates.git",
+        "ref": "main",
+        "checksum": null
+      }
+    }
+
+    ,
+    {
+      "id": "helm-chart-scaffolding",
+      "name": "helm chart scaffolding",
+      "description": "Design, organize, and manage Helm charts for templating and packaging Kubernetes applications with reusable configurations.",
+      "tags": [
+        "Helm",
+        "Kubernetes"
+      ],
+      "selector": {
+        "subpath": "plugins/kubernetes-operations/skills/helm-chart-scaffolding"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/wshobson/agents.git",
+        "ref": "main",
+        "checksum": null
       }
     }
   ]
