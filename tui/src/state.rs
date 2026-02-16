@@ -90,6 +90,16 @@ pub struct CoordinatorTaskSnapshot {
     pub active: usize,
     pub blocked: usize,
     pub merged: usize,
+    pub active_tasks: Vec<CoordinatorActiveTask>,
+}
+
+#[derive(Clone)]
+pub struct CoordinatorActiveTask {
+    pub id: String,
+    pub state: String,
+    pub tool: String,
+    pub worktree: String,
+    pub updated_at: String,
 }
 
 struct CoordinatorProcess {
@@ -150,6 +160,11 @@ pub struct AppState {
     pub coordinator_running_action: Option<String>,
     pub coordinator_last_result: Option<String>,
     pub coordinator_spinner_tick: u64,
+    pub coordinator_events: Vec<String>,
+    pub coordinator_events_last_refresh: Option<Instant>,
+    pub coordinator_events_per_sec: Option<f64>,
+    pub coordinator_last_event_age: Option<Duration>,
+    coordinator_events_last_seen_count: usize,
     pub search_query: String,
     pub search_editing: bool,
     pub undo_stack: Vec<CanonicalConfig>,
@@ -159,8 +174,10 @@ pub struct AppState {
 
 impl AppState {
     const AUTOMATION_FIELD_COUNT: usize = 14;
+    const COORDINATOR_EVENTS_EWMA_ALPHA: f64 = 0.30;
     const COORDINATOR_TASK_REGISTRY_REL_PATH: &'static str =
         ".macc/automation/task/task_registry.json";
+    const COORDINATOR_EVENTS_REL_PATH: &'static str = ".macc/log/coordinator/events.jsonl";
 
     pub fn automation_field_count(&self) -> usize {
         Self::AUTOMATION_FIELD_COUNT
@@ -226,6 +243,11 @@ impl AppState {
             coordinator_running_action: None,
             coordinator_last_result: None,
             coordinator_spinner_tick: 0,
+            coordinator_events: Vec::new(),
+            coordinator_events_last_refresh: None,
+            coordinator_events_per_sec: None,
+            coordinator_last_event_age: None,
+            coordinator_events_last_seen_count: 0,
             search_query: String::new(),
             search_editing: false,
             undo_stack: Vec::new(),
@@ -444,17 +466,46 @@ impl AppState {
             active: 0,
             blocked: 0,
             merged: 0,
+            active_tasks: Vec::new(),
         };
         for task in tasks {
+            let id = task
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string();
             let state = task
                 .get("state")
                 .and_then(|v| v.as_str())
                 .unwrap_or("todo")
                 .to_ascii_lowercase();
+            let tool = task
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string();
+            let worktree = task
+                .get("worktree")
+                .and_then(|v| v.get("worktree_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string();
+            let updated_at = task
+                .get("state_changed_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string();
             match state.as_str() {
                 "todo" => snapshot.todo += 1,
                 "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued" => {
-                    snapshot.active += 1
+                    snapshot.active += 1;
+                    snapshot.active_tasks.push(CoordinatorActiveTask {
+                        id,
+                        state,
+                        tool,
+                        worktree,
+                        updated_at,
+                    });
                 }
                 "blocked" => snapshot.blocked += 1,
                 "merged" => snapshot.merged += 1,
@@ -477,6 +528,132 @@ impl AppState {
                 self.coordinator_last_result = Some(format_actionable_error(&err));
             }
         }
+    }
+
+    fn coordinator_events_path(&self) -> Option<PathBuf> {
+        let paths = self.project_paths.as_ref()?;
+        Some(paths.root.join(Self::COORDINATOR_EVENTS_REL_PATH))
+    }
+
+    fn is_essential_coordinator_event(event: &str) -> bool {
+        matches!(
+            event,
+            "command_start"
+                | "command_end"
+                | "command_error"
+                | "task_transition"
+                | "task_dispatched"
+                | "performer_complete"
+                | "task_blocked"
+                | "dispatch_complete"
+        )
+    }
+
+    pub fn refresh_coordinator_events(&mut self) {
+        let Some(path) = self.coordinator_events_path() else {
+            return;
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => {
+                self.coordinator_events.clear();
+                self.coordinator_events_per_sec = None;
+                self.coordinator_last_event_age = None;
+                self.coordinator_events_last_seen_count = 0;
+                return;
+            }
+        };
+        let now = Instant::now();
+        let mut lines: Vec<String> = content
+            .lines()
+            .filter_map(|line| {
+                if line.trim().is_empty() {
+                    return None;
+                }
+                if let Ok(v) = serde_json::from_str::<Value>(line) {
+                    let ts = v
+                        .get("ts")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let event = v
+                        .get("event")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("event")
+                        .to_string();
+                    if !Self::is_essential_coordinator_event(&event) {
+                        return None;
+                    }
+                    let msg = v
+                        .get("msg")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let task = v
+                        .get("task_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let state = v
+                        .get("state")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let mut rendered = format!("[{}] {}", event, msg);
+                    if !task.is_empty() {
+                        rendered.push_str(&format!(" | task={}", task));
+                    }
+                    if !state.is_empty() {
+                        rendered.push_str(&format!(" | state={}", state));
+                    }
+                    let detail = v
+                        .get("detail")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !detail.is_empty() {
+                        rendered.push_str(&format!(" | {}", detail));
+                    }
+                    if !ts.is_empty() {
+                        rendered.push_str(&format!(" | {}", ts));
+                    }
+                    Some(rendered)
+                } else {
+                    Some(line.to_string())
+                }
+            })
+            .collect();
+        let total_count = lines.len();
+        if let Some(prev_refresh) = self.coordinator_events_last_refresh {
+            let elapsed_secs = now.saturating_duration_since(prev_refresh).as_secs_f64();
+            if elapsed_secs > 0.0 {
+                let delta_events =
+                    total_count.saturating_sub(self.coordinator_events_last_seen_count);
+                let instant_rate = delta_events as f64 / elapsed_secs;
+                self.coordinator_events_per_sec = Some(match self.coordinator_events_per_sec {
+                    Some(previous) => {
+                        let alpha = Self::COORDINATOR_EVENTS_EWMA_ALPHA;
+                        (1.0 - alpha) * previous + alpha * instant_rate
+                    }
+                    None => instant_rate,
+                });
+            }
+        } else {
+            self.coordinator_events_per_sec = Some(0.0);
+        }
+
+        self.coordinator_last_event_age = std::fs::metadata(&path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok());
+
+        let keep = 120usize;
+        if lines.len() > keep {
+            lines = lines.split_off(lines.len() - keep);
+        }
+        self.coordinator_events = lines;
+        self.coordinator_events_last_refresh = Some(now);
+        self.coordinator_events_last_seen_count = total_count;
     }
 
     pub fn refresh_tool_checks(&mut self) {
@@ -591,6 +768,63 @@ impl AppState {
             return;
         };
         let root = paths.root.clone();
+        if action == "run" {
+            let current_exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(err) => {
+                    let actionable = format_actionable_error(&format!(
+                        "Failed to locate current executable: {}",
+                        err
+                    ));
+                    self.coordinator_last_result = Some(actionable.clone());
+                    self.set_status(
+                        UiStatusLevel::Error,
+                        actionable,
+                        Some(Duration::from_secs(8)),
+                    );
+                    return;
+                }
+            };
+            let mut cmd = Command::new(current_exe);
+            cmd.current_dir(&root)
+                .arg("--cwd")
+                .arg(&root)
+                .arg("coordinator")
+                .arg("run")
+                .arg("--no-tui")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            match cmd.spawn() {
+                Ok(child) => {
+                    self.coordinator_process = Some(CoordinatorProcess {
+                        action: action.to_string(),
+                        child,
+                        started_at: Instant::now(),
+                    });
+                    self.coordinator_running_action = Some(action.to_string());
+                    self.coordinator_last_result = Some("Started 'run' loop.".to_string());
+                    self.refresh_coordinator_snapshot();
+                    self.refresh_coordinator_events();
+                    self.set_status(
+                        UiStatusLevel::Info,
+                        "Coordinator 'run' started.",
+                        Some(Duration::from_secs(3)),
+                    );
+                }
+                Err(err) => {
+                    self.coordinator_last_result = Some(format_actionable_error(&format!(
+                        "Failed to start 'run': {}",
+                        err
+                    )));
+                    self.set_status(
+                        UiStatusLevel::Error,
+                        "Failed to start 'run'.",
+                        Some(Duration::from_secs(8)),
+                    );
+                }
+            }
+            return;
+        }
         let script = match self.coordinator_script_path() {
             Ok(path) => path,
             Err(err) => {
@@ -641,60 +875,20 @@ impl AppState {
         }
     }
 
-    fn run_coordinator_action_blocking(
-        &mut self,
-        action: &str,
-        args: &[&str],
-    ) -> Result<(), String> {
-        let Some(paths) = self.project_paths.as_ref() else {
-            return Err("No project loaded.".to_string());
-        };
-        let root = paths.root.clone();
-        let script = self.coordinator_script_path()?;
-        let mut cmd = Command::new(script);
-        cmd.current_dir(&root)
-            .arg(action)
-            .args(args)
-            .env("REPO_DIR", &root)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        self.apply_coordinator_env_overrides(&mut cmd);
-        let status = cmd
-            .status()
-            .map_err(|e| format!("failed to run '{}': {}", action, e))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("'{}' failed with status {}", action, status))
-        }
-    }
-
     pub fn stop_coordinator_action(&mut self) {
-        match self.run_coordinator_action_blocking("stop", &["--graceful"]) {
-            Ok(()) => {
-                if let Some(mut proc_state) = self.coordinator_process.take() {
-                    let _ = proc_state.child.kill();
-                    let _ = proc_state.child.wait();
-                }
-                self.coordinator_running_action = None;
-                self.coordinator_last_result = Some("Coordinator stop completed.".to_string());
-                self.refresh_coordinator_snapshot();
-                self.set_status(
-                    UiStatusLevel::Success,
-                    "Coordinator stopped.",
-                    Some(Duration::from_secs(4)),
-                );
-            }
-            Err(err) => {
-                let actionable = format_actionable_error(&err);
-                self.coordinator_last_result = Some(actionable.clone());
-                self.set_status(
-                    UiStatusLevel::Error,
-                    actionable,
-                    Some(Duration::from_secs(8)),
-                );
-            }
+        if let Some(mut proc_state) = self.coordinator_process.take() {
+            let _ = proc_state.child.kill();
+            let _ = proc_state.child.wait();
         }
+        self.coordinator_running_action = None;
+        self.coordinator_last_result = Some("Coordinator process stopped.".to_string());
+        self.refresh_coordinator_snapshot();
+        self.refresh_coordinator_events();
+        self.set_status(
+            UiStatusLevel::Success,
+            "Coordinator stopped.",
+            Some(Duration::from_secs(4)),
+        );
     }
 
     fn ensure_working_copy(&mut self) {
@@ -719,6 +913,7 @@ impl AppState {
                 self.refresh_logs();
                 self.refresh_worktree_status();
                 self.refresh_coordinator_snapshot();
+                self.refresh_coordinator_events();
                 match macc_core::config::load_canonical_config(&paths.config_path) {
                     Ok(config) => {
                         self.config = Some(config.clone());
@@ -789,6 +984,12 @@ impl AppState {
         });
         badges.push(format!("tool:{}", self.active_tool_label()));
         badges.push(format!("warnings:{}", self.errors.len()));
+        if self.is_coordinator_running() {
+            let action = self.coordinator_running_action.as_deref().unwrap_or("run");
+            badges.push(format!("coord:{}", action));
+        } else {
+            badges.push("coord:off".to_string());
+        }
         let offline = env::var("MACC_OFFLINE")
             .ok()
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
@@ -853,6 +1054,10 @@ impl AppState {
     }
 
     pub fn tick(&mut self) {
+        // Advance spinner globally so live task animation also moves when
+        // observing a coordinator process started outside this TUI instance.
+        self.coordinator_spinner_tick = self.coordinator_spinner_tick.wrapping_add(1);
+
         if let Some(status) = &self.ui_status {
             if let Some(expire) = status.expires_at {
                 if Instant::now() >= expire {
@@ -890,15 +1095,16 @@ impl AppState {
                     self.coordinator_running_action = None;
                     self.coordinator_process = None;
                     self.refresh_coordinator_snapshot();
+                    self.refresh_coordinator_events();
                 }
                 Ok(None) => {
-                    self.coordinator_spinner_tick = self.coordinator_spinner_tick.wrapping_add(1);
                     let should_refresh = self
                         .coordinator_last_refresh
                         .map(|ts| ts.elapsed() >= Duration::from_secs(1))
                         .unwrap_or(true);
                     if should_refresh {
                         self.refresh_coordinator_snapshot();
+                        self.refresh_coordinator_events();
                     }
                 }
                 Err(err) => {
@@ -919,6 +1125,14 @@ impl AppState {
 
         if let Some((level, msg)) = finished_message {
             self.set_status(level, msg, Some(Duration::from_secs(5)));
+        }
+
+        let should_refresh_events = self
+            .coordinator_events_last_refresh
+            .map(|ts| ts.elapsed() >= Duration::from_secs(1))
+            .unwrap_or(true);
+        if should_refresh_events {
+            self.refresh_coordinator_events();
         }
     }
 

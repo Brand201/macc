@@ -3,6 +3,7 @@ pub enum Screen {
     Home,
     Tools,
     Automation,
+    CoordinatorLive,
     Mcp,
     Logs,
     Skills,
@@ -19,6 +20,7 @@ impl Screen {
             Screen::Home => "Home",
             Screen::Tools => "Tools Configuration",
             Screen::Automation => "Automation / Coordinator",
+            Screen::CoordinatorLive => "Coordinator Live",
             Screen::Mcp => "MCP Servers",
             Screen::Logs => "Logs",
             Screen::Skills => "Skills",
@@ -37,6 +39,7 @@ impl Screen {
             ("h", "Go Home"),
             ("t", "Go to Tools"),
             ("o", "Go to Automation"),
+            ("v", "Go to Coordinator Live"),
             ("m", "Go to MCP"),
             ("g", "Go to Logs"),
             ("p", "Go to Preview"),
@@ -57,6 +60,8 @@ impl Screen {
             Screen::Automation => vec![
                 ("Up/Down", "Navigate Settings"),
                 ("Space/Enter", "Edit / Cycle"),
+            ],
+            Screen::CoordinatorLive => vec![
                 ("r", "Run Full Cycle"),
                 ("y", "Sync Registry"),
                 ("c", "Reconcile"),

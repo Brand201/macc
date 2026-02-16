@@ -309,7 +309,9 @@ Worktrees let MACC run multiple isolated task branches and tool sessions in para
 Coordinator orchestrates the end-to-end automation cycle: it reads the task registry, dispatches work to tools, tracks state transitions, and reconciles/cleans up until convergence.
 
 - `macc coordinator` (default full cycle: sync -> dispatch -> advance -> reconcile -> cleanup in loop until convergence)
+- `macc coordinator` opens the TUI `Coordinator Live` screen and starts coordinator run.
 - `macc coordinator [run|dispatch|advance|sync|status|reconcile|unlock|cleanup|stop]`
+- `macc coordinator run --no-tui` keeps the previous headless CLI behavior.
 - `macc coordinator stop [--graceful] [--remove-worktrees] [--remove-branches]`
 - Coordinator options can override config at runtime:
   - `--prd`, `--coordinator-tool`
@@ -318,6 +320,7 @@ Coordinator orchestrates the end-to-end automation cycle: it reads the task regi
   - `--phase-runner-max-attempts`
   - `--stale-claimed-seconds`, `--stale-in-progress-seconds`, `--stale-changes-requested-seconds`, `--stale-action`
 - Task registry path is fixed to `.macc/automation/task/task_registry.json`.
+- Coordinator emits event bus lines to `.macc/log/coordinator/events.jsonl` (used by TUI live screen).
 - Use `--` to forward raw args directly to `coordinator.sh`.
 
 ## TUI overview
@@ -327,7 +330,8 @@ Main screens:
 - Home
 - Tools
 - Tool Settings
-- Automation / Coordinator
+- Automation / Coordinator (settings only)
+- Coordinator Live (runtime monitoring)
 - Skills
 - MCP
 - Logs
@@ -336,7 +340,7 @@ Main screens:
 
 Common keys:
 
-- Navigation: `h` Home, `t` Tools, `o` Automation, `m` MCP, `g` Logs, `p` Preview
+- Navigation: `h` Home, `t` Tools, `o` Automation, `v` Coordinator Live, `m` MCP, `g` Logs, `p` Preview
 - Save/apply: `s` Save config, `x` Apply
 - Help: `?`
 - Back: `Backspace`

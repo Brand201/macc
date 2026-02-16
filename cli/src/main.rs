@@ -171,6 +171,9 @@ enum Commands {
         /// Coordinator action (run, dispatch, advance, sync, status, reconcile, unlock, cleanup, stop)
         #[arg(default_value = "run")]
         action: String,
+        /// Disable TUI live view for `macc coordinator run`
+        #[arg(long)]
+        no_tui: bool,
         /// Graceful stop (SIGTERM only, no SIGKILL escalation)
         #[arg(long)]
         graceful: bool,
@@ -1394,6 +1397,7 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
         }
         Some(Commands::Coordinator {
             action,
+            no_tui,
             graceful,
             remove_worktrees,
             remove_branches,
@@ -1416,6 +1420,15 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             let paths = ensure_initialized_paths(&absolute_cwd)?;
             let canonical = load_canonical_config(&paths.config_path)?;
             let coordinator = canonical.automation.coordinator.clone();
+
+            if action == "run" && !*no_tui {
+                return macc_tui::run_tui_with_launch(macc_tui::LaunchMode::CoordinatorRun)
+                    .map_err(|e| MaccError::Io {
+                        path: "tui".into(),
+                        action: "run_tui coordinator live".into(),
+                        source: std::io::Error::other(e.to_string()),
+                    });
+            }
 
             let _ = macc_core::ensure_embedded_automation_scripts(&paths)?;
             let coordinator_path = paths.automation_coordinator_path();
@@ -6054,6 +6067,7 @@ exit 0
                 verbose: false,
                 command: Some(Commands::Coordinator {
                     action: "stop".to_string(),
+                    no_tui: true,
                     graceful: true,
                     remove_worktrees: true,
                     remove_branches: true,

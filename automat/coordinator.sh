@@ -36,6 +36,8 @@ ENABLED_TOOLS_JSON="[]"
 TOOL_PRIORITY_JSON="[]"
 COORD_LOG_DIR=""
 COORD_LOG_FILE=""
+COORD_EVENTS_FILE=""
+COORD_COMMAND_NAME=""
 
 note() {
   local msg="$*"
@@ -45,6 +47,32 @@ note() {
     printf '%s\n' "$msg"
   fi
   printf '%s\n' "$msg"
+}
+
+emit_event() {
+  local event="$1"
+  local msg="${2:-}"
+  local task_id="${3:-}"
+  local state="${4:-}"
+  local detail="${5:-}"
+  [[ -n "${COORD_EVENTS_FILE:-}" ]] || return 0
+  jq -nc \
+    --arg ts "$(now_iso)" \
+    --arg event "$event" \
+    --arg command "${COORD_COMMAND_NAME:-}" \
+    --arg msg "$msg" \
+    --arg task_id "$task_id" \
+    --arg state "$state" \
+    --arg detail "$detail" \
+    '{
+      ts:$ts,
+      event:$event,
+      command:$command,
+      msg:$msg,
+      task_id:($task_id|select(length>0)),
+      state:($state|select(length>0)),
+      detail:($detail|select(length>0))
+    }' >>"$COORD_EVENTS_FILE" 2>/dev/null || true
 }
 
 spinner_enabled() {
@@ -104,6 +132,11 @@ spinner_stop() {
 on_exit() {
   local rc=$?
   spinner_stop "Coordinator stopped."
+  if [[ "$rc" -eq 0 ]]; then
+    emit_event "command_end" "Coordinator command completed"
+  else
+    emit_event "command_error" "Coordinator command failed" "" "" "exit_code=${rc}"
+  fi
   if [[ "$rc" -ne 0 && -n "${COORD_TERM_FD:-}" && -n "${COORD_LOG_FILE:-}" ]]; then
     printf 'Coordinator failed. See log: %s\n' "$COORD_LOG_FILE" >&"$COORD_TERM_FD"
   fi
@@ -112,8 +145,10 @@ trap on_exit EXIT
 
 setup_logging() {
   local command_name="${1:-dispatch}"
+  COORD_COMMAND_NAME="$command_name"
   mkdir -p "${REPO_DIR}/.macc/log/coordinator"
   COORD_LOG_DIR="${REPO_DIR}/.macc/log/coordinator"
+  COORD_EVENTS_FILE="${COORD_LOG_DIR}/events.jsonl"
   local ts
   ts="$(date -u +"%Y%m%dT%H%M%SZ")"
   COORD_LOG_FILE="${COORD_LOG_DIR}/${command_name}-${ts}.md"
@@ -128,6 +163,7 @@ setup_logging() {
   note "- Started (UTC): $(now_iso)"
   note ""
   note "Coordinator log file: ${COORD_LOG_FILE}"
+  emit_event "command_start" "Coordinator command started"
 }
 
 usage() {
@@ -794,6 +830,8 @@ apply_transition() {
   local pr_url="${3:-}"
   local reviewer="${4:-}"
   local reason="${5:-}"
+  local old_state=""
+  old_state="$(task_state "$task_id" 2>/dev/null || true)"
 
   local now tmp
   now="$(now_iso)"
@@ -859,6 +897,7 @@ apply_transition() {
      ' "$TASK_REGISTRY_FILE" >"$tmp"
 
   mv "$tmp" "$TASK_REGISTRY_FILE"
+  emit_event "task_transition" "Task state changed" "$task_id" "$new_state" "from=${old_state} reason=${reason}"
 }
 
 cleanup_stale_tasks() {
@@ -1663,9 +1702,11 @@ dispatch_ready_tasks() {
       if [[ "$completed_rc" -ne 0 ]]; then
         apply_transition "$completed_task" "blocked" "" "" "failure:performer"
         note "Blocked task due to performer failure: ${completed_task}"
+        emit_event "task_blocked" "Performer failed" "$completed_task" "blocked"
       else
         transition_task_and_hooks "$completed_task" "in_progress" "" "" "auto:performer_complete"
         note "Performer complete: ${completed_task} (${completed_tool})"
+        emit_event "performer_complete" "Performer completed task phase" "$completed_task" "in_progress"
       fi
     fi
 
@@ -1725,6 +1766,7 @@ dispatch_ready_tasks() {
     note "  source:    ${dispatch_kind}"
     note "  mode:      async (pid=${performer_pid})"
     note ""
+    emit_event "task_dispatched" "Task dispatched" "$selected" "in_progress" "tool=${tool} worktree=${worktree_path}"
 
     dispatched=$((dispatched + 1))
     if [[ "$MAX_DISPATCH" -gt 0 && "$dispatched" -ge "$MAX_DISPATCH" ]]; then
@@ -1759,13 +1801,16 @@ dispatch_ready_tasks() {
     if [[ "$completed_rc" -ne 0 ]]; then
       apply_transition "$completed_task" "blocked" "" "" "failure:performer"
       note "Blocked task due to performer failure: ${completed_task}"
+      emit_event "task_blocked" "Performer failed" "$completed_task" "blocked"
     else
       transition_task_and_hooks "$completed_task" "in_progress" "" "" "auto:performer_complete"
       note "Performer complete: ${completed_task} (${completed_tool})"
+      emit_event "performer_complete" "Performer completed task phase" "$completed_task" "in_progress"
     fi
   done
 
   note "Dispatch complete. Tasks dispatched: ${dispatched}"
+  emit_event "dispatch_complete" "Dispatch finished" "" "" "dispatched=${dispatched}"
 }
 
 main() {
