@@ -264,6 +264,9 @@ macc clear
 
 - `macc tui`: open interactive UI.
 - `macc tool install <tool_id> [-y|--yes]`: install local tool via ToolSpec install commands.
+- `macc tool update <tool_id> [--check] [-y|--yes] [--force] [--rollback-on-fail]`: update one installed tool.
+- `macc tool update --all [--only enabled|installed] [--check] [-y|--yes] [--force] [--rollback-on-fail]`: batch update tools.
+- `macc tool outdated [--only enabled|installed]`: show installed/current/latest status and outdated tools.
 - `macc context [--tool <tool_id>] [--from <file> ...] [--dry-run] [--print-prompt]`: generate/update tool context markdown files (for example `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`) using the corresponding installed tool.
 - In TUI `Tools` screen, press `f` to generate context for the selected tool.
 - To prevent `macc apply` from overwriting existing context files, set per-tool protection in `.macc/macc.yaml`:

@@ -33,6 +33,18 @@ install:
   post_install:
     command: claude
     args: []
+update:
+  confirm_message: "Claude Code update may change behavior. Continue?"
+  commands:
+    - command: npm
+      args: ["install", "-g", "@anthropic-ai/claude-code@latest"]
+version_check:
+  current:
+    command: claude
+    args: ["--version"]
+  latest:
+    command: npm
+    args: ["view", "@anthropic-ai/claude-code", "version"]
 fields:
   - id: model
     label: Model

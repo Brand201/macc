@@ -215,6 +215,8 @@ impl TestEngine {
             gitignore: Vec::new(),
             performer: None,
             install: None,
+            update: None,
+            version_check: None,
             defaults: None,
         };
 
@@ -260,6 +262,8 @@ impl TestEngine {
             gitignore: Vec::new(),
             performer: None,
             install: None,
+            update: None,
+            version_check: None,
             defaults: None,
         };
 

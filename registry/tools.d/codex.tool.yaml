@@ -33,6 +33,18 @@ install:
   post_install:
     command: codex
     args: []
+update:
+  confirm_message: "Codex CLI update may change behavior. Continue?"
+  commands:
+    - command: npm
+      args: ["install", "-g", "@openai/codex@latest"]
+version_check:
+  current:
+    command: codex
+    args: ["--version"]
+  latest:
+    command: npm
+    args: ["view", "@openai/codex", "version"]
 fields:
   - id: model
     label: Model
