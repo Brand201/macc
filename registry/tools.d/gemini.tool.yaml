@@ -38,6 +38,18 @@ install:
   post_install:
     command: gemini
     args: []
+update:
+  confirm_message: "Gemini CLI update may change behavior. Continue?"
+  commands:
+    - command: npm
+      args: ["install", "-g", "@google/gemini-cli@latest"]
+version_check:
+  current:
+    command: gemini
+    args: ["--version"]
+  latest:
+    command: npm
+    args: ["view", "@google/gemini-cli", "version"]
 fields:
   - id: model
     label: Model

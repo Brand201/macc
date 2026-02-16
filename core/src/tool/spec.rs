@@ -85,6 +85,13 @@ pub struct ToolInstallSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolVersionCheckSpec {
+    pub current: ToolInstallCommand,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest: Option<ToolInstallCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolRuntimeConfig {
     pub api_version: String,
     pub id: String,
@@ -151,6 +158,10 @@ pub struct ToolSpec {
     pub performer: Option<ToolPerformerSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub install: Option<ToolInstallSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update: Option<ToolInstallSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_check: Option<ToolVersionCheckSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defaults: Option<serde_json::Value>,
 }
@@ -614,6 +625,8 @@ mod tests {
             gitignore: Vec::new(),
             performer: None,
             install: None,
+            update: None,
+            version_check: None,
             defaults: None,
         };
 
@@ -653,6 +666,8 @@ mod tests {
             gitignore: Vec::new(),
             performer: None,
             install: None,
+            update: None,
+            version_check: None,
             defaults: None,
         };
 
@@ -679,6 +694,8 @@ mod tests {
             gitignore: Vec::new(),
             performer: None,
             install: None,
+            update: None,
+            version_check: None,
             defaults: None,
         };
 
@@ -735,6 +752,8 @@ mod tests {
             gitignore: Vec::new(),
             performer: None,
             install: None,
+            update: None,
+            version_check: None,
             defaults: None,
         };
 
@@ -787,6 +806,8 @@ mod tests {
             gitignore: Vec::new(),
             performer: None,
             install: None,
+            update: None,
+            version_check: None,
             defaults: None,
         };
 
