@@ -91,6 +91,13 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: &mut AppState) -> io::
     }
 }
 
+fn format_hms(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    format!("{}:{:02}:{:02}", hours, minutes, seconds)
+}
+
 fn handle_key(state: &mut AppState, key: KeyCode) {
     if state.has_coordinator_pause_prompt() {
         match key {
@@ -1139,12 +1146,12 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
 
             let status_line = if state.is_coordinator_running() {
                 format!(
-                    "Running: {} ({}s) {}",
+                    "Running: {} ({}) {}",
                     state
                         .coordinator_running_action
                         .as_deref()
                         .unwrap_or("unknown"),
-                    state.coordinator_elapsed_seconds().unwrap_or(0),
+                    format_hms(state.coordinator_elapsed_seconds().unwrap_or(0)),
                     state.coordinator_spinner_frame()
                 )
             } else {
@@ -1160,7 +1167,7 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
             };
             let refresh_line = state
                 .coordinator_last_refresh
-                .map(|ts| format!("Last refresh: {}s ago", ts.elapsed().as_secs()))
+                .map(|ts| format!("Last refresh: {} ago", format_hms(ts.elapsed().as_secs())))
                 .unwrap_or_else(|| "Last refresh: n/a".to_string());
             let events_rate_line = state
                 .coordinator_events_per_sec
@@ -1168,7 +1175,7 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
                 .unwrap_or_else(|| "Events/sec: n/a".to_string());
             let event_age_line = state
                 .coordinator_last_event_age
-                .map(|d| format!("Last event age: {}s", d.as_secs()))
+                .map(|d| format!("Last event age: {}", format_hms(d.as_secs())))
                 .unwrap_or_else(|| "Last event age: n/a".to_string());
             let result_line = state
                 .coordinator_last_result

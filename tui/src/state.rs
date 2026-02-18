@@ -84,6 +84,13 @@ impl Drop for QuietEnvGuard {
     }
 }
 
+fn format_hms(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    format!("{}:{:02}:{:02}", hours, minutes, seconds)
+}
+
 pub struct CoordinatorTaskSnapshot {
     pub total: usize,
     pub todo: usize,
@@ -1506,7 +1513,11 @@ impl AppState {
                     if status.success() {
                         finished_message = Some((
                             UiStatusLevel::Success,
-                            format!("Coordinator '{}' finished in {}s.", action, elapsed),
+                            format!(
+                                "Coordinator '{}' finished in {}.",
+                                action,
+                                format_hms(elapsed)
+                            ),
                         ));
                         post_success_action = self.coordinator_pause_next_action.take();
                         self.coordinator_pause_error = None;
@@ -1515,8 +1526,10 @@ impl AppState {
                         self.coordinator_pause_phase = None;
                     } else {
                         let msg = format!(
-                            "Coordinator '{}' failed in {}s (status {}).",
-                            action, elapsed, status
+                            "Coordinator '{}' failed in {} (status {}).",
+                            action,
+                            format_hms(elapsed),
+                            status
                         );
                         finished_message = Some((UiStatusLevel::Error, msg.clone()));
                         self.coordinator_pause_error = Some(msg);
