@@ -11,6 +11,15 @@ performer:
   args: ["exec", "--color", "never", "-"]
   prompt:
     mode: stdin
+  capability_contract:
+    strict: true
+    available_tools: [shell, apply_patch, web_search]
+    fail_fast_patterns:
+      - '(run_shell_command|replace)[^\\n]*(not found|unknown|unsupported|unavailable)'
+      - '(unknown|invalid)[^\\n]*(tool|function)[^\\n]*(run_shell_command|replace)'
+    notes:
+      - "Use shell for command execution; do not call run_shell_command."
+      - "Use apply_patch for edits; do not call replace."
   session:
     enabled: true
     scope: worktree

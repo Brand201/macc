@@ -10,6 +10,7 @@ Env vars:
   PERFORMER_MAX_ITERATIONS  Max tasks to run before stopping (default: 50)
   PERFORMER_TOOL_MAX_ATTEMPTS Max attempts per task (default: 2)
   PERFORMER_SLEEP_SECONDS   Pause between tasks (default: 2)
+  PERFORMER_CAPABILITY_FAIL_FAST  Fail fast on unavailable tool usage (default: true)
 EOF
 }
 
@@ -29,11 +30,15 @@ EVENT_SEQ=0
 EVENT_SEQ_FILE=""
 HEARTBEAT_PID=""
 CURRENT_PHASE="dev"
+CAPABILITY_VIOLATION_REASON=""
+CAPABILITY_VIOLATION_LINE=""
 
 PERFORMER_MAX_ITERATIONS="${PERFORMER_MAX_ITERATIONS:-50}"
 PERFORMER_TOOL_MAX_ATTEMPTS="${PERFORMER_TOOL_MAX_ATTEMPTS:-2}"
 PERFORMER_SLEEP_SECONDS="${PERFORMER_SLEEP_SECONDS:-2}"
 PERFORMER_SPINNER="${PERFORMER_SPINNER:-true}"
+PERFORMER_CAPABILITY_FAIL_FAST="${PERFORMER_CAPABILITY_FAIL_FAST:-true}"
+PERFORMER_FAIL_FAST_EXIT_CODE=42
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -327,10 +332,99 @@ pending_task_count() {
   jq -r "${JQ_ITEMS} | map(select(.passes != true)) | length" "$prd"
 }
 
+capability_contract_strict() {
+  jq -r '.performer.capability_contract.strict // false' "$tool_json"
+}
+
+capability_contract_has_tools() {
+  jq -e '.performer.capability_contract.available_tools | length > 0' "$tool_json" >/dev/null 2>&1
+}
+
+render_capability_contract() {
+  local strict
+  strict="$(capability_contract_strict)"
+  if [[ "$strict" != "true" ]] && ! capability_contract_has_tools; then
+    return 0
+  fi
+
+  cat <<'EOF'
+Tool Capability Contract (STRICT):
+- Use only the tools listed below.
+- If a required tool is unavailable, stop immediately and output:
+  MACC_CAPABILITY_ERROR: requested_tool=<tool_name> reason=<why>
+- Do not invent tool names and do not retry with unknown tools.
+EOF
+
+  if capability_contract_has_tools; then
+    echo "- Allowed tools:"
+    while IFS= read -r tool_name; do
+      [[ -n "$tool_name" ]] || continue
+      printf "  - %s\n" "$tool_name"
+    done < <(jq -r '.performer.capability_contract.available_tools[]? // empty' "$tool_json")
+  fi
+
+  while IFS= read -r note; do
+    [[ -n "$note" ]] || continue
+    printf -- "- Note: %s\n" "$note"
+  done < <(jq -r '.performer.capability_contract.notes[]? // empty' "$tool_json")
+}
+
+extract_first_match() {
+  local pattern="$1"
+  local file="$2"
+  grep -Eim1 "$pattern" "$file" | head -n1
+}
+
+detect_capability_violation() {
+  local output_file="$1"
+  CAPABILITY_VIOLATION_REASON=""
+  CAPABILITY_VIOLATION_LINE=""
+
+  local line
+  line="$(extract_first_match 'MACC_CAPABILITY_ERROR:' "$output_file" || true)"
+  if [[ -n "$line" ]]; then
+    CAPABILITY_VIOLATION_REASON="explicit capability error marker"
+    CAPABILITY_VIOLATION_LINE="$line"
+    return 0
+  fi
+
+  if [[ "${PERFORMER_CAPABILITY_FAIL_FAST}" != "true" ]]; then
+    return 1
+  fi
+
+  while IFS= read -r pattern; do
+    [[ -n "$pattern" ]] || continue
+    line="$(extract_first_match "$pattern" "$output_file" || true)"
+    if [[ -n "$line" ]]; then
+      CAPABILITY_VIOLATION_REASON="matched contract fail-fast pattern"
+      CAPABILITY_VIOLATION_LINE="$line"
+      return 0
+    fi
+  done < <(jq -r '.performer.capability_contract.fail_fast_patterns[]? // empty' "$tool_json")
+
+  # Generic fallback to stop retries when a model keeps requesting unavailable tools.
+  line="$(extract_first_match '(unknown|invalid|unsupported|unavailable)[^\\n]*(tool|function)' "$output_file" || true)"
+  if [[ -n "$line" ]]; then
+    CAPABILITY_VIOLATION_REASON="generic unavailable tool/function error"
+    CAPABILITY_VIOLATION_LINE="$line"
+    return 0
+  fi
+  line="$(extract_first_match '(tool|function)[^\\n]*(not found|unknown|unsupported|unavailable|invalid)' "$output_file" || true)"
+  if [[ -n "$line" ]]; then
+    CAPABILITY_VIOLATION_REASON="generic unavailable tool/function error"
+    CAPABILITY_VIOLATION_LINE="$line"
+    return 0
+  fi
+
+  return 1
+}
+
 build_prompt() {
   local task_json="$1"
   local task_id="$2"
   local task_title="$3"
+  local capability_contract
+  capability_contract="$(render_capability_contract)"
   cat <<PROMPT
 You are an autonomous coding agent working inside a MACC worktree.
 
@@ -349,6 +443,8 @@ Instructions:
 3) Do NOT commit; the runner will commit if all tasks are done.
 4) Keep output concise; avoid dumping large files.
 
+${capability_contract}
+
 Now implement the task.
 PROMPT
 }
@@ -357,12 +453,15 @@ run_tool() {
   local prompt_file="$1"
   local attempt="$2"
   local max_attempts="$3"
+  local output_capture
+  local fail_fast=false
   local script
   script="$(tool_runner_path)"
   if [[ -z "$script" || ! -x "$script" ]]; then
     echo "Error: tool performer not found or not executable: ${script}" >&2
     return 1
   fi
+  output_capture="$(mktemp)"
 
   log_task_line "## Attempt ${attempt}/${max_attempts}"
   log_task_line ""
@@ -380,19 +479,30 @@ run_tool() {
     --worktree "$worktree" \
     --task-id "$task_id" \
     --attempt "$attempt" \
-    --max-attempts "$max_attempts" >>"$task_log_file" 2>&1
-  local status=$?
+    --max-attempts "$max_attempts" 2>&1 | tee "$output_capture" >>"$task_log_file"
+  local status=${PIPESTATUS[0]}
   spinner_stop "Runner finished (${tool})"
   set -e
+
+  if detect_capability_violation "$output_capture"; then
+    fail_fast=true
+    status="$PERFORMER_FAIL_FAST_EXIT_CODE"
+    log_task_line "- Fail-fast capability guard: ${CAPABILITY_VIOLATION_REASON}"
+    if [[ -n "${CAPABILITY_VIOLATION_LINE:-}" ]]; then
+      log_task_line "- Matched output: ${CAPABILITY_VIOLATION_LINE}"
+    fi
+  fi
+
   if [[ "$status" -eq 0 ]]; then
     emit_performer_event "phase_result" "$CURRENT_PHASE" "done" "$(jq -nc --arg attempt "$attempt" '{attempt:($attempt|tonumber?)}')"
   else
-    emit_performer_event "phase_result" "$CURRENT_PHASE" "failed" "$(jq -nc --arg attempt "$attempt" --arg status "$status" '{attempt:($attempt|tonumber?), exit_status:($status|tonumber?)}')"
+    emit_performer_event "phase_result" "$CURRENT_PHASE" "failed" "$(jq -nc --arg attempt "$attempt" --arg status "$status" --arg fail_fast "$fail_fast" --arg reason "${CAPABILITY_VIOLATION_REASON:-}" --arg line "${CAPABILITY_VIOLATION_LINE:-}" '{attempt:($attempt|tonumber?), exit_status:($status|tonumber?), fail_fast:($fail_fast=="true"), reason:($reason|select(length>0)), matched_output:($line|select(length>0))}')"
   fi
   log_task_line '```'
   log_task_line ""
   log_task_line "- Exit status: ${status}"
   log_task_line ""
+  rm -f "$output_capture"
   return "$status"
 }
 
@@ -451,17 +561,30 @@ for ((i=1; i<=PERFORMER_MAX_ITERATIONS; i++)); do
   log_task_line ""
 
   tool_success=false
+  fail_fast_abort=false
   for ((attempt=1; attempt<=PERFORMER_TOOL_MAX_ATTEMPTS; attempt++)); do
     if run_tool "$prompt_file" "$attempt" "$PERFORMER_TOOL_MAX_ATTEMPTS"; then
       tool_success=true
       break
+    else
+      attempt_rc=$?
+      if [[ "$attempt_rc" -eq "$PERFORMER_FAIL_FAST_EXIT_CODE" ]]; then
+        fail_fast_abort=true
+        echo "Fail-fast: unavailable/unauthorized tool detected for task ${next_id}" >&2
+        break
+      fi
+      echo "Tool failed for task ${next_id} (attempt ${attempt}/${PERFORMER_TOOL_MAX_ATTEMPTS})" >&2
     fi
-    echo "Tool failed for task ${next_id} (attempt ${attempt}/${PERFORMER_TOOL_MAX_ATTEMPTS})" >&2
   done
   if [[ "$tool_success" != "true" ]]; then
     rm -f "$prompt_file"
-    emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(jq -nc --arg task "$next_id" '{task_id:$task, reason:"tool execution failed"}')"
-    echo "Error: tool execution failed for task ${next_id}" >&2
+    if [[ "$fail_fast_abort" == "true" ]]; then
+      emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(jq -nc --arg task "$next_id" --arg reason "${CAPABILITY_VIOLATION_REASON:-capability contract violation}" --arg line "${CAPABILITY_VIOLATION_LINE:-}" '{task_id:$task, reason:$reason, fail_fast:true, matched_output:($line|select(length>0))}')"
+      echo "Error: fail-fast capability guard triggered for task ${next_id}" >&2
+    else
+      emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(jq -nc --arg task "$next_id" '{task_id:$task, reason:"tool execution failed"}')"
+      echo "Error: tool execution failed for task ${next_id}" >&2
+    fi
     exit 1
   fi
   rm -f "$prompt_file"
