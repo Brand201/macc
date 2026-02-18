@@ -114,7 +114,7 @@ For production-like usage, the recommended sequence is:
 - Before install, users must confirm they already have account/API credentials.
 - After install, run login/API-key setup through the tool's own command flow.
 - Validate with `macc doctor`.
-- Generate/update tool-specific context files with:
+- Generate/update tool-specific context files with prompts sent to the selected AI tool (the tool edits files directly):
   - CLI: `macc context [--tool <tool_id>]`
   - TUI: `Tools` screen, press `f` on a selected tool.
 

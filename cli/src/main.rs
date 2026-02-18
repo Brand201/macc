@@ -105,7 +105,7 @@ enum Commands {
         #[command(subcommand)]
         tool_command: ToolCommands,
     },
-    /// Generate tool-specific context files using the corresponding AI tool
+    /// Ask AI tools to update their context files directly in the repo
     Context {
         /// Generate context for a single tool ID
         #[arg(long)]
@@ -113,7 +113,7 @@ enum Commands {
         /// Additional source files to include in the prompt context
         #[arg(long = "from")]
         from_files: Vec<String>,
-        /// Preview only; do not write files
+        /// Preview only; do not run tool commands
         #[arg(long)]
         dry_run: bool,
         /// Print generated prompt(s)
@@ -3055,15 +3055,6 @@ fn run_context_generation(
             continue;
         }
 
-        let generated_content = invoke_context_tool(paths, performer, &prompt)?;
-        let cleaned = normalize_generated_markdown(&generated_content);
-        if cleaned.trim().is_empty() {
-            return Err(MaccError::Validation(format!(
-                "Tool '{}' returned empty content for '{}'",
-                spec.id, target_rel
-            )));
-        }
-
         if let Some(parent) = target_abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
                 path: parent.to_string_lossy().into(),
@@ -3071,13 +3062,20 @@ fn run_context_generation(
                 source: e,
             })?;
         }
-        std::fs::write(&target_abs, cleaned.as_bytes()).map_err(|e| MaccError::Io {
-            path: target_abs.to_string_lossy().into(),
-            action: "write generated context file".into(),
-            source: e,
-        })?;
 
-        println!("Generated {} with {}", target_rel, spec.display_name);
+        invoke_context_tool(paths, performer, &prompt)?;
+
+        if !target_abs.is_file() {
+            return Err(MaccError::Validation(format!(
+                "Tool '{}' completed but did not produce '{}'. Ensure the agent writes that file directly.",
+                spec.id, target_rel
+            )));
+        }
+
+        println!(
+            "Context updated in-place: {} via {}",
+            target_rel, spec.display_name
+        );
         generated += 1;
     }
 
@@ -3261,9 +3259,11 @@ fn build_context_prompt(
 
     prompt.push_str("Output rules\n");
     prompt.push_str(&format!(
-        "- Provide only the final content of `{}` in Markdown.\n",
+        "- Edit `{}` directly in the repository.\n",
         target_rel
     ));
+    prompt.push_str("- Do not return the full file content in output.\n");
+    prompt.push_str("- At the end, print a short status line indicating the file was updated.\n");
     prompt.push_str("- Every command must be copyable, exact, and sourced when possible.\n");
     prompt.push_str(
         "- Add Markdown checklists (`- [ ]`) for PR / security / release (if applicable).\n",
@@ -3294,7 +3294,7 @@ fn invoke_context_tool(
     paths: &macc_core::ProjectPaths,
     performer: &ToolPerformerSpec,
     prompt: &str,
-) -> Result<String> {
+) -> Result<()> {
     if !command_exists(&performer.command) {
         return Err(MaccError::Validation(format!(
             "Tool command '{}' not found in PATH. Run 'macc doctor' and install/login the tool first.",
@@ -3331,7 +3331,7 @@ fn invoke_context_tool(
                 action: "run tool context generation command".into(),
                 source: e,
             })?;
-            decode_context_output(&performer.command, output)
+            validate_context_tool_exit(&performer.command, output)
         }
         "stdin" => {
             use std::io::Write;
@@ -3359,7 +3359,7 @@ fn invoke_context_tool(
                 action: "wait for tool context generation command".into(),
                 source: e,
             })?;
-            decode_context_output(&performer.command, output)
+            validate_context_tool_exit(&performer.command, output)
         }
         other => Err(MaccError::Validation(format!(
             "Unsupported prompt mode '{}' for tool '{}'.",
@@ -3368,7 +3368,7 @@ fn invoke_context_tool(
     }
 }
 
-fn decode_context_output(command: &str, output: std::process::Output) -> Result<String> {
+fn validate_context_tool_exit(command: &str, output: std::process::Output) -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if !output.status.success() {
@@ -3385,33 +3385,7 @@ fn decode_context_output(command: &str, output: std::process::Output) -> Result<
         )));
     }
 
-    if !stdout.trim().is_empty() {
-        return Ok(stdout);
-    }
-    if !stderr.trim().is_empty() {
-        return Ok(stderr);
-    }
-    Ok(String::new())
-}
-
-fn normalize_generated_markdown(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.starts_with("```") {
-        let mut lines = trimmed.lines();
-        let _ = lines.next();
-        let mut body = Vec::new();
-        for line in lines {
-            if line.trim_start().starts_with("```") {
-                break;
-            }
-            body.push(line);
-        }
-        let joined = body.join("\n").trim().to_string();
-        if !joined.is_empty() {
-            return format!("{}\n", joined);
-        }
-    }
-    format!("{}\n", trimmed)
+    Ok(())
 }
 
 fn command_exists(cmd: &str) -> bool {

@@ -267,7 +267,7 @@ macc clear
 - `macc tool update <tool_id> [--check] [-y|--yes] [--force] [--rollback-on-fail]`: update one installed tool.
 - `macc tool update --all [--only enabled|installed] [--check] [-y|--yes] [--force] [--rollback-on-fail]`: batch update tools.
 - `macc tool outdated [--only enabled|installed]`: show installed/current/latest status and outdated tools.
-- `macc context [--tool <tool_id>] [--from <file> ...] [--dry-run] [--print-prompt]`: generate/update tool context markdown files (for example `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`) using the corresponding installed tool.
+- `macc context [--tool <tool_id>] [--from <file> ...] [--dry-run] [--print-prompt]`: sends a context prompt to the selected AI tool; the tool must edit its target context file in-place (for example `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`).
 - In TUI `Tools` screen, press `f` to generate context for the selected tool.
 - To prevent `macc apply` from overwriting existing context files, set per-tool protection in `.macc/macc.yaml`:
   - `tools.config.<tool_id>.context.protect: true`
