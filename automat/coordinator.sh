@@ -33,6 +33,9 @@ TOOL_SPECIALIZATIONS_JSON="${TOOL_SPECIALIZATIONS_JSON:-{}}"
 WORKTREE_POOL_MODE="${WORKTREE_POOL_MODE:-true}" # true|false: reuse idle compatible worktrees
 COORDINATOR_VCS_HOOK="${COORDINATOR_VCS_HOOK:-}" # optional executable implementing PR/CI/queue/merge actions
 COORDINATOR_AUTOMERGE="${COORDINATOR_AUTOMERGE:-true}" # true|false: allow default local merge fallback
+COORDINATOR_MERGE_WORKER="${COORDINATOR_MERGE_WORKER:-automat/merge_worker.sh}" # local merge worker script
+COORDINATOR_MERGE_AI_FIX="${COORDINATOR_MERGE_AI_FIX:-false}" # true|false: allow AI-assisted merge conflict fixing
+COORDINATOR_MERGE_FIX_HOOK="${COORDINATOR_MERGE_FIX_HOOK:-}" # optional hook invoked by merge worker on merge conflicts
 EVENT_LOG_MAX_BYTES="${EVENT_LOG_MAX_BYTES:-5242880}" # rotate events.jsonl when above this size
 EVENT_LOG_KEEP_FILES="${EVENT_LOG_KEEP_FILES:-5}" # number of rotated event files to keep
 PROCESSED_EVENT_IDS_MAX="${PROCESSED_EVENT_IDS_MAX:-10000}" # max dedup IDs retained in registry
@@ -47,6 +50,7 @@ COORD_CURSOR_FILE=""
 COORD_EVENT_SOURCE=""
 EVENT_SEQ_COUNTER=0
 RUN_LOOP_ACTIVE_JOBS=()
+RUN_LOOP_MERGE_JOBS=()
 
 note() {
   local msg="$*"
@@ -245,6 +249,9 @@ Env vars:
   WORKTREE_POOL_MODE            Reuse idle compatible worktrees when true (default: true)
   COORDINATOR_VCS_HOOK          Optional hook executable for PR/CI/merge integration
   COORDINATOR_AUTOMERGE         Allow local merge fallback when no hook is configured (default: true)
+  COORDINATOR_MERGE_WORKER      Path to local merge worker script (default: automat/merge_worker.sh)
+  COORDINATOR_MERGE_AI_FIX      Allow AI-assisted merge conflict fixing in merge worker (default: false)
+  COORDINATOR_MERGE_FIX_HOOK    Optional merge-fix hook path; defaults to automat/hooks/ai-merge-fix.sh when AI fix is enabled
   EVENT_LOG_MAX_BYTES           Rotate .macc/log/coordinator/events.jsonl above this size (default: 5242880)
   EVENT_LOG_KEEP_FILES          Keep this many rotated event log files (default: 5)
   PROCESSED_EVENT_IDS_MAX       Max dedup IDs retained in registry before compaction (default: 10000)
@@ -383,6 +390,23 @@ ensure_repo_valid() {
   }
 }
 
+normalize_paths() {
+  REPO_DIR="$(cd "$REPO_DIR" && pwd -P)"
+  if [[ "$PRD_FILE" != /* ]]; then
+    PRD_FILE="${REPO_DIR%/}/${PRD_FILE}"
+  fi
+  TASK_REGISTRY_FILE="${REPO_DIR%/}/${TASK_REGISTRY_REL_PATH}"
+  if [[ "$COORDINATOR_MERGE_WORKER" != /* ]]; then
+    COORDINATOR_MERGE_WORKER="${REPO_DIR%/}/${COORDINATOR_MERGE_WORKER}"
+  fi
+  if is_truthy "$COORDINATOR_MERGE_AI_FIX" && [[ -z "$COORDINATOR_MERGE_FIX_HOOK" ]]; then
+    COORDINATOR_MERGE_FIX_HOOK="${REPO_DIR%/}/automat/hooks/ai-merge-fix.sh"
+  fi
+  if [[ -n "$COORDINATOR_MERGE_FIX_HOOK" && "$COORDINATOR_MERGE_FIX_HOOK" != /* ]]; then
+    COORDINATOR_MERGE_FIX_HOOK="${REPO_DIR%/}/${COORDINATOR_MERGE_FIX_HOOK}"
+  fi
+}
+
 lock_acquire() {
   COORD_LOCK_DIR="${TASK_REGISTRY_FILE}.lock"
   mkdir -p "$(dirname "$COORD_LOCK_DIR")"
@@ -508,6 +532,7 @@ clear_inactive_worktrees() {
 }
 
 reconcile_registry() {
+  reconcile_orphan_runtime_tasks
   clear_inactive_worktrees
   while IFS=$'\t' read -r task_id state worktree_path; do
     [[ -n "$task_id" && -n "$worktree_path" ]] || continue
@@ -869,7 +894,7 @@ validate_transition() {
     echo "Error: macc is required to validate coordinator transitions from core." >&2
     return 1
   fi
-  if macc --cwd "$REPO_DIR" coordinator validate-transition --from "$from" --to "$to" >/dev/null 2>&1; then
+  if macc --cwd "$REPO_DIR" coordinator validate-transition -- --from "$from" --to "$to" >/dev/null 2>&1; then
     return 0
   fi
   echo "Error: invalid transition ${from} -> ${to} (core transition table)" >&2
@@ -998,7 +1023,13 @@ set_task_runtime() {
          .task_runtime = (.task_runtime // {})
          | .task_runtime.status = $runtime_status
          | (if ($phase|length) > 0 then .task_runtime.current_phase = $phase else . end)
-         | (if ($pid|length) > 0 then .task_runtime.pid = ($pid|tonumber?) else . end)
+         | (if ($pid|length) > 0 then
+              .task_runtime.pid = ($pid|tonumber?)
+            elif ($runtime_status == "idle" or $runtime_status == "phase_done" or $runtime_status == "failed" or $runtime_status == "stale") then
+              .task_runtime.pid = null
+            else
+              .
+            end)
          | (if ($last_error|length) > 0 then .task_runtime.last_error = $last_error else . end)
          | (if ($heartbeat_ts|length) > 0 then .task_runtime.last_heartbeat = $heartbeat_ts else . end)
          | (if ($attempt|length) > 0 then .task_runtime.attempt = ($attempt|tonumber?) else . end)
@@ -1015,6 +1046,113 @@ set_task_runtime() {
      ' "$TASK_REGISTRY_FILE" >"$tmp"
 
   mv "$tmp" "$TASK_REGISTRY_FILE"
+}
+
+pid_is_running() {
+  local pid="${1:-}"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$pid" -gt 0 ]] || return 1
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+orphan_runtime_target_state() {
+  case "$STALE_HEARTBEAT_ACTION" in
+    requeue|retry) echo "todo" ;;
+    block|*) echo "blocked" ;;
+  esac
+}
+
+transition_orphan_task_state() {
+  local task_id="$1"
+  local current_state="$2"
+  local target_state="$3"
+  local reason="$4"
+
+  if [[ "$target_state" == "todo" ]]; then
+    if [[ "$current_state" == "blocked" ]]; then
+      apply_transition "$task_id" "todo" "" "" "$reason"
+      return 0
+    fi
+    # Workflow does not support direct transitions from active states to todo.
+    apply_transition "$task_id" "blocked" "" "" "$reason"
+    apply_transition "$task_id" "todo" "" "" "$reason"
+    return 0
+  fi
+
+  apply_transition "$task_id" "$target_state" "" "" "$reason"
+}
+
+reconcile_orphan_runtime_tasks() {
+  local task_id state runtime_status pid phase
+  while IFS=$'\t' read -r task_id state runtime_status pid phase; do
+    [[ -n "$task_id" ]] || continue
+
+    case "$runtime_status" in
+      phase_done)
+        # If a task is still claimed but dev phase already completed and the worker is gone,
+        # recover the workflow transition so advance can continue.
+        if [[ "$state" == "claimed" ]]; then
+          if [[ -z "$pid" || ! "$pid" =~ ^[0-9]+$ || "$pid" -le 0 ]] || ! pid_is_running "$pid"; then
+            transition_task_and_hooks "$task_id" "in_progress" "" "" "auto:recover_phase_done"
+            set_task_runtime "$task_id" "running" "dev" "" "" "$(now_iso)"
+            emit_event "performer_complete" "Recovered completed dev phase from orphan runtime" "$task_id" "in_progress" "pid=${pid:-none}"
+            note "Recovered task ${task_id}: claimed + phase_done -> in_progress (pid=${pid:-none})"
+          fi
+        fi
+        ;;
+      running|dispatched)
+        # Runtime marked active but worker PID absent/dead means workflow/runtime divergence.
+        # Resolve explicitly according to policy to avoid ghost-active tasks.
+        local target_state reason runtime_mark msg
+        target_state="$(orphan_runtime_target_state)"
+        if [[ "$state" == "queued" && "$phase" == "integrate" && ( -z "$pid" || ! "$pid" =~ ^[0-9]+$ || "$pid" -le 0 ) ]]; then
+          # queued/integrate may be waiting for async merge worker scheduling.
+          continue
+        fi
+        if [[ -z "$pid" || ! "$pid" =~ ^[0-9]+$ || "$pid" -le 0 ]]; then
+          reason="failure:orphaned_runtime_missing_pid"
+          runtime_mark="stale"
+          msg="runtime ${runtime_status} has no pid"
+          if [[ "$state" == "todo" || "$state" == "merged" || "$state" == "abandoned" ]]; then
+            set_task_runtime "$task_id" "$runtime_mark" "$phase" "" "$msg" "$(now_iso)"
+            emit_event "task_runtime_orphan" "Orphan runtime without PID handled (runtime-only)" "$task_id" "$state" "runtime_status=${runtime_status} policy=runtime_only" "$phase" "stale"
+            note "Orphan runtime handled for ${task_id}: runtime=${runtime_status} missing pid (state=${state}, runtime only)"
+            continue
+          fi
+          transition_orphan_task_state "$task_id" "$state" "$target_state" "$reason"
+          set_task_runtime "$task_id" "$runtime_mark" "$phase" "" "$msg" "$(now_iso)"
+          emit_event "task_runtime_orphan" "Orphan runtime without PID handled" "$task_id" "$target_state" "runtime_status=${runtime_status} policy=${target_state}" "$phase" "stale"
+          note "Orphan runtime handled for ${task_id}: runtime=${runtime_status} missing pid -> ${target_state}"
+          continue
+        fi
+        if ! pid_is_running "$pid"; then
+          reason="failure:orphaned_runtime_pid"
+          runtime_mark="failed"
+          msg="runtime pid ${pid} is not running"
+          if [[ "$state" == "todo" || "$state" == "merged" || "$state" == "abandoned" ]]; then
+            set_task_runtime "$task_id" "$runtime_mark" "$phase" "" "$msg" "$(now_iso)"
+            emit_event "task_runtime_orphan" "Orphan runtime with dead PID handled (runtime-only)" "$task_id" "$state" "pid=${pid} runtime_status=${runtime_status} policy=runtime_only" "$phase" "failed"
+            note "Orphan runtime handled for ${task_id}: runtime=${runtime_status} dead pid=${pid} (state=${state}, runtime only)"
+            continue
+          fi
+          transition_orphan_task_state "$task_id" "$state" "$target_state" "$reason"
+          set_task_runtime "$task_id" "$runtime_mark" "$phase" "" "$msg" "$(now_iso)"
+          emit_event "task_runtime_orphan" "Orphan runtime with dead PID handled" "$task_id" "$target_state" "pid=${pid} runtime_status=${runtime_status} policy=${target_state}" "$phase" "failed"
+          note "Orphan runtime handled for ${task_id}: runtime=${runtime_status} dead pid=${pid} -> ${target_state}"
+        fi
+        ;;
+    esac
+  done < <(jq -r '
+    (.tasks // [])[]
+    | [
+        .id,
+        (.state // ""),
+        (.task_runtime.status // ""),
+        ((.task_runtime.pid // "")|tostring),
+        (.task_runtime.current_phase // "")
+      ]
+    | @tsv
+  ' "$TASK_REGISTRY_FILE")
 }
 
 event_file_inode() {
@@ -1331,8 +1469,11 @@ cleanup_stale_tasks() {
   ' "$TASK_REGISTRY_FILE")
 
   if [[ "$STALE_HEARTBEAT_SECONDS" -gt 0 ]]; then
-    while IFS=$'\t' read -r task_id runtime_status last_heartbeat started_at; do
+    while IFS=$'\t' read -r task_id task_state runtime_status current_phase last_heartbeat started_at; do
       [[ -n "$task_id" ]] || continue
+      if [[ "$task_state" == "queued" && "$current_phase" == "integrate" ]]; then
+        continue
+      fi
       local ref_ts heartbeat_epoch age
       ref_ts="$last_heartbeat"
       [[ -n "$ref_ts" ]] || ref_ts="$started_at"
@@ -1358,11 +1499,18 @@ cleanup_stale_tasks() {
           emit_event "task_runtime_stale" "Runtime stale heartbeat; task blocked" "$task_id" "blocked" "age=${age}s"
           ;;
       esac
-      echo "Stale heartbeat handled: ${task_id} (runtime=${runtime_status}, age=${age}s)"
+      echo "Stale heartbeat handled: ${task_id} (state=${task_state}, runtime=${runtime_status}, phase=${current_phase}, age=${age}s)"
     done < <(jq -r '
       (.tasks // [])[]
       | select((.task_runtime.status // "") == "running" or (.task_runtime.status // "") == "dispatched")
-      | [.id, (.task_runtime.status // ""), (.task_runtime.last_heartbeat // ""), (.task_runtime.started_at // "")] | @tsv
+      | [
+          .id,
+          (.state // ""),
+          (.task_runtime.status // ""),
+          (.task_runtime.current_phase // ""),
+          (.task_runtime.last_heartbeat // ""),
+          (.task_runtime.started_at // "")
+        ] | @tsv
     ' "$TASK_REGISTRY_FILE")
   fi
 }
@@ -1811,7 +1959,7 @@ transition_task_and_hooks() {
       set_task_runtime "$task_id" "running" "fix" "" "" "$(now_iso)"
       ;;
     queued)
-      set_task_runtime "$task_id" "running" "integrate" "" "" "$(now_iso)"
+      set_task_runtime "$task_id" "phase_done" "integrate" "" "" "$(now_iso)"
       ;;
     merged)
       set_task_runtime "$task_id" "idle" "" "" "" "$(now_iso)"
@@ -1911,37 +2059,47 @@ local_merge_branch_into_base() {
   local task_id="$1"
   local branch="$2"
   local base_branch="$3"
+  LOCAL_MERGE_LAST_ERROR=""
+  local safe_task ts result_file rc status error suggestion report_file
+  safe_task="$(printf '%s' "$task_id" | tr '[:space:]' '-' | tr -cd '[:alnum:]_.-')"
+  [[ -n "$safe_task" ]] || safe_task="task"
+  ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+  result_file="${COORD_LOG_DIR}/merge-result-${safe_task}-${ts}.json"
 
-  if ! git -C "$REPO_DIR" rev-parse --verify "$branch" >/dev/null 2>&1; then
-    echo "Error: merge branch not found for task ${task_id}: ${branch}" >&2
-    return 1
-  fi
-  if ! git -C "$REPO_DIR" rev-parse --verify "$base_branch" >/dev/null 2>&1; then
-    echo "Error: base branch not found for task ${task_id}: ${base_branch}" >&2
-    return 1
-  fi
-  if git -C "$REPO_DIR" status --porcelain | awk 'NF' | grep -q .; then
-    echo "Error: repository has uncommitted changes; cannot merge task ${task_id}" >&2
-    return 1
-  fi
-
-  local merge_msg
-  merge_msg="macc: merge task ${task_id}"
-  if ! git -C "$REPO_DIR" checkout "$base_branch" >/dev/null 2>&1; then
-    return 1
-  fi
   set +e
-  git -C "$REPO_DIR" merge --no-ff -m "$merge_msg" "$branch" >/dev/null 2>&1
-  local rc=$?
+  "$COORDINATOR_MERGE_WORKER" \
+    --repo "$REPO_DIR" \
+    --task-id "$task_id" \
+    --branch "$branch" \
+    --base-branch "$base_branch" \
+    --log-dir "$COORD_LOG_DIR" \
+    --result-file "$result_file" \
+    --allow-ai-fix "$COORDINATOR_MERGE_AI_FIX" \
+    --merge-fix-hook "$COORDINATOR_MERGE_FIX_HOOK" >/dev/null 2>&1
+  rc=$?
   set -e
-  if [[ "$rc" -ne 0 ]]; then
-    git -C "$REPO_DIR" merge --abort >/dev/null 2>&1 || true
-    return 1
+
+  status="$(jq -r '.status // ""' "$result_file" 2>/dev/null || true)"
+  error="$(jq -r '.error // ""' "$result_file" 2>/dev/null || true)"
+  suggestion="$(jq -r '.suggestion // ""' "$result_file" 2>/dev/null || true)"
+  report_file="$(jq -r '.report_file // ""' "$result_file" 2>/dev/null || true)"
+
+  if [[ "$rc" -eq 0 && "$status" == "success" ]]; then
+    return 0
   fi
-  return 0
+
+  LOCAL_MERGE_LAST_ERROR="${error:-failure:local_merge}"
+  if [[ -n "$suggestion" ]]; then
+    LOCAL_MERGE_LAST_ERROR="${LOCAL_MERGE_LAST_ERROR} suggestion=\"${suggestion}\""
+  fi
+  if [[ -n "$report_file" ]]; then
+    LOCAL_MERGE_LAST_ERROR="${LOCAL_MERGE_LAST_ERROR} report=\"${report_file}\""
+  fi
+  return 1
 }
 
 advance_active_tasks() {
+  reconcile_orphan_runtime_tasks
   local progressed="false"
   for _ in $(seq 1 16); do
     local pass_progressed="false"
@@ -2104,16 +2262,35 @@ advance_active_tasks() {
             merge_hook_status=$?
             if [[ "$merge_hook_status" -eq 2 ]]; then
               if is_truthy "$COORDINATOR_AUTOMERGE"; then
-                if local_merge_branch_into_base "$task_id" "$branch" "$base_branch"; then
-                  transition_task_and_hooks "$task_id" "merged" "$pr_url" "" "auto:local_merge"
-                  note "Advance: ${task_id} queued -> merged (local merge)"
-                  pass_progressed="true"
-                  progressed="true"
+                if [[ "$COORD_COMMAND_NAME" == "run" ]]; then
+                  if merge_job_is_running_for_task "$task_id"; then
+                    :
+                  elif [[ "$(run_loop_merge_job_count)" -gt 0 ]]; then
+                    :
+                  else
+                    start_local_merge_worker_async "$task_id" "$branch" "$base_branch" "$pr_url"
+                    pass_progressed="true"
+                    progressed="true"
+                  fi
                 else
-                  transition_task_and_hooks "$task_id" "blocked" "$pr_url" "" "failure:local_merge"
-                  note "Blocked task due to local merge failure: ${task_id}"
-                  pass_progressed="true"
-                  progressed="true"
+                  if local_merge_branch_into_base "$task_id" "$branch" "$base_branch"; then
+                    transition_task_and_hooks "$task_id" "merged" "$pr_url" "" "auto:local_merge"
+                    note "Advance: ${task_id} queued -> merged (local merge)"
+                    pass_progressed="true"
+                    progressed="true"
+                  else
+                    local merge_error
+                    merge_error="${LOCAL_MERGE_LAST_ERROR:-failure:local_merge}"
+                    transition_task_and_hooks "$task_id" "blocked" "$pr_url" "" "failure:local_merge"
+                    set_task_runtime "$task_id" "failed" "integrate" "" "$merge_error" "$(now_iso)"
+                    emit_event "local_merge_failed" "Local merge failed" "$task_id" "blocked" "$merge_error" "integrate" "failed"
+                    note "Blocked task due to local merge failure: ${task_id}"
+                    if [[ -n "${LOCAL_MERGE_LAST_ERROR:-}" ]]; then
+                      note "Local merge detail (${task_id}): ${LOCAL_MERGE_LAST_ERROR}"
+                    fi
+                    pass_progressed="true"
+                    progressed="true"
+                  fi
                 fi
               fi
             else
@@ -2156,6 +2333,89 @@ handle_performer_completion() {
     transition_task_and_hooks "$task_id" "in_progress" "" "" "auto:performer_complete"
     note "Performer complete: ${task_id} (${tool})"
     emit_event "performer_complete" "Performer completed task phase" "$task_id" "in_progress"
+  fi
+}
+
+merge_job_is_running_for_task() {
+  local task_id="$1"
+  local entry pid queued_task
+  for entry in "${RUN_LOOP_MERGE_JOBS[@]}"; do
+    IFS='|' read -r pid queued_task _ _ _ _ <<<"$entry"
+    if [[ "$queued_task" == "$task_id" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+start_local_merge_worker_async() {
+  local task_id="$1"
+  local branch="$2"
+  local base_branch="$3"
+  local pr_url="$4"
+  local safe_task ts result_file pid
+
+  safe_task="$(printf '%s' "$task_id" | tr '[:space:]' '-' | tr -cd '[:alnum:]_.-')"
+  [[ -n "$safe_task" ]] || safe_task="task"
+  ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+  result_file="${COORD_LOG_DIR}/merge-result-${safe_task}-${ts}.json"
+
+  lock_release
+  "$COORDINATOR_MERGE_WORKER" \
+    --repo "$REPO_DIR" \
+    --task-id "$task_id" \
+    --branch "$branch" \
+    --base-branch "$base_branch" \
+    --log-dir "$COORD_LOG_DIR" \
+    --result-file "$result_file" \
+    --allow-ai-fix "$COORDINATOR_MERGE_AI_FIX" \
+    --merge-fix-hook "$COORDINATOR_MERGE_FIX_HOOK" >/dev/null 2>&1 &
+  pid=$!
+  lock_acquire
+  ensure_registry_valid
+
+  RUN_LOOP_MERGE_JOBS+=("${pid}|${task_id}|${branch}|${base_branch}|${pr_url}|${result_file}")
+  set_task_runtime "$task_id" "running" "integrate" "$pid" "" "$(now_iso)"
+  emit_event "merge_worker_started" "Started local merge worker" "$task_id" "queued" "pid=${pid} branch=${branch} base=${base_branch}" "integrate" "started"
+  note "Merge worker started: ${task_id} (pid=${pid}, branch=${branch}, base=${base_branch})"
+}
+
+handle_merge_worker_completion() {
+  local task_id="$1"
+  local branch="$2"
+  local base_branch="$3"
+  local pr_url="$4"
+  local result_file="$5"
+  local rc="$6"
+  local status error suggestion report_file
+
+  status="$(jq -r '.status // ""' "$result_file" 2>/dev/null || true)"
+  error="$(jq -r '.error // ""' "$result_file" 2>/dev/null || true)"
+  suggestion="$(jq -r '.suggestion // ""' "$result_file" 2>/dev/null || true)"
+  report_file="$(jq -r '.report_file // ""' "$result_file" 2>/dev/null || true)"
+
+  if [[ "$rc" -eq 0 && "$status" == "success" ]]; then
+    transition_task_and_hooks "$task_id" "merged" "$pr_url" "" "auto:local_merge_worker"
+    set_task_runtime "$task_id" "idle" "" "" "" "$(now_iso)"
+    emit_event "merge_worker_complete" "Local merge worker completed successfully" "$task_id" "merged" "branch=${branch} base=${base_branch}" "integrate" "done"
+    note "Advance: ${task_id} queued -> merged (local merge worker)"
+    return 0
+  fi
+
+  local merge_error
+  merge_error="${error:-failure:local_merge branch=${branch} base=${base_branch}}"
+  if [[ -n "$suggestion" ]]; then
+    merge_error="${merge_error} suggestion=\"${suggestion}\""
+  fi
+  if [[ -n "$report_file" ]]; then
+    merge_error="${merge_error} report=\"${report_file}\""
+  fi
+  transition_task_and_hooks "$task_id" "blocked" "$pr_url" "" "failure:local_merge"
+  set_task_runtime "$task_id" "failed" "integrate" "" "$merge_error" "$(now_iso)"
+  emit_event "local_merge_failed" "Local merge worker failed" "$task_id" "blocked" "$merge_error" "integrate" "failed"
+  note "Blocked task due to local merge failure: ${task_id}"
+  if [[ -n "$report_file" ]]; then
+    note "Local merge report (${task_id}): ${report_file}"
   fi
 }
 
@@ -2297,6 +2557,18 @@ run_loop_active_job_count() {
   echo "$count"
 }
 
+run_loop_merge_job_count() {
+  local count=0
+  local entry pid
+  for entry in "${RUN_LOOP_MERGE_JOBS[@]}"; do
+    IFS='|' read -r pid _ _ _ _ _ <<<"$entry"
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      count=$((count + 1))
+    fi
+  done
+  echo "$count"
+}
+
 monitor_run_loop_jobs_once() {
   local -a remaining=()
   local entry pid task_id wt tool rc
@@ -2313,6 +2585,22 @@ monitor_run_loop_jobs_once() {
   RUN_LOOP_ACTIVE_JOBS=("${remaining[@]}")
 }
 
+monitor_run_loop_merge_jobs_once() {
+  local -a remaining=()
+  local entry pid task_id branch base_branch pr_url result_file rc
+  for entry in "${RUN_LOOP_MERGE_JOBS[@]}"; do
+    IFS='|' read -r pid task_id branch base_branch pr_url result_file <<<"$entry"
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      remaining+=("$entry")
+      continue
+    fi
+    rc=0
+    wait "$pid" || rc=$?
+    handle_merge_worker_completion "$task_id" "$branch" "$base_branch" "$pr_url" "$result_file" "$rc"
+  done
+  RUN_LOOP_MERGE_JOBS=("${remaining[@]}")
+}
+
 stop_run_loop_jobs() {
   local entry pid task_id wt tool
   for entry in "${RUN_LOOP_ACTIVE_JOBS[@]}"; do
@@ -2320,6 +2608,11 @@ stop_run_loop_jobs() {
     kill "$pid" >/dev/null 2>&1 || true
   done
   RUN_LOOP_ACTIVE_JOBS=()
+  for entry in "${RUN_LOOP_MERGE_JOBS[@]}"; do
+    IFS='|' read -r pid _ _ _ _ _ <<<"$entry"
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+  RUN_LOOP_MERGE_JOBS=()
 }
 
 dispatch_ready_tasks_nonblocking() {
@@ -2438,12 +2731,15 @@ run_control_plane() {
     consume_runtime_events_once
     cleanup_stale_tasks
     monitor_run_loop_jobs_once
+    monitor_run_loop_merge_jobs_once
+    reconcile_orphan_runtime_tasks
     dispatch_ready_tasks_nonblocking
     advance_active_tasks
     reconcile_registry
     cleanup_stale_tasks
     consume_runtime_events_once
     monitor_run_loop_jobs_once
+    monitor_run_loop_merge_jobs_once
 
     local counts total todo active blocked merged
     counts="$(registry_counts_tsv)"
@@ -2704,8 +3000,6 @@ main() {
       ;;
   esac
 
-  TASK_REGISTRY_FILE="${REPO_DIR%/}/${TASK_REGISTRY_REL_PATH}"
-
   need_cmd git
   need_cmd jq
   ENABLED_TOOLS_JSON="$(csv_to_json_array "$ENABLED_TOOLS_CSV")"
@@ -2768,10 +3062,27 @@ main() {
     need_cmd macc
   fi
 
+  ensure_repo_valid
+  normalize_paths
+  if is_truthy "$COORDINATOR_AUTOMERGE"; then
+    [[ -x "$COORDINATOR_MERGE_WORKER" ]] || {
+      echo "Error: COORDINATOR_MERGE_WORKER is not executable: $COORDINATOR_MERGE_WORKER" >&2
+      exit 1
+    }
+    if is_truthy "$COORDINATOR_MERGE_AI_FIX"; then
+      [[ -n "$COORDINATOR_MERGE_FIX_HOOK" ]] || {
+        echo "Error: COORDINATOR_MERGE_AI_FIX requires COORDINATOR_MERGE_FIX_HOOK." >&2
+        exit 1
+      }
+      [[ -x "$COORDINATOR_MERGE_FIX_HOOK" ]] || {
+        echo "Error: COORDINATOR_MERGE_FIX_HOOK is not executable: $COORDINATOR_MERGE_FIX_HOOK" >&2
+        exit 1
+      }
+    fi
+  fi
   if [[ "$requires_prd" == "true" ]]; then
     ensure_prd_valid
   fi
-  ensure_repo_valid
   setup_logging "$command"
 
   if [[ "$command" == "run" ]]; then
@@ -2798,6 +3109,7 @@ main() {
   cleanup_stale_tasks
   spinner_stop "Cleanup complete"
   consume_runtime_events_once
+  reconcile_orphan_runtime_tasks
 
   if [[ "$command" == "cleanup" ]]; then
     note "Cleanup complete."

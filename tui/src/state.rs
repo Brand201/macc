@@ -539,9 +539,16 @@ impl AppState {
                 .and_then(|v| v.as_str())
                 .unwrap_or("-")
                 .to_string();
+            let is_live_active = matches!(
+                state.as_str(),
+                "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued"
+            ) && !(state == "claimed" && runtime_status == "phase_done");
+
             match state.as_str() {
                 "todo" => snapshot.todo += 1,
-                "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued" => {
+                "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued"
+                    if is_live_active =>
+                {
                     snapshot.active += 1;
                     snapshot.active_tasks.push(CoordinatorActiveTask {
                         id,
@@ -554,6 +561,10 @@ impl AppState {
                         last_error,
                         last_heartbeat,
                     });
+                }
+                "claimed" => {
+                    // Claimed + phase_done can happen after coordinator restart before reconciliation.
+                    // Keep it out of live-active rendering to avoid a misleading "still running" signal.
                 }
                 "blocked" => snapshot.blocked += 1,
                 "merged" => snapshot.merged += 1,

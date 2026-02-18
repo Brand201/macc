@@ -26,6 +26,7 @@ EVENT_SOURCE="${MACC_EVENT_SOURCE:-}"
 EVENT_TASK_ID="${MACC_EVENT_TASK_ID:-}"
 EVENT_RUN_ID="$(date +%s%N)-$$"
 EVENT_SEQ=0
+EVENT_SEQ_FILE=""
 HEARTBEAT_PID=""
 CURRENT_PHASE="dev"
 
@@ -83,12 +84,20 @@ fi
 if [[ -z "$EVENT_TASK_ID" ]]; then
   EVENT_TASK_ID="$task_id"
 fi
+if [[ -n "$EVENT_FILE" ]]; then
+  EVENT_SEQ_FILE="${worktree}/.macc/tmp/event-seq-${EVENT_RUN_ID}.txt"
+  mkdir -p "$(dirname "$EVENT_SEQ_FILE")"
+  printf '0\n' >"$EVENT_SEQ_FILE"
+fi
 
 on_exit() {
   local rc=$?
   heartbeat_stop
   if [[ "$rc" -ne 0 ]]; then
     emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(jq -nc --arg code "$rc" '{exit_code:($code|tonumber?)}')"
+  fi
+  if [[ -n "${EVENT_SEQ_FILE:-}" ]]; then
+    rm -f "$EVENT_SEQ_FILE" "${EVENT_SEQ_FILE}.lock" >/dev/null 2>&1 || true
   fi
 }
 trap on_exit EXIT
@@ -129,6 +138,28 @@ log_task_line() {
   fi
 }
 
+next_event_seq() {
+  if [[ -z "${EVENT_SEQ_FILE:-}" ]]; then
+    EVENT_SEQ=$((EVENT_SEQ + 1))
+    echo "$EVENT_SEQ"
+    return 0
+  fi
+
+  local lock_file="${EVENT_SEQ_FILE}.lock"
+  local current=0
+  while ! mkdir "$lock_file" 2>/dev/null; do
+    sleep 0.01
+  done
+  if [[ -f "$EVENT_SEQ_FILE" ]]; then
+    current="$(cat "$EVENT_SEQ_FILE" 2>/dev/null || echo 0)"
+  fi
+  [[ "$current" =~ ^[0-9]+$ ]] || current=0
+  current=$((current + 1))
+  printf '%s\n' "$current" >"$EVENT_SEQ_FILE"
+  rmdir "$lock_file" >/dev/null 2>&1 || true
+  echo "$current"
+}
+
 emit_performer_event() {
   local event_type="$1"
   local phase="${2:-}"
@@ -137,14 +168,15 @@ emit_performer_event() {
   [[ -n "$EVENT_FILE" ]] || return 0
   [[ -n "$EVENT_SOURCE" ]] || EVENT_SOURCE="performer:${tool}:${EVENT_RUN_ID}"
   [[ -n "$EVENT_TASK_ID" ]] || EVENT_TASK_ID="$task_id"
-  EVENT_SEQ=$((EVENT_SEQ + 1))
+  local seq
+  seq="$(next_event_seq)"
   if ! jq -e 'type == "object"' <<<"$payload_json" >/dev/null 2>&1; then
     payload_json="$(jq -nc --arg value "$payload_json" '{value:$value}')"
   fi
   jq -nc \
     --arg schema_version "1" \
-    --arg event_id "${EVENT_TASK_ID}-${EVENT_SEQ}-$(date +%s%N)" \
-    --argjson seq "$EVENT_SEQ" \
+    --arg event_id "${EVENT_TASK_ID}-${seq}-$(date +%s%N)" \
+    --argjson seq "$seq" \
     --arg ts "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
     --arg source "$EVENT_SOURCE" \
     --arg task_id "$EVENT_TASK_ID" \
