@@ -67,6 +67,10 @@ impl Screen {
                 ("c", "Reconcile"),
                 ("k", "Stop Coordinator"),
                 ("l", "Refresh Live Status"),
+                ("r/Enter (on error)", "Retry failed phase + resume"),
+                ("s (on error)", "Skip failed phase + resume"),
+                ("o (on error)", "Open logs"),
+                ("k/Esc (on error)", "Stop after pause"),
             ],
             Screen::ToolSettings => vec![
                 ("Up/Down", "Navigate Fields"),

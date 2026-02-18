@@ -92,6 +92,18 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: &mut AppState) -> io::
 }
 
 fn handle_key(state: &mut AppState, key: KeyCode) {
+    if state.has_coordinator_pause_prompt() {
+        match key {
+            KeyCode::Char('r') | KeyCode::Enter => state.retry_after_coordinator_pause(),
+            KeyCode::Char('s') => state.skip_after_coordinator_pause(),
+            KeyCode::Char('o') => state.open_logs_after_coordinator_pause(),
+            KeyCode::Char('k') | KeyCode::Esc => state.stop_after_coordinator_pause(),
+            KeyCode::Char('c') => state.resume_after_coordinator_pause(),
+            _ => {}
+        }
+        return;
+    }
+
     if state.help_open {
         match key {
             KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
@@ -1184,9 +1196,19 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
                         let spinner = frames
                             [((state.coordinator_spinner_tick as usize) + idx) % frames.len()];
                         active_view.push_str(&format!(
-                            "{} {} [{}] tool={} updated={}\n",
-                            spinner, task.id, task.state, task.tool, task.updated_at
+                            "{} {} [{}|{}|{}] tool={} hb={} updated={}\n",
+                            spinner,
+                            task.id,
+                            task.state,
+                            task.runtime_status,
+                            task.current_phase,
+                            task.tool,
+                            task.last_heartbeat,
+                            task.updated_at
                         ));
+                        if !task.last_error.is_empty() {
+                            active_view.push_str(&format!("    error: {}\n", task.last_error));
+                        }
                     }
                 }
             } else {
@@ -1458,6 +1480,9 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
     .block(panel("Navigation"));
     f.render_widget(footer, chunks[2]);
 
+    if state.has_coordinator_pause_prompt() {
+        render_coordinator_pause_overlay(f, state);
+    }
     if state.help_open {
         render_help_overlay(f, state);
     }
@@ -1524,4 +1549,35 @@ fn render_help_overlay(f: &mut Frame, state: &AppState) {
         .wrap(Wrap { trim: true });
 
     f.render_widget(help_para, area);
+}
+
+fn render_coordinator_pause_overlay(f: &mut Frame, state: &AppState) {
+    let area = ui::centered_rect(75, 45, f.size());
+    f.render_widget(Clear, area);
+    let message = state
+        .coordinator_pause_error
+        .as_deref()
+        .unwrap_or("Coordinator paused due to an error.");
+    let action = state.coordinator_pause_action.as_deref().unwrap_or("run");
+    let retry_target = match (
+        state.coordinator_pause_task_id.as_deref(),
+        state.coordinator_pause_phase.as_deref(),
+    ) {
+        (Some(task), Some(phase)) => format!("task={} phase={}", task, phase),
+        (Some(task), None) => format!("task={} phase=dev", task),
+        _ => "task=unknown phase=dev".to_string(),
+    };
+    let text = format!(
+        "Coordinator Paused (blocking error)\n\n{}\n\nTarget:\n- {}\n\nFix the issue in your repo/worktree, then choose:\n\n- Press 'r' or Enter: retry failed phase, then resume run\n- Press 's': skip failed phase (move task to todo), then resume run\n- Press 'o': open Logs screen\n- Press 'k' or Esc: stop and keep paused state\n- Press 'c': resume run without retry\n\nAction: {}\n",
+        message, retry_target, action
+    );
+    let popup = Paragraph::new(text)
+        .block(
+            Block::default()
+                .title("Coordinator Error")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(popup, area);
 }

@@ -23,6 +23,8 @@ STALE_CLAIMED_SECONDS="${STALE_CLAIMED_SECONDS:-0}"
 STALE_IN_PROGRESS_SECONDS="${STALE_IN_PROGRESS_SECONDS:-0}"
 STALE_CHANGES_REQUESTED_SECONDS="${STALE_CHANGES_REQUESTED_SECONDS:-0}"
 STALE_ACTION="${STALE_ACTION:-abandon}" # abandon | todo | blocked
+STALE_HEARTBEAT_SECONDS="${STALE_HEARTBEAT_SECONDS:-0}" # 0 disables runtime heartbeat stale checks
+STALE_HEARTBEAT_ACTION="${STALE_HEARTBEAT_ACTION:-block}" # retry | block | requeue
 COORDINATOR_TOOL="${COORDINATOR_TOOL:-}"
 ENABLED_TOOLS_CSV="${ENABLED_TOOLS_CSV:-}"
 TOOL_PRIORITY_CSV="${TOOL_PRIORITY_CSV:-}"
@@ -31,6 +33,9 @@ TOOL_SPECIALIZATIONS_JSON="${TOOL_SPECIALIZATIONS_JSON:-{}}"
 WORKTREE_POOL_MODE="${WORKTREE_POOL_MODE:-true}" # true|false: reuse idle compatible worktrees
 COORDINATOR_VCS_HOOK="${COORDINATOR_VCS_HOOK:-}" # optional executable implementing PR/CI/queue/merge actions
 COORDINATOR_AUTOMERGE="${COORDINATOR_AUTOMERGE:-true}" # true|false: allow default local merge fallback
+EVENT_LOG_MAX_BYTES="${EVENT_LOG_MAX_BYTES:-5242880}" # rotate events.jsonl when above this size
+EVENT_LOG_KEEP_FILES="${EVENT_LOG_KEEP_FILES:-5}" # number of rotated event files to keep
+PROCESSED_EVENT_IDS_MAX="${PROCESSED_EVENT_IDS_MAX:-10000}" # max dedup IDs retained in registry
 
 ENABLED_TOOLS_JSON="[]"
 TOOL_PRIORITY_JSON="[]"
@@ -38,6 +43,10 @@ COORD_LOG_DIR=""
 COORD_LOG_FILE=""
 COORD_EVENTS_FILE=""
 COORD_COMMAND_NAME=""
+COORD_CURSOR_FILE=""
+COORD_EVENT_SOURCE=""
+EVENT_SEQ_COUNTER=0
+RUN_LOOP_ACTIVE_JOBS=()
 
 note() {
   local msg="$*"
@@ -55,17 +64,43 @@ emit_event() {
   local task_id="${3:-}"
   local state="${4:-}"
   local detail="${5:-}"
+  local phase="${6:-}"
+  local status="${7:-}"
+  local source="${8:-${COORD_EVENT_SOURCE:-coordinator}}"
+  local payload_json="${9:-{}}"
   [[ -n "${COORD_EVENTS_FILE:-}" ]] || return 0
+  EVENT_SEQ_COUNTER=$((EVENT_SEQ_COUNTER + 1))
+  if [[ -z "$status" ]]; then
+    status="${state:-${event}}"
+  fi
+  if ! jq -e 'type == "object"' <<<"$payload_json" >/dev/null 2>&1; then
+    payload_json="$(jq -nc --arg detail "$payload_json" '{detail:$detail}')"
+  fi
   jq -nc \
+    --arg schema_version "1" \
+    --arg event_id "${task_id:-global}-${EVENT_SEQ_COUNTER}-$(date +%s%N)" \
+    --argjson seq "$EVENT_SEQ_COUNTER" \
     --arg ts "$(now_iso)" \
     --arg event "$event" \
     --arg command "${COORD_COMMAND_NAME:-}" \
     --arg msg "$msg" \
     --arg task_id "$task_id" \
+    --arg source "$source" \
+    --arg phase "$phase" \
+    --arg status "$status" \
     --arg state "$state" \
     --arg detail "$detail" \
+    --argjson payload "$payload_json" \
     '{
+      schema_version:$schema_version,
+      event_id:$event_id,
+      seq:$seq,
       ts:$ts,
+      source:$source,
+      type:$event,
+      phase:($phase|select(length>0)),
+      status:$status,
+      payload:$payload,
       event:$event,
       command:$command,
       msg:$msg,
@@ -147,10 +182,13 @@ setup_logging() {
   local command_name="${1:-dispatch}"
   COORD_COMMAND_NAME="$command_name"
   mkdir -p "${REPO_DIR}/.macc/log/coordinator"
+  mkdir -p "${REPO_DIR}/.macc/state"
   COORD_LOG_DIR="${REPO_DIR}/.macc/log/coordinator"
   COORD_EVENTS_FILE="${COORD_LOG_DIR}/events.jsonl"
+  COORD_CURSOR_FILE="${REPO_DIR}/.macc/state/coordinator.cursor"
   local ts
   ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+  COORD_EVENT_SOURCE="coordinator:${command_name}:$$:$(date +%s%N)"
   COORD_LOG_FILE="${COORD_LOG_DIR}/${command_name}-${ts}.md"
 
   exec {COORD_TERM_FD}>&1
@@ -172,8 +210,10 @@ Usage:
   AGENT_ID=agentA ./coordinator.sh [command] [options]
 
 Commands:
+  run         Realtime coordinator control-plane (scheduler + monitor + event consumer)
   dispatch    Sync, cleanup, and dispatch READY tasks (default)
   advance     Progress active tasks through PR/CI/review/queue/merge states
+  retry-phase Retry one failed phase for a task (targeted remediation)
   sync        Sync registry from PRD without dispatching
   status      Show registry summary + lock status
   reconcile   Reconcile registry with worktree state on disk
@@ -195,6 +235,8 @@ Env vars:
   STALE_IN_PROGRESS_SECONDS     Auto-abandon in_progress tasks older than this (0 disables)
   STALE_CHANGES_REQUESTED_SECONDS Auto-abandon changes_requested tasks older than this (0 disables)
   STALE_ACTION                  Action for stale tasks: abandon|todo|blocked (default: abandon)
+  STALE_HEARTBEAT_SECONDS       Runtime heartbeat stale threshold in seconds (0 disables)
+  STALE_HEARTBEAT_ACTION        Action on stale runtime heartbeat: retry|block|requeue (default: block)
   COORDINATOR_TOOL              Optional fixed tool for coordinator phase hooks (review/fix/integrate)
   ENABLED_TOOLS_CSV             Optional allowed tool IDs (comma-separated; usually from macc.yaml tools.enabled)
   TOOL_PRIORITY_CSV             Optional priority order for tool selection (comma-separated)
@@ -203,6 +245,9 @@ Env vars:
   WORKTREE_POOL_MODE            Reuse idle compatible worktrees when true (default: true)
   COORDINATOR_VCS_HOOK          Optional hook executable for PR/CI/merge integration
   COORDINATOR_AUTOMERGE         Allow local merge fallback when no hook is configured (default: true)
+  EVENT_LOG_MAX_BYTES           Rotate .macc/log/coordinator/events.jsonl above this size (default: 5242880)
+  EVENT_LOG_KEEP_FILES          Keep this many rotated event log files (default: 5)
+  PROCESSED_EVENT_IDS_MAX       Max dedup IDs retained in registry before compaction (default: 10000)
 
 Unlock:
   ./coordinator.sh unlock --task <task_id> [--unlock-state blocked|todo]
@@ -216,6 +261,8 @@ Failure handling:
   kinds: worktree_create | pr_create | ci_red | merge_queue_fail | rebase_required
 Signal ingestion:
   ./coordinator.sh --signal <task_id> --signal-json <path>
+Retry failed phase:
+  ./coordinator.sh retry-phase --retry-task <task_id> --retry-phase <dev|review|fix|integrate> [--skip]
 
 Task readiness rules:
   - state == "todo"
@@ -397,6 +444,7 @@ ensure_registry_file() {
         "merged": "merged"
       },
       tasks: [],
+      processed_event_ids: {},
       resource_locks: {},
       updated_at: $now
     }
@@ -410,6 +458,7 @@ ensure_registry_valid() {
   }
   jq -e '
     (.tasks | type == "array")
+    and ((.processed_event_ids // {}) | type == "object")
     and (.resource_locks | type == "object")
     and (.state_mapping | type == "object")
   ' "$TASK_REGISTRY_FILE" >/dev/null 2>&1 || {
@@ -566,7 +615,19 @@ sync_registry_from_prd() {
                scope: ($t.scope // $t.git.scope // $old.scope // null),
                base_branch: ($t.git.base_branch // $default_base_branch // $old.base_branch),
                worktree: ($old.worktree // null),
-               review: ($old.review // {"reviewer": null, "changed": false, "last_reviewed_at": null})
+               review: ($old.review // {"reviewer": null, "changed": false, "last_reviewed_at": null}),
+               task_runtime: ($old.task_runtime // {
+                 status: "idle",
+                 pid: null,
+                 started_at: null,
+                 last_heartbeat: null,
+                 current_phase: null,
+                 attempt: 0,
+                 last_error: null,
+                 last_seq: 0,
+                 last_event_id: null,
+                 last_seq_source: null
+               })
              }
          )
        )
@@ -575,6 +636,11 @@ sync_registry_from_prd() {
            .assignee = null
            | .claimed_at = null
            | .worktree = null
+           | .task_runtime = (.task_runtime // {})
+           | .task_runtime.status = "idle"
+           | .task_runtime.pid = null
+           | .task_runtime.started_at = null
+           | .task_runtime.current_phase = null
          else
            .
          end
@@ -596,6 +662,7 @@ sync_registry_from_prd() {
               )
            )
        )
+     | .processed_event_ids = (.processed_event_ids // {})
      | .updated_at = $now
      ' "$TASK_REGISTRY_FILE" >"$tmp"
 
@@ -798,19 +865,14 @@ find_idle_compatible_worktree() {
 validate_transition() {
   local from="$1"
   local to="$2"
-
-  case "$from:$to" in
-    todo:claimed) return 0 ;;
-    claimed:in_progress|claimed:blocked|claimed:abandoned) return 0 ;;
-    in_progress:pr_open|in_progress:blocked|in_progress:abandoned) return 0 ;;
-    pr_open:changes_requested|pr_open:queued|pr_open:blocked|pr_open:abandoned) return 0 ;;
-    changes_requested:pr_open|changes_requested:blocked|changes_requested:abandoned) return 0 ;;
-    queued:merged|queued:pr_open|queued:blocked|queued:abandoned) return 0 ;;
-    blocked:todo|blocked:claimed|blocked:in_progress|blocked:pr_open|blocked:changes_requested|blocked:queued|blocked:abandoned) return 0 ;;
-    abandoned:todo) return 0 ;;
-  esac
-
-  echo "Error: invalid transition ${from} -> ${to}" >&2
+  if ! command -v macc >/dev/null 2>&1; then
+    echo "Error: macc is required to validate coordinator transitions from core." >&2
+    return 1
+  fi
+  if macc --cwd "$REPO_DIR" coordinator validate-transition --from "$from" --to "$to" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Error: invalid transition ${from} -> ${to} (core transition table)" >&2
   return 1
 }
 
@@ -865,10 +927,20 @@ apply_transition() {
               .assignee = null
               | .claimed_at = null
               | .worktree = null
+              | .task_runtime = (.task_runtime // {})
+              | .task_runtime.status = "idle"
+              | .task_runtime.pid = null
+              | .task_runtime.started_at = null
+              | .task_runtime.current_phase = null
             elif ($state == "todo") then
               .assignee = null
               | .claimed_at = null
               | .worktree = null
+              | .task_runtime = (.task_runtime // {})
+              | .task_runtime.status = "idle"
+              | .task_runtime.pid = null
+              | .task_runtime.started_at = null
+              | .task_runtime.current_phase = null
             else
               .
             end)
@@ -898,6 +970,329 @@ apply_transition() {
 
   mv "$tmp" "$TASK_REGISTRY_FILE"
   emit_event "task_transition" "Task state changed" "$task_id" "$new_state" "from=${old_state} reason=${reason}"
+}
+
+set_task_runtime() {
+  local task_id="$1"
+  local runtime_status="$2"
+  local phase="${3:-}"
+  local pid="${4:-}"
+  local last_error="${5:-}"
+  local heartbeat_ts="${6:-}"
+  local attempt="${7:-}"
+  local now tmp
+  now="$(now_iso)"
+  tmp="$(mktemp)"
+
+  jq --arg id "$task_id" \
+     --arg runtime_status "$runtime_status" \
+     --arg phase "$phase" \
+     --arg pid "$pid" \
+     --arg last_error "$last_error" \
+     --arg heartbeat_ts "$heartbeat_ts" \
+     --arg attempt "$attempt" \
+     --arg now "$now" \
+     '
+     .tasks |= map(
+       if .id == $id then
+         .task_runtime = (.task_runtime // {})
+         | .task_runtime.status = $runtime_status
+         | (if ($phase|length) > 0 then .task_runtime.current_phase = $phase else . end)
+         | (if ($pid|length) > 0 then .task_runtime.pid = ($pid|tonumber?) else . end)
+         | (if ($last_error|length) > 0 then .task_runtime.last_error = $last_error else . end)
+         | (if ($heartbeat_ts|length) > 0 then .task_runtime.last_heartbeat = $heartbeat_ts else . end)
+         | (if ($attempt|length) > 0 then .task_runtime.attempt = ($attempt|tonumber?) else . end)
+         | (if ($runtime_status == "running" and ((.task_runtime.started_at // "") | length) == 0) then
+              .task_runtime.started_at = $now
+            else
+              .
+            end)
+       else
+         .
+       end
+     )
+     | .updated_at = $now
+     ' "$TASK_REGISTRY_FILE" >"$tmp"
+
+  mv "$tmp" "$TASK_REGISTRY_FILE"
+}
+
+event_file_inode() {
+  local path="$1"
+  if [[ ! -f "$path" ]]; then
+    echo "0"
+    return 0
+  fi
+  stat -c '%i' "$path" 2>/dev/null \
+    || stat -f '%i' "$path" 2>/dev/null \
+    || echo "0"
+}
+
+read_event_cursor() {
+  if [[ -z "${COORD_CURSOR_FILE:-}" || ! -f "${COORD_CURSOR_FILE:-}" ]]; then
+    echo "0|0||"
+    return 0
+  fi
+  local row
+  row="$(jq -r '[.offset // 0, .inode // 0, .path // "", .last_event_id // ""] | @tsv' "$COORD_CURSOR_FILE" 2>/dev/null || true)"
+  if [[ -z "$row" ]]; then
+    echo "0|0||"
+    return 0
+  fi
+  local offset inode path last_event_id
+  IFS=$'\t' read -r offset inode path last_event_id <<<"$row"
+  [[ "$offset" =~ ^[0-9]+$ ]] || offset=0
+  [[ "$inode" =~ ^[0-9]+$ ]] || inode=0
+  echo "${offset}|${inode}|${path}|${last_event_id}"
+}
+
+write_event_cursor() {
+  local offset="$1"
+  local inode="$2"
+  local last_event_id="${3:-}"
+  [[ -n "${COORD_CURSOR_FILE:-}" ]] || return 0
+  mkdir -p "$(dirname "$COORD_CURSOR_FILE")"
+  jq -nc \
+    --arg path "$COORD_EVENTS_FILE" \
+    --arg updated_at "$(now_iso)" \
+    --argjson offset "$offset" \
+    --argjson inode "$inode" \
+    --arg last_event_id "$last_event_id" \
+    '{
+      path:$path,
+      inode:$inode,
+      offset:$offset,
+      last_event_id:($last_event_id|select(length>0)),
+      updated_at:$updated_at
+    }' >"$COORD_CURSOR_FILE"
+}
+
+rotate_events_log_if_needed() {
+  [[ -n "${COORD_EVENTS_FILE:-}" ]] || return 0
+  [[ -f "$COORD_EVENTS_FILE" ]] || return 0
+  [[ "$EVENT_LOG_MAX_BYTES" =~ ^[0-9]+$ ]] || return 0
+  if [[ "$EVENT_LOG_MAX_BYTES" -le 0 ]]; then
+    return 0
+  fi
+  local size
+  size="$(wc -c <"$COORD_EVENTS_FILE" 2>/dev/null || echo 0)"
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+  if [[ "$size" -lt "$EVENT_LOG_MAX_BYTES" ]]; then
+    return 0
+  fi
+
+  local ts rotated
+  ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+  rotated="${COORD_LOG_DIR}/events-${ts}.jsonl"
+  mv "$COORD_EVENTS_FILE" "$rotated"
+  : >"$COORD_EVENTS_FILE"
+  emit_event "events_rotated" "Rotated coordinator events log" "" "" "from_size=${size} path=${rotated}"
+
+  if [[ "$EVENT_LOG_KEEP_FILES" =~ ^[0-9]+$ ]] && [[ "$EVENT_LOG_KEEP_FILES" -ge 0 ]]; then
+    mapfile -t rotated_files < <(ls -1t "${COORD_LOG_DIR}"/events-*.jsonl 2>/dev/null || true)
+    local idx
+    for idx in "${!rotated_files[@]}"; do
+      if [[ "$idx" -ge "$EVENT_LOG_KEEP_FILES" ]]; then
+        rm -f "${rotated_files[$idx]}"
+      fi
+    done
+  fi
+}
+
+compact_processed_event_ids_if_needed() {
+  [[ "$PROCESSED_EVENT_IDS_MAX" =~ ^[0-9]+$ ]] || return 0
+  if [[ "$PROCESSED_EVENT_IDS_MAX" -le 0 ]]; then
+    return 0
+  fi
+  local count
+  count="$(jq -r '(.processed_event_ids // {}) | length' "$TASK_REGISTRY_FILE" 2>/dev/null || echo 0)"
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  if [[ "$count" -le "$PROCESSED_EVENT_IDS_MAX" ]]; then
+    return 0
+  fi
+  local tmp now
+  now="$(now_iso)"
+  tmp="$(mktemp)"
+  jq --arg now "$now" '
+    . as $root
+    | (.tasks // [])
+      | map(.task_runtime.last_event_id // "")
+      | map(select(length > 0))
+      | unique as $keep
+    | .processed_event_ids = (
+        reduce $keep[] as $id ({};
+          if (($root.processed_event_ids // {})[$id] // false) then
+            .[$id] = true
+          else
+            .
+          end
+        )
+      )
+    | .updated_at = $now
+  ' "$TASK_REGISTRY_FILE" >"$tmp"
+  mv "$tmp" "$TASK_REGISTRY_FILE"
+  emit_event "events_compacted" "Compacted processed event dedup map" "" "" "previous_count=${count}"
+}
+
+apply_runtime_event() {
+  local event_id="$1"
+  local task_id="$2"
+  local seq="$3"
+  local event_type="$4"
+  local phase="$5"
+  local status="$6"
+  local ts="$7"
+  local payload_json="$8"
+  local source="$9"
+
+  [[ -n "$task_id" ]] || return 0
+  task_exists "$task_id" || return 0
+
+  local runtime_status
+  case "$status" in
+    started|dispatched) runtime_status="dispatched" ;;
+    running|progress|heartbeat) runtime_status="running" ;;
+    done|phase_done) runtime_status="phase_done" ;;
+    failed|error) runtime_status="failed" ;;
+    stale) runtime_status="stale" ;;
+    paused) runtime_status="paused" ;;
+    *) runtime_status="running" ;;
+  esac
+
+  local tmp now
+  now="$(now_iso)"
+  tmp="$(mktemp)"
+  jq --arg task_id "$task_id" \
+     --arg event_id "$event_id" \
+     --argjson seq "$seq" \
+     --arg runtime_status "$runtime_status" \
+     --arg phase "$phase" \
+     --arg event_type "$event_type" \
+     --arg status "$status" \
+     --arg ts "$ts" \
+     --argjson payload "$payload_json" \
+     --arg source "$source" \
+     --arg now "$now" \
+     '
+     def payload_error:
+       ($payload.error // $payload.message // "");
+
+     def payload_attempt:
+       ($payload.attempt // null);
+
+     def heartbeat_ts:
+       if ($status == "running" or $status == "heartbeat" or $event_type == "heartbeat") then
+         (if ($ts|length) > 0 then $ts else $now end)
+       else
+         null
+       end;
+
+     . as $root
+     | (.processed_event_ids // {}) as $seen
+     | if ($seen[$event_id] // false) then
+         .
+       else
+         .processed_event_ids = $seen
+         | .processed_event_ids[$event_id] = true
+         | .tasks |= map(
+             if .id == $task_id then
+               .task_runtime = (.task_runtime // {})
+               | (if (
+                    (.task_runtime.last_seq_source // "") == $source
+                    and $seq > 0
+                    and ((.task_runtime.last_seq // -1) >= 0)
+                    and ((.task_runtime.last_seq // -1) >= $seq)
+                  ) then
+                    .
+                  else
+                    .task_runtime.last_seq = $seq
+                    | .task_runtime.last_event_id = $event_id
+                    | .task_runtime.last_seq_source = $source
+                    | .task_runtime.status = $runtime_status
+                    | (if ($phase|length) > 0 then .task_runtime.current_phase = $phase else . end)
+                    | (if heartbeat_ts != null then .task_runtime.last_heartbeat = heartbeat_ts else . end)
+                    | (if payload_attempt != null then .task_runtime.attempt = payload_attempt else . end)
+                    | (if ($runtime_status == "failed" and (payload_error|length) > 0) then
+                         .task_runtime.last_error = payload_error
+                       else
+                         .
+                       end)
+                    | (if ($runtime_status == "running" and ((.task_runtime.started_at // "")|length) == 0) then
+                         .task_runtime.started_at = (if ($ts|length) > 0 then $ts else $now end)
+                       else
+                         .
+                       end)
+                  end)
+             else
+               .
+             end
+           )
+         | .updated_at = $now
+       end
+     ' "$TASK_REGISTRY_FILE" >"$tmp"
+  mv "$tmp" "$TASK_REGISTRY_FILE"
+}
+
+consume_runtime_events_once() {
+  [[ -n "${COORD_EVENTS_FILE:-}" ]] || return 0
+  rotate_events_log_if_needed
+  [[ -f "$COORD_EVENTS_FILE" ]] || return 0
+
+  local cursor_meta cursor_offset cursor_inode cursor_path cursor_last_event_id
+  cursor_meta="$(read_event_cursor)"
+  IFS='|' read -r cursor_offset cursor_inode cursor_path cursor_last_event_id <<<"$cursor_meta"
+
+  local file_size file_inode
+  file_size="$(wc -c <"$COORD_EVENTS_FILE" 2>/dev/null || echo 0)"
+  file_inode="$(event_file_inode "$COORD_EVENTS_FILE")"
+  [[ "$cursor_offset" =~ ^[0-9]+$ ]] || cursor_offset=0
+  [[ "$cursor_inode" =~ ^[0-9]+$ ]] || cursor_inode=0
+  [[ "$file_size" =~ ^[0-9]+$ ]] || file_size=0
+  [[ "$file_inode" =~ ^[0-9]+$ ]] || file_inode=0
+
+  if [[ "$cursor_path" != "$COORD_EVENTS_FILE" || "$cursor_inode" != "$file_inode" || "$cursor_offset" -gt "$file_size" ]]; then
+    cursor_offset=0
+  fi
+  if [[ "$cursor_offset" -eq "$file_size" ]]; then
+    return 0
+  fi
+
+  local lines
+  lines="$(tail -c +"$((cursor_offset + 1))" "$COORD_EVENTS_FILE" 2>/dev/null || true)"
+  local last_processed_event_id=""
+  while IFS= read -r line; do
+    [[ -n "${line// }" ]] || continue
+    local event_id task_id seq event_type phase status ts payload_json source
+    event_id="$(jq -r '.event_id // ""' <<<"$line" 2>/dev/null || true)"
+    task_id="$(jq -r '.task_id // ""' <<<"$line" 2>/dev/null || true)"
+    seq="$(jq -r '.seq // 0' <<<"$line" 2>/dev/null || echo 0)"
+    event_type="$(jq -r '.type // .event // ""' <<<"$line" 2>/dev/null || true)"
+    phase="$(jq -r '.phase // ""' <<<"$line" 2>/dev/null || true)"
+    status="$(jq -r '.status // .state // ""' <<<"$line" 2>/dev/null || true)"
+    ts="$(jq -r '.ts // ""' <<<"$line" 2>/dev/null || true)"
+    source="$(jq -r '.source // ""' <<<"$line" 2>/dev/null || true)"
+    payload_json="$(jq -c '.payload // {}' <<<"$line" 2>/dev/null || echo '{}')"
+
+    [[ "$seq" =~ ^[0-9]+$ ]] || seq=0
+    [[ -n "$event_id" ]] || continue
+    case "$event_type" in
+      started|progress|phase_result|commit_created|review_done|integrate_done|failed|heartbeat) ;;
+      *) continue ;;
+    esac
+    apply_runtime_event "$event_id" "$task_id" "$seq" "$event_type" "$phase" "$status" "$ts" "$payload_json" "$source"
+    last_processed_event_id="$event_id"
+
+    if [[ "$status" == "failed" && "$source" == performer:* ]]; then
+      local current
+      current="$(task_state "$task_id" 2>/dev/null || true)"
+      if [[ -n "$current" && "$current" != "blocked" && "$current" != "merged" && "$current" != "abandoned" ]]; then
+        apply_transition "$task_id" "blocked" "" "" "failure:performer_event"
+      fi
+    fi
+  done <<<"$lines"
+
+  write_event_cursor "$file_size" "$file_inode" "$last_processed_event_id"
+  compact_processed_event_ids_if_needed
 }
 
 cleanup_stale_tasks() {
@@ -934,6 +1329,42 @@ cleanup_stale_tasks() {
     | select(.state == "claimed" or .state == "in_progress" or .state == "changes_requested")
     | [.id, .state, (.claimed_at // "")] | @tsv
   ' "$TASK_REGISTRY_FILE")
+
+  if [[ "$STALE_HEARTBEAT_SECONDS" -gt 0 ]]; then
+    while IFS=$'\t' read -r task_id runtime_status last_heartbeat started_at; do
+      [[ -n "$task_id" ]] || continue
+      local ref_ts heartbeat_epoch age
+      ref_ts="$last_heartbeat"
+      [[ -n "$ref_ts" ]] || ref_ts="$started_at"
+      [[ -n "$ref_ts" ]] || continue
+      heartbeat_epoch="$(date -d "$ref_ts" +%s 2>/dev/null || echo 0)"
+      [[ "$heartbeat_epoch" -gt 0 ]] || continue
+      age=$((now_epoch - heartbeat_epoch))
+      [[ "$age" -ge "$STALE_HEARTBEAT_SECONDS" ]] || continue
+
+      case "$STALE_HEARTBEAT_ACTION" in
+        retry)
+          set_task_runtime "$task_id" "dispatched" "" "" "stale heartbeat (${age}s)" "$(now_iso)"
+          emit_event "task_runtime_retry" "Runtime stale heartbeat; retry requested" "$task_id" "dispatched" "age=${age}s"
+          ;;
+        requeue)
+          apply_transition "$task_id" "todo" "" "" "stale_heartbeat_requeue"
+          set_task_runtime "$task_id" "stale" "" "" "stale heartbeat (${age}s)" "$(now_iso)"
+          emit_event "task_runtime_requeue" "Runtime stale heartbeat; task requeued" "$task_id" "todo" "age=${age}s"
+          ;;
+        block|*)
+          apply_transition "$task_id" "blocked" "" "" "stale_heartbeat"
+          set_task_runtime "$task_id" "stale" "" "" "stale heartbeat (${age}s)" "$(now_iso)"
+          emit_event "task_runtime_stale" "Runtime stale heartbeat; task blocked" "$task_id" "blocked" "age=${age}s"
+          ;;
+      esac
+      echo "Stale heartbeat handled: ${task_id} (runtime=${runtime_status}, age=${age}s)"
+    done < <(jq -r '
+      (.tasks // [])[]
+      | select((.task_runtime.status // "") == "running" or (.task_runtime.status // "") == "dispatched")
+      | [.id, (.task_runtime.status // ""), (.task_runtime.last_heartbeat // ""), (.task_runtime.started_at // "")] | @tsv
+    ' "$TASK_REGISTRY_FILE")
+  fi
 }
 
 select_next_ready_task_tsv() {
@@ -942,6 +1373,7 @@ select_next_ready_task_tsv() {
     --argjson tool_priority "$TOOL_PRIORITY_JSON" \
     --argjson tool_caps "$MAX_PARALLEL_PER_TOOL_JSON" \
     --argjson tool_specializations "$TOOL_SPECIALIZATIONS_JSON" \
+    --argjson max_parallel "$MAX_PARALLEL" \
     --arg default_tool "$DEFAULT_TOOL" \
     --arg default_base_branch "$DEFAULT_BASE_BRANCH" \
     '
@@ -966,6 +1398,11 @@ select_next_ready_task_tsv() {
     def active_count($root; $tool):
       (($root.tasks // [])
         | map(select(is_active_state(.state // "") and ((.tool // "") == $tool)))
+        | length);
+
+    def active_global_count($root):
+      (($root.tasks // [])
+        | map(select(is_active_state(.state // "")))
         | length);
 
     def cap_ok($root; $tool):
@@ -1034,6 +1471,7 @@ select_next_ready_task_tsv() {
 
     . as $root
     | [($root.tasks // [])[]
+        | select(($max_parallel | tonumber) <= 0 or (active_global_count($root) < ($max_parallel | tonumber)))
         | select((.state // "todo") == "todo" and (.worktree == null))
         | . as $t
         | select((($t.dependencies // []) | all(
@@ -1168,6 +1606,13 @@ mark_task_claimed() {
              last_commit: $commit,
              session_id: $session
            }
+         | .task_runtime = (.task_runtime // {})
+         | .task_runtime.status = "dispatched"
+         | .task_runtime.current_phase = "dev"
+         | .task_runtime.started_at = $now
+         | .task_runtime.last_heartbeat = $now
+         | .task_runtime.last_error = null
+         | .task_runtime.pid = null
        else
          .
        end
@@ -1203,6 +1648,9 @@ invoke_performer() {
     return 1
   fi
 
+  COORD_EVENTS_FILE="$COORD_EVENTS_FILE" \
+  MACC_EVENT_SOURCE="performer:${tool}:${task_id}:$(date +%s%N)" \
+  MACC_EVENT_TASK_ID="$task_id" \
   macc --cwd "$REPO_DIR" worktree run "$worktree_path"
 }
 
@@ -1282,6 +1730,9 @@ invoke_tool_phase_runner() {
   prompt_file="$(mktemp)"
   build_phase_prompt "$mode" "$task_id" "$tool" >"$prompt_file"
 
+  COORD_EVENTS_FILE="$COORD_EVENTS_FILE" \
+  MACC_EVENT_SOURCE="performer:${tool}:${task_id}:$(date +%s%N)" \
+  MACC_EVENT_TASK_ID="$task_id" \
   "$runner" \
     --prompt-file "$prompt_file" \
     --tool-json "$tool_json" \
@@ -1346,6 +1797,32 @@ transition_task_and_hooks() {
   current="$(task_state "$task_id")"
   validate_transition "$current" "$new_state" || return 1
   apply_transition "$task_id" "$new_state" "$pr_url" "$reviewer" "$reason"
+  case "$new_state" in
+    claimed)
+      set_task_runtime "$task_id" "dispatched" "dev" "" "" "$(now_iso)"
+      ;;
+    in_progress)
+      set_task_runtime "$task_id" "running" "dev" "" "" "$(now_iso)"
+      ;;
+    pr_open)
+      set_task_runtime "$task_id" "running" "review" "" "" "$(now_iso)"
+      ;;
+    changes_requested)
+      set_task_runtime "$task_id" "running" "fix" "" "" "$(now_iso)"
+      ;;
+    queued)
+      set_task_runtime "$task_id" "running" "integrate" "" "" "$(now_iso)"
+      ;;
+    merged)
+      set_task_runtime "$task_id" "idle" "" "" "" "$(now_iso)"
+      ;;
+    blocked|abandoned)
+      set_task_runtime "$task_id" "failed" "" "" "${reason:-workflow transition to ${new_state}}" "$(now_iso)"
+      ;;
+    todo)
+      set_task_runtime "$task_id" "idle" "" "" "" "$(now_iso)"
+      ;;
+  esac
 
   if [[ "$new_state" == "pr_open" || "$new_state" == "changes_requested" || "$new_state" == "queued" ]]; then
     wt="$(worktree_for_task "$task_id")"
@@ -1353,6 +1830,19 @@ transition_task_and_hooks() {
     if [[ -n "$wt" && -n "$tool" ]]; then
       if ! maybe_run_phase_hook "$task_id" "$new_state" "$wt" "$tool"; then
         note "Warning: phase hook failed for ${task_id} (${new_state}); continuing state machine."
+        emit_event "phase_result" "Coordinator phase hook failed" "$task_id" "$new_state" "tool=${tool}" "$new_state" "failed"
+      else
+        case "$new_state" in
+          pr_open)
+            emit_event "review_done" "Review phase completed" "$task_id" "$new_state" "tool=${tool}" "review" "done"
+            ;;
+          changes_requested)
+            emit_event "phase_result" "Fix phase completed" "$task_id" "$new_state" "tool=${tool}" "fix" "done"
+            ;;
+          queued)
+            emit_event "integrate_done" "Integrate phase completed" "$task_id" "$new_state" "tool=${tool}" "integrate" "done"
+            ;;
+        esac
       fi
     fi
   fi
@@ -1651,9 +2141,189 @@ advance_active_tasks() {
     note "Advance complete: no transitions."
   fi
 }
-dispatch_ready_tasks() {
+
+handle_performer_completion() {
+  local task_id="$1"
+  local tool="$2"
+  local rc="$3"
+  if [[ "$rc" -ne 0 ]]; then
+    set_task_runtime "$task_id" "failed" "dev" "" "performer exited with status ${rc}" "$(now_iso)"
+    apply_transition "$task_id" "blocked" "" "" "failure:performer"
+    note "Blocked task due to performer failure: ${task_id}"
+    emit_event "task_blocked" "Performer failed" "$task_id" "blocked"
+  else
+    set_task_runtime "$task_id" "phase_done" "dev" "" "" "$(now_iso)"
+    transition_task_and_hooks "$task_id" "in_progress" "" "" "auto:performer_complete"
+    note "Performer complete: ${task_id} (${tool})"
+    emit_event "performer_complete" "Performer completed task phase" "$task_id" "in_progress"
+  fi
+}
+
+retry_failed_phase() {
+  local task_id="$1"
+  local phase="$2"
+  local skip_phase="${3:-false}"
+
+  task_exists "$task_id" || {
+    echo "Error: task not found in registry: $task_id" >&2
+    return 1
+  }
+
+  case "$phase" in
+    dev|review|fix|integrate) ;;
+    *)
+      echo "Error: unsupported retry phase '${phase}' (expected: dev|review|fix|integrate)" >&2
+      return 1
+      ;;
+  esac
+
+  if [[ "$skip_phase" == "true" ]]; then
+    transition_task_and_hooks "$task_id" "todo" "" "" "manual:skip_phase:${phase}"
+    set_task_runtime "$task_id" "idle" "" "" "" "$(now_iso)"
+    emit_event "phase_skipped" "Skipped failed phase" "$task_id" "todo" "phase=${phase}" "$phase" "skipped"
+    note "Skipped phase '${phase}' for task ${task_id}; task moved back to todo."
+    return 0
+  fi
+
+  local worktree_path tool current rc performer_pid
+  worktree_path="$(worktree_for_task "$task_id")"
+  tool="$(coordinator_phase_tool_for_task "$task_id")"
+  current="$(task_state "$task_id")"
+
+  [[ -n "$worktree_path" && -d "$worktree_path" ]] || {
+    echo "Error: retry-phase requires an existing worktree for task ${task_id}" >&2
+    return 1
+  }
+  [[ -n "$tool" ]] || {
+    echo "Error: retry-phase could not resolve tool for task ${task_id}" >&2
+    return 1
+  }
+
+  case "$phase" in
+    dev)
+      if [[ "$current" == "blocked" || "$current" == "todo" ]]; then
+        transition_task_and_hooks "$task_id" "claimed" "" "" "manual:retry_phase:dev"
+      fi
+      set_task_runtime "$task_id" "running" "dev" "" "" "$(now_iso)"
+      emit_event "phase_retry" "Retrying failed phase" "$task_id" "$current" "phase=dev tool=${tool}" "dev" "started"
+      lock_release
+      invoke_performer "$task_id" "$worktree_path" "$tool" &
+      performer_pid=$!
+      rc=0
+      wait "$performer_pid" || rc=$?
+      lock_acquire
+      ensure_registry_valid
+      handle_performer_completion "$task_id" "$tool" "$rc"
+      [[ "$rc" -eq 0 ]]
+      return
+      ;;
+    review)
+      emit_event "phase_retry" "Retrying failed phase" "$task_id" "$current" "phase=review tool=${tool}" "review" "started"
+      if invoke_tool_phase_runner review "$task_id" "$worktree_path" "$tool"; then
+        local target="pr_open"
+        current="$(task_state "$task_id")"
+        validate_transition "$current" "$target"
+        apply_transition "$task_id" "$target" "" "" "manual:retry_phase:review"
+        set_task_runtime "$task_id" "running" "review" "" "" "$(now_iso)"
+        emit_event "review_done" "Review phase retried successfully" "$task_id" "pr_open" "tool=${tool}" "review" "done"
+        note "Retried review phase for task ${task_id}."
+      else
+        set_task_runtime "$task_id" "failed" "review" "" "retry review phase failed" "$(now_iso)"
+        emit_event "phase_result" "Retry review phase failed" "$task_id" "$current" "tool=${tool}" "review" "failed"
+        return 1
+      fi
+      ;;
+    fix)
+      emit_event "phase_retry" "Retrying failed phase" "$task_id" "$current" "phase=fix tool=${tool}" "fix" "started"
+      if invoke_tool_phase_runner fix "$task_id" "$worktree_path" "$tool"; then
+        local target="changes_requested"
+        current="$(task_state "$task_id")"
+        validate_transition "$current" "$target"
+        apply_transition "$task_id" "$target" "" "" "manual:retry_phase:fix"
+        set_task_runtime "$task_id" "running" "fix" "" "" "$(now_iso)"
+        emit_event "phase_result" "Fix phase retried successfully" "$task_id" "changes_requested" "tool=${tool}" "fix" "done"
+        note "Retried fix phase for task ${task_id}."
+      else
+        set_task_runtime "$task_id" "failed" "fix" "" "retry fix phase failed" "$(now_iso)"
+        emit_event "phase_result" "Retry fix phase failed" "$task_id" "$current" "tool=${tool}" "fix" "failed"
+        return 1
+      fi
+      ;;
+    integrate)
+      emit_event "phase_retry" "Retrying failed phase" "$task_id" "$current" "phase=integrate tool=${tool}" "integrate" "started"
+      if invoke_tool_phase_runner integrate "$task_id" "$worktree_path" "$tool"; then
+        local target="queued"
+        current="$(task_state "$task_id")"
+        validate_transition "$current" "$target"
+        apply_transition "$task_id" "$target" "" "" "manual:retry_phase:integrate"
+        set_task_runtime "$task_id" "running" "integrate" "" "" "$(now_iso)"
+        emit_event "integrate_done" "Integrate phase retried successfully" "$task_id" "queued" "tool=${tool}" "integrate" "done"
+        note "Retried integrate phase for task ${task_id}."
+      else
+        set_task_runtime "$task_id" "failed" "integrate" "" "retry integrate phase failed" "$(now_iso)"
+        emit_event "phase_result" "Retry integrate phase failed" "$task_id" "$current" "tool=${tool}" "integrate" "failed"
+        return 1
+      fi
+      ;;
+  esac
+}
+
+registry_counts_tsv() {
+  jq -r '
+    def is_active($s):
+      ($s == "claimed" or $s == "in_progress" or $s == "pr_open" or $s == "changes_requested" or $s == "queued");
+
+    [(.tasks // [])[] | (.state // "todo")] as $states
+    | [
+        ($states | length),
+        ($states | map(select(. == "todo")) | length),
+        ($states | map(select(is_active(.))) | length),
+        ($states | map(select(. == "blocked")) | length),
+        ($states | map(select(. == "merged")) | length)
+      ]
+    | @tsv
+  ' "$TASK_REGISTRY_FILE"
+}
+
+run_loop_active_job_count() {
+  local count=0
+  local entry pid task_id wt tool
+  for entry in "${RUN_LOOP_ACTIVE_JOBS[@]}"; do
+    IFS='|' read -r pid task_id wt tool <<<"$entry"
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      count=$((count + 1))
+    fi
+  done
+  echo "$count"
+}
+
+monitor_run_loop_jobs_once() {
+  local -a remaining=()
+  local entry pid task_id wt tool rc
+  for entry in "${RUN_LOOP_ACTIVE_JOBS[@]}"; do
+    IFS='|' read -r pid task_id wt tool <<<"$entry"
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      remaining+=("$entry")
+      continue
+    fi
+    rc=0
+    wait "$pid" || rc=$?
+    handle_performer_completion "$task_id" "$tool" "$rc"
+  done
+  RUN_LOOP_ACTIVE_JOBS=("${remaining[@]}")
+}
+
+stop_run_loop_jobs() {
+  local entry pid task_id wt tool
+  for entry in "${RUN_LOOP_ACTIVE_JOBS[@]}"; do
+    IFS='|' read -r pid task_id wt tool <<<"$entry"
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+  RUN_LOOP_ACTIVE_JOBS=()
+}
+
+dispatch_ready_tasks_nonblocking() {
   local dispatched=0
-  local -a jobs=()
   local ready_count
   ready_count="$(jq -r '
     . as $root
@@ -1675,39 +2345,13 @@ dispatch_ready_tasks() {
   note "Dispatch ready tasks: ${ready_count}"
 
   while true; do
-    if [[ "$MAX_PARALLEL" -gt 0 && "${#jobs[@]}" -ge "$MAX_PARALLEL" ]]; then
-      local completed_idx="" completed_task="" completed_tool="" completed_rc=0
-      lock_release
-      while [[ -z "$completed_idx" ]]; do
-        local i
-        for i in "${!jobs[@]}"; do
-          local pid task_id wt tool
-          IFS='|' read -r pid task_id wt tool <<<"${jobs[$i]}"
-          if ! kill -0 "$pid" >/dev/null 2>&1; then
-            completed_idx="$i"
-            completed_task="$task_id"
-            completed_tool="$tool"
-            wait "$pid" || completed_rc=$?
-            break
-          fi
-        done
-        [[ -n "$completed_idx" ]] || sleep 0.1
-      done
-      lock_acquire
-      ensure_registry_valid
-
-      unset "jobs[$completed_idx]"
-      jobs=("${jobs[@]}")
-
-      if [[ "$completed_rc" -ne 0 ]]; then
-        apply_transition "$completed_task" "blocked" "" "" "failure:performer"
-        note "Blocked task due to performer failure: ${completed_task}"
-        emit_event "task_blocked" "Performer failed" "$completed_task" "blocked"
-      else
-        transition_task_and_hooks "$completed_task" "in_progress" "" "" "auto:performer_complete"
-        note "Performer complete: ${completed_task} (${completed_tool})"
-        emit_event "performer_complete" "Performer completed task phase" "$completed_task" "in_progress"
-      fi
+    local active_jobs
+    active_jobs="$(run_loop_active_job_count)"
+    if [[ "$MAX_PARALLEL" -gt 0 && "$active_jobs" -ge "$MAX_PARALLEL" ]]; then
+      break
+    fi
+    if [[ "$MAX_DISPATCH" -gt 0 && "$dispatched" -ge "$MAX_DISPATCH" ]]; then
+      break
     fi
 
     local selected_row selected title tool base_branch
@@ -1757,6 +2401,201 @@ dispatch_ready_tasks() {
     local performer_pid=$!
     lock_acquire
     ensure_registry_valid
+    set_task_runtime "$selected" "running" "dev" "$performer_pid" "" "$(now_iso)"
+    RUN_LOOP_ACTIVE_JOBS+=("${performer_pid}|${selected}|${worktree_path}|${tool}")
+
+    note "Dispatched: ${selected}"
+    note "  tool:      ${tool}"
+    note "  branch:    ${branch}"
+    note "  worktree:  ${worktree_path}"
+    note "  source:    ${dispatch_kind}"
+    note "  mode:      async (pid=${performer_pid})"
+    note ""
+    emit_event "task_dispatched" "Task dispatched" "$selected" "claimed" "tool=${tool} worktree=${worktree_path}" "dev" "started"
+
+    dispatched=$((dispatched + 1))
+  done
+
+  note "Dispatch complete. Tasks dispatched: ${dispatched}"
+  emit_event "dispatch_complete" "Dispatch finished" "" "" "dispatched=${dispatched}"
+}
+
+run_control_plane() {
+  local started_epoch cycle no_progress previous_counts
+  started_epoch="$(date +%s)"
+  cycle=0
+  no_progress=0
+  previous_counts=""
+
+  while true; do
+    cycle=$((cycle + 1))
+    lock_acquire
+    ensure_registry_file
+    ensure_registry_valid
+    sync_registry_from_prd
+    ensure_registry_valid
+
+    consume_runtime_events_once
+    cleanup_stale_tasks
+    monitor_run_loop_jobs_once
+    dispatch_ready_tasks_nonblocking
+    advance_active_tasks
+    reconcile_registry
+    cleanup_stale_tasks
+    consume_runtime_events_once
+    monitor_run_loop_jobs_once
+
+    local counts total todo active blocked merged
+    counts="$(registry_counts_tsv)"
+    IFS=$'\t' read -r total todo active blocked merged <<<"$counts"
+    lock_release
+
+    note "Coordinator cycle ${cycle}: total=${total} todo=${todo} active=${active} blocked=${blocked} merged=${merged}"
+
+    if [[ "$todo" -eq 0 && "$active" -eq 0 ]]; then
+      if [[ "$blocked" -gt 0 ]]; then
+        echo "Error: Validation error: Coordinator run finished with blocked tasks: ${blocked}. Run \`macc coordinator status\`, then \`macc coordinator unlock --all\`, and inspect logs with \`macc logs tail --component coordinator\`." >&2
+        return 1
+      fi
+      note "Coordinator run complete."
+      return 0
+    fi
+
+    if [[ "$active" -gt 0 ]]; then
+      no_progress=0
+    elif [[ "$counts" == "$previous_counts" ]]; then
+      no_progress=$((no_progress + 1))
+    else
+      no_progress=0
+    fi
+    previous_counts="$counts"
+
+    if [[ "$no_progress" -ge 2 ]]; then
+      stop_run_loop_jobs
+      echo "Error: Validation error: Coordinator made no progress for ${no_progress} cycles (todo=${todo}, active=${active}, blocked=${blocked}). Run \`macc coordinator status\`, then \`macc coordinator unlock --all\`, and inspect logs with \`macc logs tail --component coordinator\`." >&2
+      return 1
+    fi
+
+    if [[ "$TIMEOUT_SECONDS" -gt 0 ]]; then
+      local now elapsed
+      now="$(date +%s)"
+      elapsed=$((now - started_epoch))
+      if [[ "$elapsed" -ge "$TIMEOUT_SECONDS" ]]; then
+        stop_run_loop_jobs
+        echo "Error: Validation error: Coordinator run timed out after ${TIMEOUT_SECONDS} seconds. Run \`macc coordinator status\` and \`macc logs tail --component coordinator\`." >&2
+        return 1
+      fi
+    fi
+
+    sleep 0.2
+  done
+}
+
+dispatch_ready_tasks() {
+  local dispatched=0
+  local -a jobs=()
+  local ready_count
+  ready_count="$(jq -r '
+    . as $root
+    | [($root.tasks // [])[]
+        | select((.state // "todo") == "todo" and (.worktree == null))
+        | . as $t
+        | select((($t.dependencies // []) | all(
+            . as $dep
+            | (((($root.tasks // []) | map(select(.id == ($dep|tostring)) | .state) | .[0]) // "") == "merged")
+          )))
+        | select((($t.exclusive_resources // []) | all(
+            . as $r
+            | (($root.resource_locks[$r].task_id // "") as $owner | ($owner == "" or $owner == $t.id))
+          )))
+      ]
+    | length
+  ' "$TASK_REGISTRY_FILE")"
+  note "Dispatch config: MAX_DISPATCH=${MAX_DISPATCH} MAX_PARALLEL=${MAX_PARALLEL} MAX_PARALLEL_PER_TOOL_JSON=${MAX_PARALLEL_PER_TOOL_JSON}"
+  note "Dispatch ready tasks: ${ready_count}"
+
+  while true; do
+    if [[ "$MAX_PARALLEL" -gt 0 && "${#jobs[@]}" -ge "$MAX_PARALLEL" ]]; then
+      local completed_idx="" completed_task="" completed_tool="" completed_rc=0
+      lock_release
+      while [[ -z "$completed_idx" ]]; do
+        local i
+        for i in "${!jobs[@]}"; do
+          local pid task_id wt tool
+          IFS='|' read -r pid task_id wt tool <<<"${jobs[$i]}"
+          if ! kill -0 "$pid" >/dev/null 2>&1; then
+            completed_idx="$i"
+            completed_task="$task_id"
+            completed_tool="$tool"
+            wait "$pid" || completed_rc=$?
+            break
+          fi
+        done
+        if [[ -z "$completed_idx" ]]; then
+          lock_acquire
+          consume_runtime_events_once
+          lock_release
+          sleep 0.1
+        fi
+      done
+      lock_acquire
+      ensure_registry_valid
+      consume_runtime_events_once
+
+      unset "jobs[$completed_idx]"
+      jobs=("${jobs[@]}")
+
+      handle_performer_completion "$completed_task" "$completed_tool" "$completed_rc"
+    fi
+
+    local selected_row selected title tool base_branch
+    selected_row="$(select_next_ready_task_tsv)"
+    [[ -n "$selected_row" ]] || break
+    IFS=$'\t' read -r selected title tool base_branch <<<"$selected_row"
+    [[ -n "$selected" ]] || break
+
+    local created task_scope_value dispatch_kind
+    dispatch_kind="create"
+    task_scope_value="$(task_scope "$selected")"
+
+    if is_truthy "$WORKTREE_POOL_MODE"; then
+      created="$(find_idle_compatible_worktree "$tool" "$base_branch" "$task_scope_value" || true)"
+      if [[ -n "$created" ]]; then
+        dispatch_kind="reuse"
+      fi
+    fi
+
+    if [[ -z "$created" ]]; then
+      if ! created="$(create_macc_worktree "$selected" "$title" "$tool" "$base_branch")"; then
+        apply_transition "$selected" "blocked" "" "" "failure:worktree_create"
+        note "Blocked task due to worktree create failure: ${selected}"
+        continue
+      fi
+    fi
+    local worktree_path branch last_commit
+    IFS=$'\t' read -r worktree_path branch last_commit <<<"$created"
+
+    if worktree_in_use "$worktree_path"; then
+      local other
+      other="$(worktree_task_id "$worktree_path")"
+      note "Skip: worktree already in use by task ${other}: ${worktree_path}"
+      continue
+    fi
+    if ! worktree_exists_on_disk "$worktree_path"; then
+      echo "Error: worktree path not a git worktree on disk: ${worktree_path}" >&2
+      apply_transition "$selected" "blocked" "" "" "failure:worktree_create"
+      continue
+    fi
+
+    write_worktree_prd "$worktree_path" "$selected"
+    mark_task_claimed "$selected" "$worktree_path" "$branch" "$base_branch" "$last_commit" "$tool"
+
+    lock_release
+    invoke_performer "$selected" "$worktree_path" "$tool" &
+    local performer_pid=$!
+    lock_acquire
+    ensure_registry_valid
+    set_task_runtime "$selected" "running" "dev" "$performer_pid" "" "$(now_iso)"
     jobs+=("${performer_pid}|${selected}|${worktree_path}|${tool}")
 
     note "Dispatched: ${selected}"
@@ -1766,7 +2605,7 @@ dispatch_ready_tasks() {
     note "  source:    ${dispatch_kind}"
     note "  mode:      async (pid=${performer_pid})"
     note ""
-    emit_event "task_dispatched" "Task dispatched" "$selected" "in_progress" "tool=${tool} worktree=${worktree_path}"
+    emit_event "task_dispatched" "Task dispatched" "$selected" "claimed" "tool=${tool} worktree=${worktree_path}" "dev" "started"
 
     dispatched=$((dispatched + 1))
     if [[ "$MAX_DISPATCH" -gt 0 && "$dispatched" -ge "$MAX_DISPATCH" ]]; then
@@ -1790,23 +2629,21 @@ dispatch_ready_tasks() {
           break
         fi
       done
-      [[ -n "$completed_idx" ]] || sleep 0.1
+      if [[ -z "$completed_idx" ]]; then
+        lock_acquire
+        consume_runtime_events_once
+        lock_release
+        sleep 0.1
+      fi
     done
     lock_acquire
     ensure_registry_valid
+    consume_runtime_events_once
 
     unset "jobs[$completed_idx]"
     jobs=("${jobs[@]}")
 
-    if [[ "$completed_rc" -ne 0 ]]; then
-      apply_transition "$completed_task" "blocked" "" "" "failure:performer"
-      note "Blocked task due to performer failure: ${completed_task}"
-      emit_event "task_blocked" "Performer failed" "$completed_task" "blocked"
-    else
-      transition_task_and_hooks "$completed_task" "in_progress" "" "" "auto:performer_complete"
-      note "Performer complete: ${completed_task} (${completed_tool})"
-      emit_event "performer_complete" "Performer completed task phase" "$completed_task" "in_progress"
-    fi
+    handle_performer_completion "$completed_task" "$completed_tool" "$completed_rc"
   done
 
   note "Dispatch complete. Tasks dispatched: ${dispatched}"
@@ -1828,12 +2665,15 @@ main() {
   local unlock_resource=""
   local unlock_all="false"
   local unlock_state="blocked"
+  local retry_task_id=""
+  local retry_phase=""
+  local retry_skip="false"
   local requires_prd="false"
   local requires_sync="false"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      dispatch|advance|sync|status|reconcile|unlock|cleanup) command="$1"; shift ;;
+      run|dispatch|advance|sync|status|reconcile|unlock|cleanup|retry-phase) command="$1"; shift ;;
       --prd) PRD_FILE="$2"; shift 2 ;;
       --repo) REPO_DIR="$2"; shift 2 ;;
       --transition) transition_task_id="$2"; shift 2 ;;
@@ -1848,6 +2688,9 @@ main() {
       --task) unlock_task_id="$2"; shift 2 ;;
       --resource) unlock_resource="$2"; shift 2 ;;
       --unlock-state) unlock_state="$2"; shift 2 ;;
+      --retry-task) retry_task_id="$2"; shift 2 ;;
+      --retry-phase) retry_phase="$2"; shift 2 ;;
+      --skip) retry_skip="true"; shift ;;
       --all) unlock_all="true"; shift ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
@@ -1855,7 +2698,7 @@ main() {
   done
 
   case "$command" in
-    dispatch|sync|reconcile)
+    run|dispatch|sync|reconcile|retry-phase)
       requires_prd="true"
       requires_sync="true"
       ;;
@@ -1898,7 +2741,30 @@ main() {
     echo "Error: MAX_PARALLEL must be >= 1: $MAX_PARALLEL" >&2
     exit 1
   }
-  if [[ "$command" == "dispatch" ]]; then
+  [[ "$STALE_HEARTBEAT_SECONDS" =~ ^[0-9]+$ ]] || {
+    echo "Error: STALE_HEARTBEAT_SECONDS must be a non-negative integer: $STALE_HEARTBEAT_SECONDS" >&2
+    exit 1
+  }
+  [[ "$EVENT_LOG_MAX_BYTES" =~ ^[0-9]+$ ]] || {
+    echo "Error: EVENT_LOG_MAX_BYTES must be a non-negative integer: $EVENT_LOG_MAX_BYTES" >&2
+    exit 1
+  }
+  [[ "$EVENT_LOG_KEEP_FILES" =~ ^[0-9]+$ ]] || {
+    echo "Error: EVENT_LOG_KEEP_FILES must be a non-negative integer: $EVENT_LOG_KEEP_FILES" >&2
+    exit 1
+  }
+  [[ "$PROCESSED_EVENT_IDS_MAX" =~ ^[0-9]+$ ]] || {
+    echo "Error: PROCESSED_EVENT_IDS_MAX must be a non-negative integer: $PROCESSED_EVENT_IDS_MAX" >&2
+    exit 1
+  }
+  case "$STALE_HEARTBEAT_ACTION" in
+    retry|block|requeue) ;;
+    *)
+      echo "Error: STALE_HEARTBEAT_ACTION must be retry|block|requeue: $STALE_HEARTBEAT_ACTION" >&2
+      exit 1
+      ;;
+  esac
+  if [[ "$command" == "dispatch" || "$command" == "run" || "$command" == "retry-phase" ]]; then
     need_cmd macc
   fi
 
@@ -1907,6 +2773,11 @@ main() {
   fi
   ensure_repo_valid
   setup_logging "$command"
+
+  if [[ "$command" == "run" ]]; then
+    run_control_plane
+    exit $?
+  fi
 
   lock_acquire
   ensure_registry_file
@@ -1926,10 +2797,20 @@ main() {
   spinner_start "Cleaning stale tasks"
   cleanup_stale_tasks
   spinner_stop "Cleanup complete"
+  consume_runtime_events_once
 
   if [[ "$command" == "cleanup" ]]; then
     note "Cleanup complete."
     exit 0
+  fi
+
+  if [[ "$command" == "retry-phase" ]]; then
+    [[ -n "$retry_task_id" && -n "$retry_phase" ]] || {
+      echo "Error: retry-phase requires --retry-task and --retry-phase" >&2
+      exit 1
+    }
+    retry_failed_phase "$retry_task_id" "$retry_phase" "$retry_skip"
+    exit $?
   fi
 
   if [[ -n "$signal_task_id" || -n "$signal_json" ]]; then

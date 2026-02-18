@@ -483,6 +483,24 @@ Important behavior:
   - Hook returns JSON object on stdout (mode-specific fields such as `pr_url`, `decision`, `status`, `reason`).
   - Without hook, coordinator can use local fallback merge when `COORDINATOR_AUTOMERGE=true`.
 
+### 12.3.1 Realtime orchestrator target (next evolution)
+
+To remove ambiguity between "task dispatched" and "task actually running", MACC targets a split model:
+
+- Workflow state remains in `task.state` (`todo`, `in_progress`, `pr_open`, ...).
+- Runtime process lifecycle moves to `task.task_runtime.status` (`dispatched`, `running`, `phase_done`, `failed`, `stale`).
+
+Migration direction:
+
+1. strict transition table in core (single source of truth),
+2. versioned event contract (JSON schema),
+3. event consumer with durable cursor (`.macc/state/coordinator.cursor`),
+4. control-plane loop split (scheduler / event monitor / runtime monitor),
+5. TUI live timeline + blocking error gate (Retry / Skip / Stop / Logs).
+
+Reference short design doc:
+- `docs/COORDINATOR_REALTIME.md`
+
 ---
 
 ## 13. Worktrees & parallelism

@@ -4,6 +4,7 @@ use macc_core::catalog::{
     load_effective_mcp_catalog, load_effective_skills_catalog, McpCatalog, McpEntry, Selector,
     SkillEntry, SkillsCatalog, Source, SourceKind,
 };
+use macc_core::coordinator::{is_valid_workflow_transition, WorkflowState};
 use macc_core::engine::{Engine, MaccEngine};
 use macc_core::plan::builders::{plan_mcp_install, plan_skill_install};
 use macc_core::plan::ActionPlan;
@@ -168,7 +169,7 @@ enum Commands {
     },
     /// Run the project coordinator automation script
     Coordinator {
-        /// Coordinator action (run, dispatch, advance, sync, status, reconcile, unlock, cleanup, stop)
+        /// Coordinator action (run, dispatch, advance, sync, status, reconcile, unlock, cleanup, retry-phase, stop, validate-transition)
         #[arg(default_value = "run")]
         action: String,
         /// Disable TUI live view for `macc coordinator run`
@@ -1420,8 +1421,14 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             let paths = ensure_initialized_paths(&absolute_cwd)?;
             let canonical = load_canonical_config(&paths.config_path)?;
             let coordinator = canonical.automation.coordinator.clone();
+            let action_name = action.as_str();
 
-            if action == "run" && !*no_tui {
+            if action_name == "validate-transition" {
+                validate_coordinator_transition_action(extra_args)?;
+                return Ok(());
+            }
+
+            if action_name == "run" && !*no_tui {
                 return macc_tui::run_tui_with_launch(macc_tui::LaunchMode::CoordinatorRun)
                     .map_err(|e| MaccError::Io {
                         path: "tui".into(),
@@ -1456,7 +1463,7 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                 stale_action: stale_action.clone(),
             };
 
-            if action == "stop" {
+            if action_name == "stop" {
                 let stopped =
                     stop_coordinator_process_groups(&paths.root, &coordinator_path, *graceful)?;
                 println!("Coordinator process groups signaled: {}", stopped);
@@ -1495,15 +1502,17 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                     macc_core::prune_worktrees(&paths.root)?;
                     println!("Pruned git worktrees.");
                 }
-            } else if action == "run" {
+            } else if action_name == "run" {
                 if !extra_args.is_empty() {
                     return Err(MaccError::Validation(
                         "Action 'run' does not accept extra args after '--'.".into(),
                     ));
                 }
-                run_coordinator_full_cycle(
+                run_coordinator_action(
                     &paths.root,
                     &coordinator_path,
+                    "run",
+                    &[],
                     &canonical,
                     coordinator.as_ref(),
                     &env_cfg,
@@ -1512,7 +1521,7 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                 run_coordinator_action(
                     &paths.root,
                     &coordinator_path,
-                    action,
+                    action_name,
                     extra_args,
                     &canonical,
                     coordinator.as_ref(),
@@ -2005,6 +2014,79 @@ struct CoordinatorEnvConfig {
 
 const COORDINATOR_TASK_REGISTRY_REL_PATH: &str = ".macc/automation/task/task_registry.json";
 
+fn parse_coordinator_validate_transition_args(
+    args: &[String],
+) -> Result<(WorkflowState, WorkflowState)> {
+    let mut from: Option<WorkflowState> = None;
+    let mut to: Option<WorkflowState> = None;
+    let mut idx = 0usize;
+
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--from" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    MaccError::Validation(
+                        "Missing value for --from. Usage: macc coordinator validate-transition --from <state> --to <state>"
+                            .into(),
+                    )
+                })?;
+                from = Some(
+                    value
+                        .parse::<WorkflowState>()
+                        .map_err(MaccError::Validation)?,
+                );
+                idx += 2;
+            }
+            "--to" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    MaccError::Validation(
+                        "Missing value for --to. Usage: macc coordinator validate-transition --from <state> --to <state>"
+                            .into(),
+                    )
+                })?;
+                to = Some(
+                    value
+                        .parse::<WorkflowState>()
+                        .map_err(MaccError::Validation)?,
+                );
+                idx += 2;
+            }
+            other => {
+                return Err(MaccError::Validation(format!(
+                    "Unknown arg for validate-transition: '{}'. Usage: macc coordinator validate-transition --from <state> --to <state>",
+                    other
+                )));
+            }
+        }
+    }
+
+    let from = from.ok_or_else(|| {
+        MaccError::Validation(
+            "Missing --from. Usage: macc coordinator validate-transition --from <state> --to <state>"
+                .into(),
+        )
+    })?;
+    let to = to.ok_or_else(|| {
+        MaccError::Validation(
+            "Missing --to. Usage: macc coordinator validate-transition --from <state> --to <state>"
+                .into(),
+        )
+    })?;
+    Ok((from, to))
+}
+
+fn validate_coordinator_transition_action(args: &[String]) -> Result<()> {
+    let (from, to) = parse_coordinator_validate_transition_args(args)?;
+    if is_valid_workflow_transition(from, to) {
+        return Ok(());
+    }
+    Err(MaccError::Validation(format!(
+        "invalid transition {} -> {}",
+        from.as_str(),
+        to.as_str()
+    )))
+}
+
 fn apply_coordinator_env(
     command: &mut std::process::Command,
     canonical: &macc_core::config::CanonicalConfig,
@@ -2160,6 +2242,12 @@ fn coordinator_action_hint(action: &str) -> &'static str {
         "reconcile" | "cleanup" => {
             "Run `macc worktree prune` and retry; if locks remain, run `macc coordinator unlock --all`."
         }
+        "run" => {
+            "Run `macc coordinator status`, then inspect events with `macc logs tail --component coordinator`."
+        }
+        "retry-phase" => {
+            "Verify task/worktree consistency with `macc coordinator status` and inspect errors in `macc logs tail --component coordinator`."
+        }
         "unlock" => {
             "Inspect lock owners in .macc/automation/task/task_registry.json then retry dispatch."
         }
@@ -2168,6 +2256,7 @@ fn coordinator_action_hint(action: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RegistryCounts {
     total: usize,
@@ -2177,6 +2266,7 @@ struct RegistryCounts {
     merged: usize,
 }
 
+#[cfg(test)]
 fn read_registry_counts(path: &std::path::Path) -> Result<RegistryCounts> {
     let content = std::fs::read_to_string(path).map_err(|e| MaccError::Io {
         path: path.to_string_lossy().into(),
@@ -2222,6 +2312,7 @@ fn read_registry_counts(path: &std::path::Path) -> Result<RegistryCounts> {
     Ok(counts)
 }
 
+#[cfg(test)]
 fn run_coordinator_full_cycle(
     repo_root: &std::path::Path,
     coordinator_path: &std::path::Path,
@@ -5647,6 +5738,31 @@ mod tests {
             }),
             6
         );
+    }
+
+    #[test]
+    fn test_parse_coordinator_validate_transition_args() {
+        let args = vec![
+            "--from".to_string(),
+            "todo".to_string(),
+            "--to".to_string(),
+            "claimed".to_string(),
+        ];
+        let (from, to) = parse_coordinator_validate_transition_args(&args).unwrap();
+        assert_eq!(from, WorkflowState::Todo);
+        assert_eq!(to, WorkflowState::Claimed);
+    }
+
+    #[test]
+    fn test_validate_coordinator_transition_action_rejects_invalid() {
+        let args = vec![
+            "--from".to_string(),
+            "todo".to_string(),
+            "--to".to_string(),
+            "merged".to_string(),
+        ];
+        let err = validate_coordinator_transition_action(&args).unwrap_err();
+        assert!(err.to_string().contains("invalid transition"));
     }
 
     #[test]

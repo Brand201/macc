@@ -8,7 +8,7 @@ use macc_core::resolve::{resolve, resolve_fetch_units, CliOverrides};
 use macc_core::tool::{ActionKind, FieldDefault, FieldKind, ToolDescriptor, ToolField};
 use macc_core::{find_project_root, Engine, ProjectPaths};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -100,12 +100,22 @@ pub struct CoordinatorActiveTask {
     pub tool: String,
     pub worktree: String,
     pub updated_at: String,
+    pub runtime_status: String,
+    pub current_phase: String,
+    pub last_error: String,
+    pub last_heartbeat: String,
 }
 
 struct CoordinatorProcess {
     action: String,
     child: Child,
     started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoordinatorPauseNextAction {
+    RetryPhaseAndRun,
+    ResumeRun,
 }
 
 pub struct AppState {
@@ -159,6 +169,10 @@ pub struct AppState {
     pub coordinator_last_refresh: Option<Instant>,
     pub coordinator_running_action: Option<String>,
     pub coordinator_last_result: Option<String>,
+    pub coordinator_pause_error: Option<String>,
+    pub coordinator_pause_action: Option<String>,
+    pub coordinator_pause_task_id: Option<String>,
+    pub coordinator_pause_phase: Option<String>,
     pub coordinator_spinner_tick: u64,
     pub coordinator_events: Vec<String>,
     pub coordinator_events_last_refresh: Option<Instant>,
@@ -170,6 +184,7 @@ pub struct AppState {
     pub undo_stack: Vec<CanonicalConfig>,
     pub redo_stack: Vec<CanonicalConfig>,
     coordinator_process: Option<CoordinatorProcess>,
+    coordinator_pause_next_action: Option<CoordinatorPauseNextAction>,
 }
 
 impl AppState {
@@ -242,6 +257,10 @@ impl AppState {
             coordinator_last_refresh: None,
             coordinator_running_action: None,
             coordinator_last_result: None,
+            coordinator_pause_error: None,
+            coordinator_pause_action: None,
+            coordinator_pause_task_id: None,
+            coordinator_pause_phase: None,
             coordinator_spinner_tick: 0,
             coordinator_events: Vec::new(),
             coordinator_events_last_refresh: None,
@@ -253,6 +272,7 @@ impl AppState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             coordinator_process: None,
+            coordinator_pause_next_action: None,
         };
 
         state.refresh_tools();
@@ -495,6 +515,30 @@ impl AppState {
                 .and_then(|v| v.as_str())
                 .unwrap_or("-")
                 .to_string();
+            let runtime_status = task
+                .get("task_runtime")
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string();
+            let current_phase = task
+                .get("task_runtime")
+                .and_then(|v| v.get("current_phase"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string();
+            let last_error = task
+                .get("task_runtime")
+                .and_then(|v| v.get("last_error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let last_heartbeat = task
+                .get("task_runtime")
+                .and_then(|v| v.get("last_heartbeat"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string();
             match state.as_str() {
                 "todo" => snapshot.todo += 1,
                 "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued" => {
@@ -505,6 +549,10 @@ impl AppState {
                         tool,
                         worktree,
                         updated_at,
+                        runtime_status,
+                        current_phase,
+                        last_error,
+                        last_heartbeat,
                     });
                 }
                 "blocked" => snapshot.blocked += 1,
@@ -546,6 +594,21 @@ impl AppState {
                 | "performer_complete"
                 | "task_blocked"
                 | "dispatch_complete"
+                | "started"
+                | "progress"
+                | "phase_result"
+                | "commit_created"
+                | "review_done"
+                | "integrate_done"
+                | "failed"
+                | "heartbeat"
+                | "task_runtime_retry"
+                | "task_runtime_requeue"
+                | "task_runtime_stale"
+                | "phase_retry"
+                | "phase_skipped"
+                | "events_rotated"
+                | "events_compacted"
         )
     }
 
@@ -577,7 +640,8 @@ impl AppState {
                         .unwrap_or("")
                         .to_string();
                     let event = v
-                        .get("event")
+                        .get("type")
+                        .or_else(|| v.get("event"))
                         .and_then(|x| x.as_str())
                         .unwrap_or("event")
                         .to_string();
@@ -586,8 +650,10 @@ impl AppState {
                     }
                     let msg = v
                         .get("msg")
+                        .or_else(|| v.get("payload").and_then(|p| p.get("message")))
+                        .or_else(|| v.get("payload").and_then(|p| p.get("reason")))
                         .and_then(|x| x.as_str())
-                        .unwrap_or("")
+                        .unwrap_or(event.as_str())
                         .to_string();
                     let task = v
                         .get("task_id")
@@ -596,6 +662,7 @@ impl AppState {
                         .to_string();
                     let state = v
                         .get("state")
+                        .or_else(|| v.get("status"))
                         .and_then(|x| x.as_str())
                         .unwrap_or("")
                         .to_string();
@@ -606,6 +673,14 @@ impl AppState {
                     if !state.is_empty() {
                         rendered.push_str(&format!(" | state={}", state));
                     }
+                    let phase = v
+                        .get("phase")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !phase.is_empty() {
+                        rendered.push_str(&format!(" | phase={}", phase));
+                    }
                     let detail = v
                         .get("detail")
                         .and_then(|x| x.as_str())
@@ -613,6 +688,14 @@ impl AppState {
                         .to_string();
                     if !detail.is_empty() {
                         rendered.push_str(&format!(" | {}", detail));
+                    }
+                    let source = v
+                        .get("source")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !source.is_empty() {
+                        rendered.push_str(&format!(" | src={}", source));
                     }
                     if !ts.is_empty() {
                         rendered.push_str(&format!(" | {}", ts));
@@ -750,7 +833,7 @@ impl AppState {
         Ok(script)
     }
 
-    pub fn start_coordinator_action(&mut self, action: &str) {
+    fn start_coordinator_action_with_args(&mut self, action: &str, args: &[String]) {
         if self.coordinator_process.is_some() {
             self.set_status(
                 UiStatusLevel::Warning,
@@ -759,6 +842,10 @@ impl AppState {
             );
             return;
         }
+        self.coordinator_pause_error = None;
+        self.coordinator_pause_action = None;
+        self.coordinator_pause_task_id = None;
+        self.coordinator_pause_phase = None;
         let Some(paths) = self.project_paths.as_ref() else {
             self.set_status(
                 UiStatusLevel::Error,
@@ -792,6 +879,7 @@ impl AppState {
                 .arg("coordinator")
                 .arg("run")
                 .arg("--no-tui")
+                .args(args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             match cmd.spawn() {
@@ -841,6 +929,7 @@ impl AppState {
         let mut cmd = Command::new(script);
         cmd.current_dir(&root)
             .arg(action)
+            .args(args)
             .env("REPO_DIR", &root)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -875,20 +964,200 @@ impl AppState {
         }
     }
 
+    pub fn start_coordinator_action(&mut self, action: &str) {
+        self.coordinator_pause_next_action = None;
+        self.start_coordinator_action_with_args(action, &[]);
+    }
+
     pub fn stop_coordinator_action(&mut self) {
-        if let Some(mut proc_state) = self.coordinator_process.take() {
-            let _ = proc_state.child.kill();
-            let _ = proc_state.child.wait();
-        }
+        let Some(mut proc_state) = self.coordinator_process.take() else {
+            self.set_status(
+                UiStatusLevel::Warning,
+                "No coordinator process started from this TUI.",
+                Some(Duration::from_secs(4)),
+            );
+            return;
+        };
+
+        let coordinator_pid = proc_state.child.id() as i32;
+        let stop_result = Self::stop_coordinator_process_group_or_tree(coordinator_pid);
+
+        let _ = proc_state.child.kill();
+        let _ = proc_state.child.wait();
+
+        self.coordinator_pause_next_action = None;
         self.coordinator_running_action = None;
-        self.coordinator_last_result = Some("Coordinator process stopped.".to_string());
         self.refresh_coordinator_snapshot();
         self.refresh_coordinator_events();
-        self.set_status(
-            UiStatusLevel::Success,
-            "Coordinator stopped.",
-            Some(Duration::from_secs(4)),
-        );
+        match stop_result {
+            Ok((count, used_group)) => {
+                let mode = if used_group {
+                    "process-group"
+                } else {
+                    "process-tree"
+                };
+                self.coordinator_last_result = Some(format!(
+                    "Coordinator stopped via {} ({} process target(s)).",
+                    mode, count
+                ));
+                self.set_status(
+                    UiStatusLevel::Success,
+                    format!("Coordinator stopped via {}.", mode),
+                    Some(Duration::from_secs(4)),
+                );
+            }
+            Err(err) => {
+                self.coordinator_last_result = Some(format!(
+                    "Coordinator process stopped with fallback: {}",
+                    err
+                ));
+                self.set_status(
+                    UiStatusLevel::Warning,
+                    "Coordinator stopped, but child cleanup may be incomplete.",
+                    Some(Duration::from_secs(6)),
+                );
+            }
+        }
+    }
+
+    fn stop_coordinator_process_group_or_tree(pid: i32) -> Result<(usize, bool), String> {
+        let current_pgid = Self::pgid_for_pid(std::process::id() as i32).unwrap_or(-1);
+        if let Some(target_pgid) = Self::pgid_for_pid(pid) {
+            if target_pgid > 0 && target_pgid != current_pgid {
+                let _ = Self::signal_process_group(target_pgid, "-TERM");
+                std::thread::sleep(Duration::from_millis(800));
+                if Self::pgid_is_alive(target_pgid) {
+                    let _ = Self::signal_process_group(target_pgid, "-KILL");
+                }
+                return Ok((1, true));
+            }
+        }
+
+        let descendants = Self::collect_descendant_pids(pid);
+        let mut targets = descendants;
+        targets.push(pid);
+        targets.sort_unstable();
+        targets.dedup();
+
+        let mut signaled = 0usize;
+        for target in &targets {
+            if Self::signal_pid(*target, "-TERM") {
+                signaled += 1;
+            }
+        }
+
+        for _ in 0..20 {
+            if targets.iter().all(|target| !Self::pid_is_alive(*target)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(120));
+        }
+
+        for target in &targets {
+            if Self::pid_is_alive(*target) {
+                let _ = Self::signal_pid(*target, "-KILL");
+            }
+        }
+        Ok((signaled, false))
+    }
+
+    fn collect_descendant_pids(root_pid: i32) -> Vec<i32> {
+        let mut stack = vec![root_pid];
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+
+        while let Some(pid) = stack.pop() {
+            for child in Self::child_pids(pid) {
+                if !seen.insert(child) {
+                    continue;
+                }
+                out.push(child);
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    fn child_pids(pid: i32) -> Vec<i32> {
+        let output = Command::new("pgrep")
+            .arg("-P")
+            .arg(pid.to_string())
+            .output();
+        let Ok(output) = output else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<i32>().ok())
+            .collect()
+    }
+
+    fn pgid_for_pid(pid: i32) -> Option<i32> {
+        let output = Command::new("ps")
+            .arg("-o")
+            .arg("pgid=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<i32>()
+            .ok()
+    }
+
+    fn signal_process_group(pgid: i32, signal: &str) -> bool {
+        if pgid <= 0 {
+            return false;
+        }
+        Command::new("kill")
+            .arg(signal)
+            .arg(format!("-{}", pgid))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn pgid_is_alive(pgid: i32) -> bool {
+        if pgid <= 0 {
+            return false;
+        }
+        Command::new("kill")
+            .arg("-0")
+            .arg(format!("-{}", pgid))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn signal_pid(pid: i32, signal: &str) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        Command::new("kill")
+            .arg(signal)
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn pid_is_alive(pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     fn ensure_working_copy(&mut self) {
@@ -1038,6 +1307,154 @@ impl AppState {
         self.coordinator_process.is_some()
     }
 
+    pub fn has_coordinator_pause_prompt(&self) -> bool {
+        self.coordinator_pause_error.is_some()
+    }
+
+    fn parse_retry_context_from_events(&self) -> Option<(String, String)> {
+        let path = self.coordinator_events_path()?;
+        let content = std::fs::read_to_string(path).ok()?;
+        for line in content.lines().rev() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parsed: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let task_id = parsed
+                .get("task_id")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string());
+            let status = parsed
+                .get("status")
+                .or_else(|| parsed.get("state"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let event = parsed
+                .get("type")
+                .or_else(|| parsed.get("event"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if !matches!(status, "failed" | "error")
+                && !matches!(event, "task_blocked" | "command_error" | "phase_result")
+            {
+                continue;
+            }
+            let Some(task_id) = task_id else {
+                continue;
+            };
+            let phase = parsed
+                .get("phase")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    let state = parsed
+                        .get("state")
+                        .or_else(|| parsed.get("status"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    match state {
+                        "claimed" | "in_progress" => Some("dev".to_string()),
+                        "pr_open" => Some("review".to_string()),
+                        "changes_requested" => Some("fix".to_string()),
+                        "queued" => Some("integrate".to_string()),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| "dev".to_string());
+            return Some((task_id, phase));
+        }
+        None
+    }
+
+    pub fn retry_after_coordinator_pause(&mut self) {
+        let Some(task_id) = self.coordinator_pause_task_id.clone() else {
+            self.resume_after_coordinator_pause();
+            return;
+        };
+        let phase = self
+            .coordinator_pause_phase
+            .clone()
+            .unwrap_or_else(|| "dev".to_string());
+        let args = vec![
+            "--retry-task".to_string(),
+            task_id,
+            "--retry-phase".to_string(),
+            phase,
+        ];
+        self.coordinator_pause_error = None;
+        self.coordinator_pause_action = None;
+        self.coordinator_pause_task_id = None;
+        self.coordinator_pause_phase = None;
+        self.coordinator_pause_next_action = Some(CoordinatorPauseNextAction::RetryPhaseAndRun);
+        self.start_coordinator_action_with_args("retry-phase", &args);
+    }
+
+    pub fn skip_after_coordinator_pause(&mut self) {
+        let Some(task_id) = self.coordinator_pause_task_id.clone() else {
+            self.resume_after_coordinator_pause();
+            return;
+        };
+        let phase = self
+            .coordinator_pause_phase
+            .clone()
+            .unwrap_or_else(|| "dev".to_string());
+        let args = vec![
+            "--retry-task".to_string(),
+            task_id,
+            "--retry-phase".to_string(),
+            phase,
+            "--skip".to_string(),
+        ];
+        self.coordinator_pause_error = None;
+        self.coordinator_pause_action = None;
+        self.coordinator_pause_task_id = None;
+        self.coordinator_pause_phase = None;
+        self.coordinator_pause_next_action = Some(CoordinatorPauseNextAction::ResumeRun);
+        self.start_coordinator_action_with_args("retry-phase", &args);
+    }
+
+    pub fn open_logs_after_coordinator_pause(&mut self) {
+        self.coordinator_pause_error = None;
+        self.coordinator_pause_action = None;
+        self.coordinator_pause_task_id = None;
+        self.coordinator_pause_phase = None;
+        self.coordinator_pause_next_action = None;
+        self.goto_screen(Screen::Logs);
+        self.refresh_logs();
+        self.set_status(
+            UiStatusLevel::Info,
+            "Opened logs for investigation.",
+            Some(Duration::from_secs(4)),
+        );
+    }
+
+    pub fn resume_after_coordinator_pause(&mut self) {
+        let action = self
+            .coordinator_pause_action
+            .clone()
+            .unwrap_or_else(|| "run".to_string());
+        self.coordinator_pause_error = None;
+        self.coordinator_pause_action = None;
+        self.coordinator_pause_task_id = None;
+        self.coordinator_pause_phase = None;
+        self.start_coordinator_action(&action);
+    }
+
+    pub fn stop_after_coordinator_pause(&mut self) {
+        self.coordinator_pause_error = None;
+        self.coordinator_pause_action = None;
+        self.coordinator_pause_task_id = None;
+        self.coordinator_pause_phase = None;
+        self.coordinator_pause_next_action = None;
+        self.set_status(
+            UiStatusLevel::Warning,
+            "Coordinator paused. Stopped by user.",
+            Some(Duration::from_secs(5)),
+        );
+    }
+
     pub fn coordinator_elapsed_seconds(&self) -> Option<u64> {
         self.coordinator_process
             .as_ref()
@@ -1067,6 +1484,7 @@ impl AppState {
         }
 
         let mut finished_message: Option<(UiStatusLevel, String)> = None;
+        let mut post_success_action: Option<CoordinatorPauseNextAction> = None;
         if let Some(proc_state) = self.coordinator_process.as_mut() {
             match proc_state.child.try_wait() {
                 Ok(Some(status)) => {
@@ -1077,14 +1495,27 @@ impl AppState {
                             UiStatusLevel::Success,
                             format!("Coordinator '{}' finished in {}s.", action, elapsed),
                         ));
+                        post_success_action = self.coordinator_pause_next_action.take();
+                        self.coordinator_pause_error = None;
+                        self.coordinator_pause_action = None;
+                        self.coordinator_pause_task_id = None;
+                        self.coordinator_pause_phase = None;
                     } else {
-                        finished_message = Some((
-                            UiStatusLevel::Error,
-                            format!(
-                                "Coordinator '{}' failed in {}s (status {}).",
-                                action, elapsed, status
-                            ),
-                        ));
+                        let msg = format!(
+                            "Coordinator '{}' failed in {}s (status {}).",
+                            action, elapsed, status
+                        );
+                        finished_message = Some((UiStatusLevel::Error, msg.clone()));
+                        self.coordinator_pause_error = Some(msg);
+                        self.coordinator_pause_action = Some(action);
+                        self.coordinator_pause_next_action = None;
+                        if let Some((task_id, phase)) = self.parse_retry_context_from_events() {
+                            self.coordinator_pause_task_id = Some(task_id);
+                            self.coordinator_pause_phase = Some(phase);
+                        } else {
+                            self.coordinator_pause_task_id = None;
+                            self.coordinator_pause_phase = None;
+                        }
                     }
                     self.coordinator_last_result = Some(
                         finished_message
@@ -1115,6 +1546,12 @@ impl AppState {
                     )));
                     self.coordinator_running_action = None;
                     self.coordinator_process = None;
+                    self.coordinator_pause_error =
+                        Some(format!("Coordinator '{}' polling error: {}", action, err));
+                    self.coordinator_pause_action = Some(action);
+                    self.coordinator_pause_task_id = None;
+                    self.coordinator_pause_phase = None;
+                    self.coordinator_pause_next_action = None;
                     finished_message = Some((
                         UiStatusLevel::Error,
                         "Coordinator polling failed.".to_string(),
@@ -1125,6 +1562,15 @@ impl AppState {
 
         if let Some((level, msg)) = finished_message {
             self.set_status(level, msg, Some(Duration::from_secs(5)));
+        }
+
+        if let Some(next_action) = post_success_action {
+            match next_action {
+                CoordinatorPauseNextAction::RetryPhaseAndRun
+                | CoordinatorPauseNextAction::ResumeRun => {
+                    self.start_coordinator_action("run");
+                }
+            }
         }
 
         let should_refresh_events = self

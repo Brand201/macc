@@ -319,8 +319,10 @@ Coordinator orchestrates the end-to-end automation cycle: it reads the task regi
   - `--max-dispatch`, `--max-parallel`, `--timeout-seconds`
   - `--phase-runner-max-attempts`
   - `--stale-claimed-seconds`, `--stale-in-progress-seconds`, `--stale-changes-requested-seconds`, `--stale-action`
+  - Runtime stale heartbeat policy via env: `STALE_HEARTBEAT_SECONDS`, `STALE_HEARTBEAT_ACTION=retry|block|requeue`
 - Task registry path is fixed to `.macc/automation/task/task_registry.json`.
 - Coordinator emits event bus lines to `.macc/log/coordinator/events.jsonl` (used by TUI live screen).
+- Realtime orchestrator target design (state model + event contract + rollout): `docs/COORDINATOR_REALTIME.md`.
 - Use `--` to forward raw args directly to `coordinator.sh`.
 
 ## TUI overview
@@ -426,6 +428,7 @@ Performer session management is project-level, tool-aware, and lease-based:
 
 - `docs/README.md`: documentation index (active vs historical docs).
 - `MACC.md`: full architecture/specification.
+- `docs/COORDINATOR_REALTIME.md`: short design doc for event-driven coordinator evolution.
 - `CHANGELOG.md`: release notes by version (Keep a Changelog format).
 - `SECURITY.md`: vulnerability disclosure and supported version policy.
 - `docs/CONFIG.md`: canonical config schema and semantics.

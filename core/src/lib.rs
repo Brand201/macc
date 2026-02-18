@@ -1,6 +1,7 @@
 pub mod automation;
 pub mod catalog;
 pub mod config;
+pub mod coordinator;
 pub mod doctor;
 pub mod engine;
 pub use config::migrate;

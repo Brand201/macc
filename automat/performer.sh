@@ -21,6 +21,13 @@ registry=""
 prd=""
 performer_log_dir=""
 task_log_file=""
+EVENT_FILE="${COORD_EVENTS_FILE:-}"
+EVENT_SOURCE="${MACC_EVENT_SOURCE:-}"
+EVENT_TASK_ID="${MACC_EVENT_TASK_ID:-}"
+EVENT_RUN_ID="$(date +%s%N)-$$"
+EVENT_SEQ=0
+HEARTBEAT_PID=""
+CURRENT_PHASE="dev"
 
 PERFORMER_MAX_ITERATIONS="${PERFORMER_MAX_ITERATIONS:-50}"
 PERFORMER_TOOL_MAX_ATTEMPTS="${PERFORMER_TOOL_MAX_ATTEMPTS:-2}"
@@ -70,6 +77,22 @@ if [[ ! -f "$tool_json" ]]; then
   exit 1
 fi
 
+if [[ -z "$EVENT_SOURCE" ]]; then
+  EVENT_SOURCE="performer:${tool}:${EVENT_RUN_ID}"
+fi
+if [[ -z "$EVENT_TASK_ID" ]]; then
+  EVENT_TASK_ID="$task_id"
+fi
+
+on_exit() {
+  local rc=$?
+  heartbeat_stop
+  if [[ "$rc" -ne 0 ]]; then
+    emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(jq -nc --arg code "$rc" '{exit_code:($code|tonumber?)}')"
+  fi
+}
+trap on_exit EXIT
+
 performer_log_dir="${worktree}/.macc/log/performer"
 mkdir -p "$performer_log_dir"
 
@@ -103,6 +126,65 @@ log_task_line() {
   local msg="$1"
   if [[ -n "$task_log_file" ]]; then
     printf '%s\n' "$msg" >>"$task_log_file"
+  fi
+}
+
+emit_performer_event() {
+  local event_type="$1"
+  local phase="${2:-}"
+  local status="${3:-}"
+  local payload_json="${4:-{}}"
+  [[ -n "$EVENT_FILE" ]] || return 0
+  [[ -n "$EVENT_SOURCE" ]] || EVENT_SOURCE="performer:${tool}:${EVENT_RUN_ID}"
+  [[ -n "$EVENT_TASK_ID" ]] || EVENT_TASK_ID="$task_id"
+  EVENT_SEQ=$((EVENT_SEQ + 1))
+  if ! jq -e 'type == "object"' <<<"$payload_json" >/dev/null 2>&1; then
+    payload_json="$(jq -nc --arg value "$payload_json" '{value:$value}')"
+  fi
+  jq -nc \
+    --arg schema_version "1" \
+    --arg event_id "${EVENT_TASK_ID}-${EVENT_SEQ}-$(date +%s%N)" \
+    --argjson seq "$EVENT_SEQ" \
+    --arg ts "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    --arg source "$EVENT_SOURCE" \
+    --arg task_id "$EVENT_TASK_ID" \
+    --arg type "$event_type" \
+    --arg phase "$phase" \
+    --arg status "$status" \
+    --argjson payload "$payload_json" \
+    '{
+      schema_version:$schema_version,
+      event_id:$event_id,
+      seq:$seq,
+      ts:$ts,
+      source:$source,
+      task_id:$task_id,
+      type:$type,
+      phase:($phase|select(length>0)),
+      status:$status,
+      payload:$payload,
+      event:$type,
+      state:$status
+    }' >>"$EVENT_FILE" 2>/dev/null || true
+}
+
+heartbeat_start() {
+  [[ -n "$EVENT_FILE" ]] || return 0
+  heartbeat_stop
+  (
+    while true; do
+      emit_performer_event "heartbeat" "$CURRENT_PHASE" "running" '{}'
+      sleep 2
+    done
+  ) &
+  HEARTBEAT_PID=$!
+}
+
+heartbeat_stop() {
+  if [[ -n "${HEARTBEAT_PID:-}" ]]; then
+    kill "$HEARTBEAT_PID" >/dev/null 2>&1 || true
+    wait "$HEARTBEAT_PID" >/dev/null 2>&1 || true
+    HEARTBEAT_PID=""
   fi
 }
 
@@ -257,6 +339,7 @@ run_tool() {
   log_task_line ""
   log_task_line '```text'
   set +e
+  emit_performer_event "progress" "$CURRENT_PHASE" "running" "$(jq -nc --arg attempt "$attempt" --arg max "$max_attempts" '{attempt:($attempt|tonumber?), max_attempts:($max|tonumber?)}')"
   spinner_start "Running ${tool} (attempt ${attempt}/${max_attempts})"
   "$script" \
     --prompt-file "$prompt_file" \
@@ -269,6 +352,11 @@ run_tool() {
   local status=$?
   spinner_stop "Runner finished (${tool})"
   set -e
+  if [[ "$status" -eq 0 ]]; then
+    emit_performer_event "phase_result" "$CURRENT_PHASE" "done" "$(jq -nc --arg attempt "$attempt" '{attempt:($attempt|tonumber?)}')"
+  else
+    emit_performer_event "phase_result" "$CURRENT_PHASE" "failed" "$(jq -nc --arg attempt "$attempt" --arg status "$status" '{attempt:($attempt|tonumber?), exit_status:($status|tonumber?)}')"
+  fi
   log_task_line '```'
   log_task_line ""
   log_task_line "- Exit status: ${status}"
@@ -287,6 +375,9 @@ commit_changes() {
       msg="feat: ${last_id} - ${last_title}"
     fi
     git commit -m "$msg"
+    local sha
+    sha="$(git rev-parse HEAD 2>/dev/null || true)"
+    emit_performer_event "commit_created" "$CURRENT_PHASE" "done" "$(jq -nc --arg sha "$sha" --arg message "$msg" '{sha:$sha, message:$message}')"
     echo "Committed changes: $msg"
   else
     echo "No changes to commit."
@@ -295,10 +386,13 @@ commit_changes() {
 
 last_id=""
 last_title=""
+emit_performer_event "started" "$CURRENT_PHASE" "started" "$(jq -nc --arg tool "$tool" --arg worktree "$worktree" '{tool:$tool, worktree:$worktree}')"
+heartbeat_start
 
 for ((i=1; i<=PERFORMER_MAX_ITERATIONS; i++)); do
   next_task_json="$(get_next_task_json)"
   if [[ -z "$next_task_json" ]]; then
+    emit_performer_event "phase_result" "$CURRENT_PHASE" "done" '{}'
     commit_changes "$last_id" "$last_title"
     exit 0
   fi
@@ -313,6 +407,7 @@ for ((i=1; i<=PERFORMER_MAX_ITERATIONS; i++)); do
   log_task_line "- Started: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   log_task_line ""
   echo "Performer: task ${next_id} (${tool})"
+  emit_performer_event "progress" "$CURRENT_PHASE" "running" "$(jq -nc --arg task "$next_id" --arg title "$next_title" '{task_id:$task, title:$title}')"
 
   prompt_file="$(mktemp)"
   build_prompt "$next_task_json" "$next_id" "$next_title" >"$prompt_file"
@@ -333,6 +428,7 @@ for ((i=1; i<=PERFORMER_MAX_ITERATIONS; i++)); do
   done
   if [[ "$tool_success" != "true" ]]; then
     rm -f "$prompt_file"
+    emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(jq -nc --arg task "$next_id" '{task_id:$task, reason:"tool execution failed"}')"
     echo "Error: tool execution failed for task ${next_id}" >&2
     exit 1
   fi
@@ -347,6 +443,7 @@ for ((i=1; i<=PERFORMER_MAX_ITERATIONS; i++)); do
   last_title="$next_title"
 
   if [[ "$(pending_task_count)" -eq 0 ]]; then
+    emit_performer_event "phase_result" "$CURRENT_PHASE" "done" "$(jq -nc --arg task "$next_id" '{task_id:$task, final:true}')"
     commit_changes "$last_id" "$last_title"
     exit 0
   fi
