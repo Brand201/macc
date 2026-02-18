@@ -616,6 +616,8 @@ impl AppState {
                 | "task_runtime_retry"
                 | "task_runtime_requeue"
                 | "task_runtime_stale"
+                | "task_retry_count"
+                | "task_slo_warning"
                 | "phase_retry"
                 | "phase_skipped"
                 | "events_rotated"

@@ -39,6 +39,11 @@ COORDINATOR_MERGE_FIX_HOOK="${COORDINATOR_MERGE_FIX_HOOK:-}" # optional hook inv
 EVENT_LOG_MAX_BYTES="${EVENT_LOG_MAX_BYTES:-5242880}" # rotate events.jsonl when above this size
 EVENT_LOG_KEEP_FILES="${EVENT_LOG_KEEP_FILES:-5}" # number of rotated event files to keep
 PROCESSED_EVENT_IDS_MAX="${PROCESSED_EVENT_IDS_MAX:-10000}" # max dedup IDs retained in registry
+SLO_DEV_SECONDS="${SLO_DEV_SECONDS:-0}" # 0 disables; warn when dev runtime exceeds this value
+SLO_REVIEW_SECONDS="${SLO_REVIEW_SECONDS:-300}" # 0 disables
+SLO_INTEGRATE_SECONDS="${SLO_INTEGRATE_SECONDS:-0}" # 0 disables
+SLO_WAIT_SECONDS="${SLO_WAIT_SECONDS:-0}" # 0 disables
+SLO_RETRIES_MAX="${SLO_RETRIES_MAX:-0}" # 0 disables
 
 ENABLED_TOOLS_JSON="[]"
 TOOL_PRIORITY_JSON="[]"
@@ -255,6 +260,11 @@ Env vars:
   EVENT_LOG_MAX_BYTES           Rotate .macc/log/coordinator/events.jsonl above this size (default: 5242880)
   EVENT_LOG_KEEP_FILES          Keep this many rotated event log files (default: 5)
   PROCESSED_EVENT_IDS_MAX       Max dedup IDs retained in registry before compaction (default: 10000)
+  SLO_DEV_SECONDS               Warn when dev_s exceeds this threshold (0 disables)
+  SLO_REVIEW_SECONDS            Warn when review_s exceeds this threshold (default: 300, 0 disables)
+  SLO_INTEGRATE_SECONDS         Warn when integrate_s exceeds this threshold (0 disables)
+  SLO_WAIT_SECONDS              Warn when wait_s exceeds this threshold (0 disables)
+  SLO_RETRIES_MAX               Warn when retries exceeds this threshold (0 disables)
 
 Unlock:
   ./coordinator.sh unlock --task <task_id> [--unlock-state blocked|todo]
@@ -511,6 +521,19 @@ status_summary() {
     | to_entries[]
     | "  \(.key) -> \(.value.task_id)"
   ' "$TASK_REGISTRY_FILE"
+  local slo_warn_count
+  slo_warn_count="$(jq -r '
+    (.tasks // [])
+    | map(((.task_runtime.slo_warnings // {}) | length))
+    | add // 0
+  ' "$TASK_REGISTRY_FILE")"
+  note "SLO warnings: ${slo_warn_count}"
+  jq -r '
+    (.tasks // [])[]
+    | .id as $id
+    | ((.task_runtime.slo_warnings // {}) | to_entries[])
+    | "  task=\($id) metric=\(.key) value=\(.value.value // 0) threshold=\(.value.threshold // 0)"
+  ' "$TASK_REGISTRY_FILE"
 }
 
 clear_inactive_worktrees() {
@@ -529,6 +552,7 @@ clear_inactive_worktrees() {
     )
   ' "$TASK_REGISTRY_FILE" >"$tmp"
   mv "$tmp" "$TASK_REGISTRY_FILE"
+  check_task_slo_and_warn "$task_id"
 }
 
 reconcile_registry() {
@@ -645,9 +669,20 @@ sync_registry_from_prd() {
                  status: "idle",
                  pid: null,
                  started_at: null,
+                 phase_started_at: null,
                  last_heartbeat: null,
+                 wait_started_at: null,
                  current_phase: null,
                  attempt: 0,
+                 retries: 0,
+                 metrics: {
+                   dev_s: 0,
+                   review_s: 0,
+                   integrate_s: 0,
+                   wait_s: 0,
+                   retries: 0
+                 },
+                 slo_warnings: {},
                  last_error: null,
                  last_seq: 0,
                  last_event_id: null,
@@ -1018,9 +1053,68 @@ set_task_runtime() {
      --arg attempt "$attempt" \
      --arg now "$now" \
      '
+     def ts_to_epoch($v):
+       if ($v | type) == "string" and ($v | length) > 0 then
+         ($v | fromdateiso8601? // 0)
+       else
+         0
+       end;
+
+     def positive_delta($start; $end):
+       if $start > 0 and $end > $start then ($end - $start) else 0 end;
+
+     def is_active_state($s):
+       ($s == "claimed" or $s == "in_progress" or $s == "pr_open" or $s == "changes_requested" or $s == "queued");
+
+     def should_close_phase($old_phase; $new_phase; $new_status):
+       ($old_phase | length) > 0 and (
+         (($new_phase | length) > 0 and $new_phase != $old_phase)
+         or ($new_status == "phase_done" or $new_status == "failed" or $new_status == "stale" or $new_status == "idle")
+       );
+
      .tasks |= map(
        if .id == $id then
          .task_runtime = (.task_runtime // {})
+         | .task_runtime.metrics = (.task_runtime.metrics // {})
+         | .task_runtime.metrics.dev_s = (.task_runtime.metrics.dev_s // 0)
+         | .task_runtime.metrics.review_s = (.task_runtime.metrics.review_s // 0)
+         | .task_runtime.metrics.integrate_s = (.task_runtime.metrics.integrate_s // 0)
+         | .task_runtime.metrics.wait_s = (.task_runtime.metrics.wait_s // 0)
+         | .task_runtime.metrics.retries = (.task_runtime.metrics.retries // (.task_runtime.retries // 0))
+         | .task_runtime.retries = (.task_runtime.metrics.retries // 0)
+         | .task_runtime.slo_warnings = (.task_runtime.slo_warnings // {})
+         | (ts_to_epoch($now)) as $now_epoch
+         | (.task_runtime.current_phase // "") as $old_phase
+         | (.task_runtime.status // "") as $old_status
+         | (if ($phase | length) > 0 then $phase else $old_phase end) as $new_phase
+         | (.task_runtime.phase_started_at // .task_runtime.started_at // "") as $old_phase_started_at
+         | (ts_to_epoch($old_phase_started_at)) as $old_phase_started_epoch
+         | (positive_delta($old_phase_started_epoch; $now_epoch)) as $phase_elapsed
+         | (if should_close_phase($old_phase; $new_phase; $runtime_status) then
+              if $old_phase == "dev" then
+                .task_runtime.metrics.dev_s = ((.task_runtime.metrics.dev_s // 0) + $phase_elapsed)
+              elif $old_phase == "review" then
+                .task_runtime.metrics.review_s = ((.task_runtime.metrics.review_s // 0) + $phase_elapsed)
+              elif $old_phase == "integrate" then
+                .task_runtime.metrics.integrate_s = ((.task_runtime.metrics.integrate_s // 0) + $phase_elapsed)
+              else
+                .
+              end
+            else
+              .
+            end)
+         | (.state // "") as $task_state
+         | (.task_runtime.wait_started_at // "") as $old_wait_started_at
+         | (ts_to_epoch($old_wait_started_at)) as $old_wait_started_epoch
+         | (positive_delta($old_wait_started_epoch; $now_epoch)) as $wait_elapsed
+         | (if ($old_wait_started_at | length) > 0 and ($runtime_status == "running" or $runtime_status == "idle" or $runtime_status == "failed" or $runtime_status == "stale") then
+              .task_runtime.metrics.wait_s = ((.task_runtime.metrics.wait_s // 0) + $wait_elapsed)
+              | .task_runtime.wait_started_at = null
+            elif (($old_wait_started_at | length) == 0 and is_active_state($task_state) and ($runtime_status != "running") and ($runtime_status != "idle")) then
+              .task_runtime.wait_started_at = $now
+            else
+              .
+            end)
          | .task_runtime.status = $runtime_status
          | (if ($phase|length) > 0 then .task_runtime.current_phase = $phase else . end)
          | (if ($pid|length) > 0 then
@@ -1033,6 +1127,16 @@ set_task_runtime() {
          | (if ($last_error|length) > 0 then .task_runtime.last_error = $last_error else . end)
          | (if ($heartbeat_ts|length) > 0 then .task_runtime.last_heartbeat = $heartbeat_ts else . end)
          | (if ($attempt|length) > 0 then .task_runtime.attempt = ($attempt|tonumber?) else . end)
+         | (if (
+              (($phase|length) > 0 and $runtime_status == "running" and ($phase != $old_phase or $old_status != "running"))
+              or ($runtime_status == "running" and ((.task_runtime.phase_started_at // "") | length) == 0)
+            ) then
+              .task_runtime.phase_started_at = $now
+            elif ($runtime_status == "idle" or $runtime_status == "phase_done" or $runtime_status == "failed" or $runtime_status == "stale") then
+              .task_runtime.phase_started_at = null
+            else
+              .
+            end)
          | (if ($runtime_status == "running" and ((.task_runtime.started_at // "") | length) == 0) then
               .task_runtime.started_at = $now
             else
@@ -1046,6 +1150,126 @@ set_task_runtime() {
      ' "$TASK_REGISTRY_FILE" >"$tmp"
 
   mv "$tmp" "$TASK_REGISTRY_FILE"
+  check_task_slo_and_warn "$task_id"
+}
+
+increment_task_retries() {
+  local task_id="$1"
+  local reason="${2:-retry}"
+  task_exists "$task_id" || return 0
+  local tmp now
+  now="$(now_iso)"
+  tmp="$(mktemp)"
+  jq --arg id "$task_id" \
+     --arg now "$now" \
+     '
+     .tasks |= map(
+       if .id == $id then
+         .task_runtime = (.task_runtime // {})
+         | .task_runtime.metrics = (.task_runtime.metrics // {})
+         | .task_runtime.metrics.retries = ((.task_runtime.metrics.retries // (.task_runtime.retries // 0)) + 1)
+         | .task_runtime.retries = (.task_runtime.metrics.retries // 0)
+       else
+         .
+       end
+     )
+     | .updated_at = $now
+     ' "$TASK_REGISTRY_FILE" >"$tmp"
+  mv "$tmp" "$TASK_REGISTRY_FILE"
+  emit_event "task_retry_count" "Incremented task retry counter" "$task_id" "" "reason=${reason}"
+  check_task_slo_and_warn "$task_id"
+}
+
+upsert_task_slo_warning() {
+  local task_id="$1"
+  local metric="$2"
+  local threshold="$3"
+  local value="$4"
+  local suggestion="$5"
+  local now tmp
+  now="$(now_iso)"
+  tmp="$(mktemp)"
+  jq --arg id "$task_id" \
+     --arg metric "$metric" \
+     --arg suggestion "$suggestion" \
+     --arg now "$now" \
+     --argjson threshold "$threshold" \
+     --argjson value "$value" \
+     '
+     .tasks |= map(
+       if .id == $id then
+         .task_runtime = (.task_runtime // {})
+         | .task_runtime.slo_warnings = (.task_runtime.slo_warnings // {})
+         | .task_runtime.slo_warnings[$metric] = {
+             metric: $metric,
+             threshold: $threshold,
+             value: $value,
+             warned_at: $now,
+             suggestion: $suggestion
+           }
+       else
+         .
+       end
+     )
+     | .updated_at = $now
+     ' "$TASK_REGISTRY_FILE" >"$tmp"
+  mv "$tmp" "$TASK_REGISTRY_FILE"
+}
+
+maybe_warn_task_metric() {
+  local task_id="$1"
+  local metric="$2"
+  local threshold="$3"
+  local suggestion="$4"
+  [[ "$threshold" =~ ^[0-9]+$ ]] || return 0
+  [[ "$threshold" -gt 0 ]] || return 0
+
+  local value warned
+  value="$(jq -r --arg id "$task_id" --arg metric "$metric" '
+    (.tasks // [])
+    | map(select(.id == $id))
+    | .[0]
+    | (
+        if ($metric == "retries") then
+          (.task_runtime.retries // .task_runtime.metrics.retries // 0)
+        else
+          (.task_runtime.metrics[$metric] // 0)
+        end
+      )
+  ' "$TASK_REGISTRY_FILE" 2>/dev/null || echo 0)"
+  warned="$(jq -r --arg id "$task_id" --arg metric "$metric" '
+    (.tasks // [])
+    | map(select(.id == $id))
+    | .[0]
+    | ((.task_runtime.slo_warnings // {})[$metric] != null)
+  ' "$TASK_REGISTRY_FILE" 2>/dev/null || echo false)"
+
+  [[ "$value" =~ ^[0-9]+$ ]] || value=0
+  if [[ "$value" -gt "$threshold" && "$warned" != "true" ]]; then
+    local unit
+    if [[ "$metric" == "retries" ]]; then
+      unit=""
+    else
+      unit="s"
+    fi
+    upsert_task_slo_warning "$task_id" "$metric" "$threshold" "$value" "$suggestion"
+    emit_event "task_slo_warning" \
+      "Task exceeded SLO threshold" \
+      "$task_id" \
+      "$(task_state "$task_id")" \
+      "metric=${metric} value=${value} threshold=${threshold} action=${suggestion}"
+    note "SLO warning ${task_id}: ${metric}=${value}${unit} threshold=${threshold}${unit}. Suggestion: ${suggestion}"
+  fi
+}
+
+check_task_slo_and_warn() {
+  local task_id="$1"
+  task_exists "$task_id" || return 0
+  maybe_warn_task_metric "$task_id" "dev_s" "$SLO_DEV_SECONDS" "Check performer logs and split implementation scope before retrying dev phase."
+  maybe_warn_task_metric "$task_id" "review_s" "$SLO_REVIEW_SECONDS" "Run macc coordinator retry-phase --retry-task ${task_id} --retry-phase review after fixing review blockers."
+  maybe_warn_task_metric "$task_id" "integrate_s" "$SLO_INTEGRATE_SECONDS" "Inspect merge logs and retry integrate phase or run merge worker manually."
+  maybe_warn_task_metric "$task_id" "wait_s" "$SLO_WAIT_SECONDS" "Check queue capacity/dependencies and run macc coordinator reconcile."
+  maybe_warn_task_metric "$task_id" "retries" "$SLO_RETRIES_MAX" "Inspect repeated failures and consider manual intervention or task decomposition."
 }
 
 pid_is_running() {
@@ -1350,6 +1574,20 @@ apply_runtime_event() {
                     | (if ($phase|length) > 0 then .task_runtime.current_phase = $phase else . end)
                     | (if heartbeat_ts != null then .task_runtime.last_heartbeat = heartbeat_ts else . end)
                     | (if payload_attempt != null then .task_runtime.attempt = payload_attempt else . end)
+                    | .task_runtime.metrics = (.task_runtime.metrics // {})
+                    | .task_runtime.metrics.retries = (.task_runtime.metrics.retries // (.task_runtime.retries // 0))
+                    | (if payload_attempt != null and payload_attempt > 1 then
+                         .task_runtime.metrics.retries = (
+                           if (.task_runtime.metrics.retries // 0) > (payload_attempt - 1) then
+                             (.task_runtime.metrics.retries // 0)
+                           else
+                             (payload_attempt - 1)
+                           end
+                         )
+                       else
+                         .
+                       end)
+                    | .task_runtime.retries = (.task_runtime.metrics.retries // 0)
                     | (if ($runtime_status == "failed" and (payload_error|length) > 0) then
                          .task_runtime.last_error = payload_error
                        else
@@ -1485,6 +1723,7 @@ cleanup_stale_tasks() {
 
       case "$STALE_HEARTBEAT_ACTION" in
         retry)
+          increment_task_retries "$task_id" "stale_heartbeat_retry"
           set_task_runtime "$task_id" "dispatched" "" "" "stale heartbeat (${age}s)" "$(now_iso)"
           emit_event "task_runtime_retry" "Runtime stale heartbeat; retry requested" "$task_id" "dispatched" "age=${age}s"
           ;;
@@ -2459,6 +2698,8 @@ retry_failed_phase() {
     return 1
   }
 
+  increment_task_retries "$task_id" "manual_retry_phase:${phase}"
+
   case "$phase" in
     dev)
       if [[ "$current" == "blocked" || "$current" == "todo" ]]; then
@@ -3049,6 +3290,26 @@ main() {
   }
   [[ "$PROCESSED_EVENT_IDS_MAX" =~ ^[0-9]+$ ]] || {
     echo "Error: PROCESSED_EVENT_IDS_MAX must be a non-negative integer: $PROCESSED_EVENT_IDS_MAX" >&2
+    exit 1
+  }
+  [[ "$SLO_DEV_SECONDS" =~ ^[0-9]+$ ]] || {
+    echo "Error: SLO_DEV_SECONDS must be a non-negative integer: $SLO_DEV_SECONDS" >&2
+    exit 1
+  }
+  [[ "$SLO_REVIEW_SECONDS" =~ ^[0-9]+$ ]] || {
+    echo "Error: SLO_REVIEW_SECONDS must be a non-negative integer: $SLO_REVIEW_SECONDS" >&2
+    exit 1
+  }
+  [[ "$SLO_INTEGRATE_SECONDS" =~ ^[0-9]+$ ]] || {
+    echo "Error: SLO_INTEGRATE_SECONDS must be a non-negative integer: $SLO_INTEGRATE_SECONDS" >&2
+    exit 1
+  }
+  [[ "$SLO_WAIT_SECONDS" =~ ^[0-9]+$ ]] || {
+    echo "Error: SLO_WAIT_SECONDS must be a non-negative integer: $SLO_WAIT_SECONDS" >&2
+    exit 1
+  }
+  [[ "$SLO_RETRIES_MAX" =~ ^[0-9]+$ ]] || {
+    echo "Error: SLO_RETRIES_MAX must be a non-negative integer: $SLO_RETRIES_MAX" >&2
     exit 1
   }
   case "$STALE_HEARTBEAT_ACTION" in
