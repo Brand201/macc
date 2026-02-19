@@ -36,18 +36,6 @@ pub struct ToolPerformerPrompt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolCapabilityContractSpec {
-    #[serde(default)]
-    pub strict: bool,
-    #[serde(default)]
-    pub available_tools: Vec<String>,
-    #[serde(default)]
-    pub fail_fast_patterns: Vec<String>,
-    #[serde(default)]
-    pub notes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolPerformerSessionSpec {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -75,8 +63,6 @@ pub struct ToolPerformerSpec {
     pub retry: Option<ToolPerformerCommand>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<ToolPerformerPrompt>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capability_contract: Option<ToolCapabilityContractSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<ToolPerformerSessionSpec>,
 }
@@ -439,14 +425,6 @@ impl ToolSpec {
                     )));
                 }
             }
-            if let Some(contract) = &performer.capability_contract {
-                if contract.strict && contract.available_tools.is_empty() {
-                    return Err(MaccError::Validation(format!(
-                        "Performer capability_contract.available_tools must be non-empty when strict=true for tool '{}'",
-                        self.id
-                    )));
-                }
-            }
             if let Some(session) = &performer.session {
                 if let Some(scope) = &session.scope {
                     if scope != "project" && scope != "worktree" {
@@ -722,52 +700,6 @@ mod tests {
         };
 
         assert!(spec.validate().is_err());
-    }
-
-    #[test]
-    fn test_performer_capability_contract_validation() {
-        let mut spec = ToolSpec {
-            api_version: "v1".to_string(),
-            id: "test-tool".to_string(),
-            display_name: "Test Tool".to_string(),
-            description: None,
-            capabilities: vec![],
-            fields: vec![],
-            doctor: None,
-            gitignore: Vec::new(),
-            performer: Some(ToolPerformerSpec {
-                runner: "adapters/test.performer.sh".to_string(),
-                command: "test-cli".to_string(),
-                args: vec![],
-                retry: None,
-                prompt: Some(ToolPerformerPrompt {
-                    mode: "stdin".to_string(),
-                    arg: None,
-                }),
-                capability_contract: Some(ToolCapabilityContractSpec {
-                    strict: true,
-                    available_tools: vec![],
-                    fail_fast_patterns: vec![],
-                    notes: vec![],
-                }),
-                session: None,
-            }),
-            install: None,
-            update: None,
-            version_check: None,
-            defaults: None,
-        };
-
-        assert!(spec.validate().is_err());
-
-        if let Some(performer) = spec.performer.as_mut() {
-            performer
-                .capability_contract
-                .as_mut()
-                .expect("capability contract present")
-                .available_tools = vec!["shell".to_string()];
-        }
-        assert!(spec.validate().is_ok());
     }
 
     #[test]

@@ -13,15 +13,6 @@ performer:
   prompt:
     mode: arg
     arg: "--prompt"
-  capability_contract:
-    strict: true
-    available_tools: [list_directory, read_file, write_file, glob, search_file_content, replace, run_shell_command, web_fetch, google_web_search]
-    fail_fast_patterns:
-      - '(exec_command|apply_patch|write_stdin)[^\\n]*(not found|unknown|unsupported|unavailable)'
-      - '(unknown|invalid)[^\\n]*(tool|function)[^\\n]*(exec_command|apply_patch|write_stdin)'
-    notes:
-      - "Use Gemini native tools only."
-      - "Do not call exec_command/apply_patch/write_stdin."
   session:
     enabled: true
     scope: worktree

@@ -10,7 +10,6 @@ Env vars:
   PERFORMER_MAX_ITERATIONS  Max tasks to run before stopping (default: 50)
   PERFORMER_TOOL_MAX_ATTEMPTS Max attempts per task (default: 2)
   PERFORMER_SLEEP_SECONDS   Pause between tasks (default: 2)
-  PERFORMER_CAPABILITY_FAIL_FAST  Fail fast on unavailable tool usage (default: true)
 EOF
 }
 
@@ -37,7 +36,6 @@ PERFORMER_MAX_ITERATIONS="${PERFORMER_MAX_ITERATIONS:-50}"
 PERFORMER_TOOL_MAX_ATTEMPTS="${PERFORMER_TOOL_MAX_ATTEMPTS:-2}"
 PERFORMER_SLEEP_SECONDS="${PERFORMER_SLEEP_SECONDS:-2}"
 PERFORMER_SPINNER="${PERFORMER_SPINNER:-true}"
-PERFORMER_CAPABILITY_FAIL_FAST="${PERFORMER_CAPABILITY_FAIL_FAST:-true}"
 PERFORMER_FAIL_FAST_EXIT_CODE=42
 
 while [[ $# -gt 0 ]]; do
@@ -332,43 +330,6 @@ pending_task_count() {
   jq -r "${JQ_ITEMS} | map(select(.passes != true)) | length" "$prd"
 }
 
-capability_contract_strict() {
-  jq -r '.performer.capability_contract.strict // false' "$tool_json"
-}
-
-capability_contract_has_tools() {
-  jq -e '.performer.capability_contract.available_tools | length > 0' "$tool_json" >/dev/null 2>&1
-}
-
-render_capability_contract() {
-  local strict
-  strict="$(capability_contract_strict)"
-  if [[ "$strict" != "true" ]] && ! capability_contract_has_tools; then
-    return 0
-  fi
-
-  cat <<'EOF'
-Tool Capability Contract (STRICT):
-- Use only the tools listed below.
-- If a required tool is unavailable, stop immediately and output:
-  MACC_CAPABILITY_ERROR: requested_tool=<tool_name> reason=<why>
-- Do not invent tool names and do not retry with unknown tools.
-EOF
-
-  if capability_contract_has_tools; then
-    echo "- Allowed tools:"
-    while IFS= read -r tool_name; do
-      [[ -n "$tool_name" ]] || continue
-      printf "  - %s\n" "$tool_name"
-    done < <(jq -r '.performer.capability_contract.available_tools[]? // empty' "$tool_json")
-  fi
-
-  while IFS= read -r note; do
-    [[ -n "$note" ]] || continue
-    printf -- "- Note: %s\n" "$note"
-  done < <(jq -r '.performer.capability_contract.notes[]? // empty' "$tool_json")
-}
-
 extract_first_match() {
   local pattern="$1"
   local file="$2"
@@ -379,43 +340,48 @@ detect_capability_violation() {
   local output_file="$1"
   CAPABILITY_VIOLATION_REASON=""
   CAPABILITY_VIOLATION_LINE=""
+  local scan_file
+  scan_file="$(mktemp)"
+  if awk '
+      BEGIN { emit = 0 }
+      /^Now implement the task\.$/ { emit = 1; next }
+      emit { print }
+    ' "$output_file" >"$scan_file" && [[ -s "$scan_file" ]]; then
+    :
+  else
+    cp "$output_file" "$scan_file"
+  fi
 
   local line
-  line="$(extract_first_match 'MACC_CAPABILITY_ERROR:' "$output_file" || true)"
-  if [[ -n "$line" ]]; then
+  while IFS= read -r line; do
+    [[ "$line" == *"MACC_CAPABILITY_ERROR:"* ]] || continue
+    # Ignore prompt templates; only accept concrete assistant-emitted errors.
+    if [[ "$line" == *"requested_tool=<tool_name>"* || "$line" == *"reason=<why>"* ]]; then
+      continue
+    fi
     CAPABILITY_VIOLATION_REASON="explicit capability error marker"
     CAPABILITY_VIOLATION_LINE="$line"
+    rm -f "$scan_file"
     return 0
-  fi
-
-  if [[ "${PERFORMER_CAPABILITY_FAIL_FAST}" != "true" ]]; then
-    return 1
-  fi
-
-  while IFS= read -r pattern; do
-    [[ -n "$pattern" ]] || continue
-    line="$(extract_first_match "$pattern" "$output_file" || true)"
-    if [[ -n "$line" ]]; then
-      CAPABILITY_VIOLATION_REASON="matched contract fail-fast pattern"
-      CAPABILITY_VIOLATION_LINE="$line"
-      return 0
-    fi
-  done < <(jq -r '.performer.capability_contract.fail_fast_patterns[]? // empty' "$tool_json")
+  done <"$scan_file"
 
   # Generic fallback to stop retries when a model keeps requesting unavailable tools.
-  line="$(extract_first_match '(unknown|invalid|unsupported|unavailable)[^\\n]*(tool|function)' "$output_file" || true)"
+  line="$(extract_first_match '(unknown|invalid|unsupported|unavailable)[^\\n]*(tool|function)' "$scan_file" || true)"
   if [[ -n "$line" ]]; then
     CAPABILITY_VIOLATION_REASON="generic unavailable tool/function error"
     CAPABILITY_VIOLATION_LINE="$line"
+    rm -f "$scan_file"
     return 0
   fi
-  line="$(extract_first_match '(tool|function)[^\\n]*(not found|unknown|unsupported|unavailable|invalid)' "$output_file" || true)"
+  line="$(extract_first_match '(tool|function)[^\\n]*(not found|unknown|unsupported|unavailable|invalid)' "$scan_file" || true)"
   if [[ -n "$line" ]]; then
     CAPABILITY_VIOLATION_REASON="generic unavailable tool/function error"
     CAPABILITY_VIOLATION_LINE="$line"
+    rm -f "$scan_file"
     return 0
   fi
 
+  rm -f "$scan_file"
   return 1
 }
 
@@ -423,8 +389,6 @@ build_prompt() {
   local task_json="$1"
   local task_id="$2"
   local task_title="$3"
-  local capability_contract
-  capability_contract="$(render_capability_contract)"
   cat <<PROMPT
 You are an autonomous coding agent working inside a MACC worktree.
 
@@ -442,8 +406,6 @@ Instructions:
 2) Do NOT edit ${prd}; the runner will update it.
 3) Do NOT commit; the runner will commit if all tasks are done.
 4) Keep output concise; avoid dumping large files.
-
-${capability_contract}
 
 Now implement the task.
 PROMPT
@@ -511,7 +473,17 @@ commit_changes() {
   local last_title="$2"
 
   if git status --porcelain | awk 'NF' | grep -q .; then
-    git add -A
+    # Never commit coordinator scaffolding artifacts from worktree execution.
+    git add -A -- . ':(exclude)performer.sh' ':(exclude)worktree.prd.json'
+    git reset -q HEAD -- performer.sh worktree.prd.json >/dev/null 2>&1 || true
+    if git diff --cached --quiet; then
+      if git status --porcelain -- performer.sh worktree.prd.json | awk 'NF' | grep -q .; then
+        echo "No committable changes (protected files excluded: performer.sh, worktree.prd.json)."
+      else
+        echo "No changes to commit."
+      fi
+      return 0
+    fi
     local msg="feat: ${last_id}"
     if [[ -n "$last_title" ]]; then
       msg="feat: ${last_id} - ${last_title}"

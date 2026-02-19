@@ -211,6 +211,14 @@ impl ProjectPaths {
         self.automation_dir().join("coordinator.sh")
     }
 
+    pub fn automation_merge_worker_path(&self) -> PathBuf {
+        self.automation_dir().join("merge_worker.sh")
+    }
+
+    pub fn automation_merge_fix_hook_path(&self) -> PathBuf {
+        self.automation_dir().join("hooks").join("ai-merge-fix.sh")
+    }
+
     pub fn automation_runner_path(&self, tool_id: &str) -> PathBuf {
         self.automation_runner_dir()
             .join(format!("{}.performer.sh", tool_id))

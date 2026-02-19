@@ -12,15 +12,6 @@ performer:
   prompt:
     mode: arg
     arg: "-p"
-  capability_contract:
-    strict: true
-    available_tools: [Read, Write, Edit, MultiEdit, Bash, Grep, Glob, LS, WebFetch, WebSearch]
-    fail_fast_patterns:
-      - '(run_shell_command|apply_patch|exec_command)[^\\n]*(not found|unknown|unsupported|unavailable)'
-      - '(unknown|invalid)[^\\n]*(tool|function)[^\\n]*(run_shell_command|apply_patch|exec_command)'
-    notes:
-      - "Use Claude internal tools (Bash/Edit/Write/etc.) only."
-      - "Do not call run_shell_command, apply_patch, or exec_command."
   session:
     enabled: true
     scope: worktree
