@@ -156,8 +156,61 @@ in_merge_state() {
   git -C "$REPO_DIR" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1
 }
 
+repo_is_dirty() {
+  git -C "$REPO_DIR" status --porcelain | awk 'NF' | grep -q .
+}
+
 conflicts_csv() {
   git -C "$REPO_DIR" diff --name-only --diff-filter=U 2>/dev/null | paste -sd, -
+}
+
+HOOK_LAST_OUTPUT=""
+run_merge_fix_hook() {
+  local step="$1"
+  local reason="$2"
+  local conflicts="$3"
+  local merge_output="$4"
+  local suggestion="$5"
+  HOOK_LAST_OUTPUT=""
+
+  if [[ "$ALLOW_AI_FIX" != "true" || -z "$MERGE_FIX_HOOK" ]]; then
+    return 1
+  fi
+  if ! hook_allowed "$MERGE_FIX_HOOK"; then
+    HOOK_LAST_OUTPUT="Merge-fix hook rejected by security policy or not executable: ${MERGE_FIX_HOOK}"
+    return 1
+  fi
+
+  set +e
+  HOOK_LAST_OUTPUT="$(
+    REPO_DIR="$REPO_DIR" \
+    TASK_ID="$TASK_ID" \
+    BRANCH="$BRANCH" \
+    BASE_BRANCH="$BASE_BRANCH" \
+    REPORT_FILE="$REPORT_FILE" \
+    MACC_MERGE_FAILURE_STEP="$step" \
+    MACC_MERGE_FAILURE_REASON="$reason" \
+    MACC_MERGE_FAILURE_CONFLICTS="$conflicts" \
+    MACC_MERGE_FAILURE_OUTPUT="$merge_output" \
+    MACC_MERGE_SUGGESTION="$suggestion" \
+    MACC_MERGE_REPORT_FILE="$REPORT_FILE" \
+    "$MERGE_FIX_HOOK" \
+      --repo "$REPO_DIR" \
+      --task-id "$TASK_ID" \
+      --branch "$BRANCH" \
+      --base-branch "$BASE_BRANCH" \
+      --failure-step "$step" \
+      --failure-reason "$reason" \
+      --conflicts "$conflicts" \
+      --report-file "$REPORT_FILE" 2>&1
+  )"
+  local hook_rc=$?
+  set -e
+  if [[ "$hook_rc" -ne 0 ]]; then
+    HOOK_LAST_OUTPUT="${HOOK_LAST_OUTPUT}\nHook exit status: ${hook_rc}"
+    return 1
+  fi
+  return 0
 }
 
 suggestion_cmd="git checkout ${BASE_BRANCH} && git merge ${BRANCH}"
@@ -174,11 +227,24 @@ if ! git -C "$REPO_DIR" rev-parse --verify "$BASE_BRANCH" >/dev/null 2>&1; then
   write_result "failed" "$err" "" "base branch not found: ${BASE_BRANCH}" "" "false" "$suggestion_cmd"
   exit 1
 fi
-if git -C "$REPO_DIR" status --porcelain | awk 'NF' | grep -q .; then
+if repo_is_dirty; then
+  precheck_out="repository has uncommitted changes before merge\n$(git -C "$REPO_DIR" status --short 2>&1 || true)"
+  precheck_hook_out=""
+  precheck_reason="repository dirty before merge"
+  if run_merge_fix_hook "precheck_clean" "$precheck_reason" "" "$precheck_out" "$suggestion_cmd"; then
+    precheck_hook_out="$HOOK_LAST_OUTPUT"
+    if repo_is_dirty; then
+      precheck_hook_out="${precheck_hook_out}\nHook returned 0 but repository is still dirty."
+    fi
+  elif [[ -n "$HOOK_LAST_OUTPUT" ]]; then
+    precheck_hook_out="$HOOK_LAST_OUTPUT"
+  fi
+  if repo_is_dirty; then
   err="failure:local_merge step=precheck_clean branch=${BRANCH} base=${BASE_BRANCH} suggestion=\"${suggestion_cmd}\""
-  write_report "$err" "" "repository has uncommitted changes" "" "$suggestion_cmd"
-  write_result "failed" "$err" "" "repository has uncommitted changes" "" "false" "$suggestion_cmd"
+  write_report "$err" "" "$precheck_out" "$precheck_hook_out" "$suggestion_cmd"
+  write_result "failed" "$err" "" "$precheck_out" "$precheck_hook_out" "false" "$suggestion_cmd"
   exit 1
+  fi
 fi
 
 checkout_out="$(git -C "$REPO_DIR" checkout "$BASE_BRANCH" 2>&1)" || {
@@ -203,32 +269,16 @@ conflicts="$(conflicts_csv)"
 hook_out=""
 assisted="false"
 
-if [[ "$ALLOW_AI_FIX" == "true" && -n "$MERGE_FIX_HOOK" ]]; then
-  if hook_allowed "$MERGE_FIX_HOOK"; then
-    set +e
-    hook_out="$(
-      REPO_DIR="$REPO_DIR" \
-      TASK_ID="$TASK_ID" \
-      BRANCH="$BRANCH" \
-      BASE_BRANCH="$BASE_BRANCH" \
-      REPORT_FILE="$REPORT_FILE" \
-      "$MERGE_FIX_HOOK" --repo "$REPO_DIR" --task-id "$TASK_ID" --branch "$BRANCH" --base-branch "$BASE_BRANCH" 2>&1
-    )"
-    hook_rc=$?
-    set -e
-    if [[ "$hook_rc" -eq 0 ]]; then
-      if [[ -z "$(conflicts_csv)" && ! in_merge_state ]]; then
-        assisted="true"
-        write_result "success" "" "" "$merge_out" "$hook_out" "$assisted" "$suggestion_cmd"
-        exit 0
-      fi
-      hook_out="${hook_out}\nHook returned 0 but merge is still unresolved."
-    else
-      hook_out="${hook_out}\nHook exit status: ${hook_rc}"
-    fi
-  else
-    hook_out="Merge-fix hook rejected by security policy or not executable: ${MERGE_FIX_HOOK}"
+if run_merge_fix_hook "merge" "git merge reported conflicts" "$conflicts" "$merge_out" "$suggestion_cmd"; then
+  hook_out="$HOOK_LAST_OUTPUT"
+  if [[ -z "$(conflicts_csv)" && ! in_merge_state ]]; then
+    assisted="true"
+    write_result "success" "" "" "$merge_out" "$hook_out" "$assisted" "$suggestion_cmd"
+    exit 0
   fi
+  hook_out="${hook_out}\nHook returned 0 but merge is still unresolved."
+elif [[ -n "$HOOK_LAST_OUTPUT" ]]; then
+  hook_out="$HOOK_LAST_OUTPUT"
 fi
 
 if in_merge_state; then

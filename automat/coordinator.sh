@@ -57,6 +57,10 @@ COORD_EVENT_SOURCE=""
 EVENT_SEQ_COUNTER=0
 RUN_LOOP_ACTIVE_JOBS=()
 RUN_LOOP_MERGE_JOBS=()
+RUN_BLOCKING_MERGE_FAILED="false"
+RUN_BLOCKING_MERGE_TASK_ID=""
+RUN_BLOCKING_MERGE_ERROR=""
+RUN_BLOCKING_MERGE_REPORT=""
 
 note() {
   local msg="$*"
@@ -1344,6 +1348,80 @@ maybe_warn_task_metric() {
       "metric=${metric} value=${value} threshold=${threshold} action=${suggestion}"
     note "SLO warning ${task_id}: ${metric}=${value}${unit} threshold=${threshold}${unit}. Suggestion: ${suggestion}"
   fi
+}
+
+mark_run_blocking_merge_failure() {
+  local task_id="$1"
+  local merge_error="$2"
+  local report_file="$3"
+  [[ "$COORD_COMMAND_NAME" == "run" ]] || return 0
+  RUN_BLOCKING_MERGE_FAILED="true"
+  RUN_BLOCKING_MERGE_TASK_ID="$task_id"
+  RUN_BLOCKING_MERGE_ERROR="$merge_error"
+  RUN_BLOCKING_MERGE_REPORT="$report_file"
+}
+
+extract_report_file_from_error() {
+  local merge_error="${1:-}"
+  if [[ "$merge_error" =~ report=\"([^\"]+)\" ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  fi
+}
+
+find_blocking_local_merge_task_tsv() {
+  jq -r '
+    (.tasks // [])
+    | map(
+        select(
+          (.state // "") == "blocked"
+          and (
+            (((.reason // "") + " " + (.task_runtime.last_error // "")) | test("failure:local_merge"))
+          )
+        )
+      )
+    | .[0]
+    | if . == null then
+        empty
+      else
+        [
+          (.id // ""),
+          (.task_runtime.last_error // .reason // "failure:local_merge"),
+          (.task_runtime.last_merge_result_file // .task_runtime.merge_result_file // "")
+        ] | @tsv
+      end
+  ' "$TASK_REGISTRY_FILE"
+}
+
+mark_run_blocking_merge_failure_from_registry() {
+  local row task_id merge_error report_file
+  row="$(find_blocking_local_merge_task_tsv)"
+  [[ -n "$row" ]] || return 1
+  IFS=$'\t' read -r task_id merge_error report_file <<<"$row"
+  [[ -n "$task_id" ]] || return 1
+  if [[ -z "$report_file" ]]; then
+    report_file="$(extract_report_file_from_error "$merge_error")"
+  fi
+  mark_run_blocking_merge_failure "$task_id" "$merge_error" "$report_file"
+  return 0
+}
+
+run_should_pause_on_blocking_merge() {
+  [[ "$RUN_BLOCKING_MERGE_FAILED" == "true" ]]
+}
+
+print_blocking_merge_pause_error() {
+  local task_id="${RUN_BLOCKING_MERGE_TASK_ID:-unknown}"
+  local merge_error="${RUN_BLOCKING_MERGE_ERROR:-failure:local_merge}"
+  local report_file="${RUN_BLOCKING_MERGE_REPORT:-}"
+  echo "Error: coordinator paused by blocking merge failure on task ${task_id} (phase=integrate)." >&2
+  echo "Reason: ${merge_error}" >&2
+  if [[ -n "$report_file" ]]; then
+    echo "Merge report: ${report_file}" >&2
+  fi
+  echo "Resolve the merge issue, then run:" >&2
+  echo "  macc coordinator retry-phase --retry-task ${task_id} --retry-phase integrate" >&2
+  echo "After integrate retry succeeds, resume orchestration with:" >&2
+  echo "  macc coordinator run" >&2
 }
 
 check_task_slo_and_warn() {
@@ -2870,10 +2948,10 @@ handle_merge_worker_completion() {
 
   local merge_error
   merge_error="${error:-failure:local_merge branch=${branch} base=${base_branch}}"
-  if [[ -n "$suggestion" ]]; then
+  if [[ -n "$suggestion" && "$merge_error" != *"suggestion="* ]]; then
     merge_error="${merge_error} suggestion=\"${suggestion}\""
   fi
-  if [[ -n "$report_file" ]]; then
+  if [[ -n "$report_file" && "$merge_error" != *"report="* ]]; then
     merge_error="${merge_error} report=\"${report_file}\""
   fi
   transition_task_and_hooks "$task_id" "blocked" "$pr_url" "" "failure:local_merge"
@@ -2884,6 +2962,7 @@ handle_merge_worker_completion() {
   if [[ -n "$report_file" ]]; then
     note "Local merge report (${task_id}): ${report_file}"
   fi
+  mark_run_blocking_merge_failure "$task_id" "$merge_error" "$report_file"
 }
 
 monitor_persisted_merge_results_once() {
@@ -2938,10 +3017,13 @@ retry_failed_phase() {
     return 0
   fi
 
-  local worktree_path tool current rc performer_pid
+  local worktree_path tool current rc performer_pid branch base_branch pr_url
   worktree_path="$(worktree_for_task "$task_id")"
   tool="$(coordinator_phase_tool_for_task "$task_id")"
   current="$(task_state "$task_id")"
+  branch="$(task_worktree_field "$task_id" "branch")"
+  base_branch="$(task_worktree_field "$task_id" "base_branch")"
+  pr_url="$(task_pr_url "$task_id")"
 
   [[ -n "$worktree_path" && -d "$worktree_path" ]] || {
     echo "Error: retry-phase requires an existing worktree for task ${task_id}" >&2
@@ -3005,7 +3087,24 @@ retry_failed_phase() {
       fi
       ;;
     integrate)
+      local runtime_last_error merge_error
+      runtime_last_error="$(task_field "$task_id" '.task_runtime.last_error // ""')"
       emit_event "phase_retry" "Retrying failed phase" "$task_id" "$current" "phase=integrate tool=${tool}" "integrate" "started"
+      if [[ "$current" == "blocked" ]] && [[ "$runtime_last_error" == *"failure:local_merge"* ]] && is_truthy "$COORDINATOR_AUTOMERGE"; then
+        if local_merge_branch_into_base "$task_id" "$branch" "$base_branch"; then
+          transition_task_and_hooks "$task_id" "merged" "$pr_url" "" "manual:retry_phase:integrate_local_merge"
+          set_task_runtime "$task_id" "idle" "" "" "" "$(now_iso)"
+          emit_event "integrate_done" "Integrate phase retried successfully (local merge)" "$task_id" "merged" "tool=${tool}" "integrate" "done"
+          note "Retried integrate phase for task ${task_id} (local merge success)."
+          return 0
+        fi
+        merge_error="${LOCAL_MERGE_LAST_ERROR:-failure:local_merge}"
+        transition_task_and_hooks "$task_id" "blocked" "$pr_url" "" "failure:local_merge"
+        set_task_runtime "$task_id" "failed" "integrate" "" "$merge_error" "$(now_iso)"
+        emit_event "local_merge_failed" "Retry integrate phase failed (local merge)" "$task_id" "blocked" "$merge_error" "integrate" "failed"
+        note "Retried integrate phase for task ${task_id} failed (local merge still blocked)."
+        return 1
+      fi
       if invoke_tool_phase_runner integrate "$task_id" "$worktree_path" "$tool"; then
         local target="queued"
         current="$(task_state "$task_id")"
@@ -3228,14 +3327,33 @@ run_control_plane() {
     cleanup_stale_tasks
     monitor_run_loop_jobs_once
     monitor_run_loop_merge_jobs_once
+    mark_run_blocking_merge_failure_from_registry || true
+    if run_should_pause_on_blocking_merge; then
+      print_blocking_merge_pause_error
+      return 1
+    fi
+
     reconcile_orphan_runtime_tasks
-    dispatch_ready_tasks_nonblocking
     advance_active_tasks
+    monitor_run_loop_merge_jobs_once
+    mark_run_blocking_merge_failure_from_registry || true
+    if run_should_pause_on_blocking_merge; then
+      print_blocking_merge_pause_error
+      return 1
+    fi
+
     reconcile_registry
     cleanup_stale_tasks
     consume_runtime_events_once
     monitor_run_loop_jobs_once
     monitor_run_loop_merge_jobs_once
+    mark_run_blocking_merge_failure_from_registry || true
+    if run_should_pause_on_blocking_merge; then
+      print_blocking_merge_pause_error
+      return 1
+    fi
+
+    dispatch_ready_tasks_nonblocking
 
     local counts total todo active blocked merged
     counts="$(registry_counts_tsv)"
@@ -3592,6 +3710,16 @@ main() {
       }
       [[ -x "$COORDINATOR_MERGE_FIX_HOOK" ]] || {
         echo "Error: COORDINATOR_MERGE_FIX_HOOK is not executable: $COORDINATOR_MERGE_FIX_HOOK" >&2
+        exit 1
+      }
+    fi
+    if [[ "$command" == "run" ]]; then
+      is_truthy "$COORDINATOR_MERGE_AI_FIX" || {
+        echo "Error: coordinator run requires COORDINATOR_MERGE_AI_FIX=true to enforce AI-assisted merge handling." >&2
+        exit 1
+      }
+      [[ -n "$COORDINATOR_MERGE_FIX_HOOK" && -x "$COORDINATOR_MERGE_FIX_HOOK" ]] || {
+        echo "Error: coordinator run requires an executable COORDINATOR_MERGE_FIX_HOOK." >&2
         exit 1
       }
     fi
