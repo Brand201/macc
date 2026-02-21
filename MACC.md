@@ -426,9 +426,10 @@ MCP servers may be provided via remote packages (Git/HTTP) using §8.5. The pack
 ### 12.2 Coordinator + Performer (worktree orchestration)
 
 MACC automation is split into:
-1) `coordinator.sh` (project-level orchestrator): reads PRD, maintains `.macc/automation/task/task_registry.json`, dispatches READY tasks by constraints (`priority`, `dependencies`, `exclusive_resources`, `category`, `id`), and tracks transitions.
-2) `performer.sh` (worktree-level executor): runs in a single worktree and delegates to the tool-specific runner from `.macc/tool.json`.
-3) `runners/<tool>.performer.sh`: tool-specific execution strategy.
+1) Native Rust coordinator control-plane (primary path): reads PRD, maintains `.macc/automation/task/task_registry.json`, dispatches READY tasks by constraints (`priority`, `dependencies`, `exclusive_resources`, `category`, `id`), supervises performers asynchronously, and tracks transitions.
+2) `coordinator.sh` (legacy compatibility wrapper): kept for backward compatibility/non-migrated actions.
+3) `performer.sh` (worktree-level executor): runs in a single worktree and delegates to the tool-specific runner from `.macc/tool.json`.
+4) `runners/<tool>.performer.sh`: tool-specific execution strategy.
 
 Observability:
 - Coordinator and performer runtime logs are centralized in `.macc/log/`:
@@ -473,9 +474,12 @@ Important behavior:
 
 - `macc coordinator` runs full-cycle mode by default (`run`).
 - Full-cycle loop: `sync -> dispatch -> advance -> reconcile -> cleanup` until convergence.
-- `macc coordinator [run|dispatch|advance|sync|status|reconcile|unlock|cleanup]`
+- `macc coordinator [run|dispatch|advance|resume|sync|status|reconcile|unlock|cleanup]`
+- `run`, `dispatch`, `advance`, `reconcile`, and `cleanup` are handled natively in Rust.
+- Worktrees are reused as worker slots (not task-coupled names): once a task is merged, the slot is reset to reference, moved to a fresh branch, refreshed for the new task, then relaunched.
+- New worker worktrees are created only when no reusable slot is available; pool size is bounded by `max_parallel`.
 - CLI options can override YAML settings (`--max-dispatch`, `--max-parallel`, `--timeout-seconds`, etc.).
-- Extra raw args can be passed to the script with `--` (example: `macc coordinator unlock -- --all`).
+- Extra raw args with `--` are for legacy compatibility paths only.
 - Optional VCS automation hook:
   - `COORDINATOR_VCS_HOOK=/path/to/hook.sh`
   - Hook modes called by `advance`: `pr_create`, `review_status`, `ci_status`, `queue_status`, `merge_status`

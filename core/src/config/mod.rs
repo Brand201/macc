@@ -103,6 +103,8 @@ pub struct CoordinatorConfig {
     pub stale_changes_requested_seconds: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_mode: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -478,6 +480,7 @@ automation:
     stale_in_progress_seconds: 1200
     stale_changes_requested_seconds: 1800
     stale_action: blocked
+    storage_mode: dual-write
 "#;
         let config = CanonicalConfig::from_yaml(yaml).expect("Should parse coordinator config");
         let coordinator = config
@@ -509,6 +512,7 @@ automation:
         assert_eq!(coordinator.stale_in_progress_seconds, Some(1200));
         assert_eq!(coordinator.stale_changes_requested_seconds, Some(1800));
         assert_eq!(coordinator.stale_action.as_deref(), Some("blocked"));
+        assert_eq!(coordinator.storage_mode.as_deref(), Some("dual-write"));
 
         let reserialized = config.to_yaml().expect("Should serialize back to yaml");
         let config2 =

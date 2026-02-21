@@ -115,6 +115,7 @@ pub struct HeaderContext<'a> {
     pub config_label: &'a str,
     pub errors: usize,
     pub coordinator_active: bool,
+    pub coordinator_paused: bool,
     pub coordinator_action: Option<&'a str>,
     pub status: Option<(UiStatusLevel, String)>,
     pub width: u16,
@@ -144,6 +145,13 @@ pub fn header_lines(ctx: &HeaderContext<'_>, t: &Theme) -> Vec<Line<'static>> {
         top_line.push(Span::styled(
             format!("[coord:{}]", action),
             Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if ctx.coordinator_paused {
+        top_line.push(Span::raw("  "));
+        top_line.push(Span::styled(
+            "PAUSED (awaiting resume)".to_string(),
+            Style::default().fg(t.bad).add_modifier(Modifier::BOLD),
         ));
     }
 

@@ -4,7 +4,13 @@ use macc_core::catalog::{
     load_effective_mcp_catalog, load_effective_skills_catalog, McpCatalog, McpEntry, Selector,
     SkillEntry, SkillsCatalog, Source, SourceKind,
 };
-use macc_core::coordinator::{is_valid_workflow_transition, WorkflowState};
+use macc_core::coordinator::{
+    engine as coordinator_engine, is_valid_runtime_transition, is_valid_workflow_transition,
+    runtime_status_from_event, RuntimeStatus, WorkflowState,
+};
+use macc_core::coordinator_storage::{
+    sync_coordinator_storage, CoordinatorStorageMode, CoordinatorStoragePhase,
+};
 use macc_core::engine::{Engine, MaccEngine};
 use macc_core::plan::builders::{plan_mcp_install, plan_skill_install};
 use macc_core::plan::ActionPlan;
@@ -13,8 +19,10 @@ use macc_core::resolve::{
 };
 use macc_core::tool::{ToolPerformerSpec, ToolSpec, ToolSpecLoader};
 use macc_core::{load_canonical_config, MaccError, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::exit;
+
+mod coordinator;
 
 #[derive(Parser)]
 #[command(name = "macc")]
@@ -169,7 +177,7 @@ enum Commands {
     },
     /// Run the project coordinator automation script
     Coordinator {
-        /// Coordinator action (run, dispatch, advance, sync, status, reconcile, unlock, cleanup, retry-phase, stop, validate-transition)
+        /// Coordinator action (run, control-plane-run, dispatch, advance, resume, sync, status, reconcile, unlock, cleanup, retry-phase, cutover-gate, stop, validate-transition, validate-runtime-transition, runtime-status-from-event, storage-sync, select-ready-task, state-apply-transition, state-set-runtime, state-task-field, state-task-exists, state-counts, state-locks, state-set-merge-pending, state-set-merge-processed, state-increment-retries, state-upsert-slo-warning, state-slo-metric)
         #[arg(default_value = "run")]
         action: String,
         /// Disable TUI live view for `macc coordinator run`
@@ -226,6 +234,9 @@ enum Commands {
         /// Override STALE_ACTION (abandon, todo, blocked)
         #[arg(long)]
         stale_action: Option<String>,
+        /// Coordinator storage mode (json, dual-write, sqlite)
+        #[arg(long)]
+        storage_mode: Option<String>,
         /// Extra args passed directly to coordinator.sh (use after --)
         #[arg(last = true)]
         extra_args: Vec<String>,
@@ -1380,6 +1391,11 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                     lines,
                     follow,
                 } => {
+                    if component.eq_ignore_ascii_case("all")
+                        || component.eq_ignore_ascii_case("performer")
+                    {
+                        let _ = coordinator::logs::aggregate_performer_logs(&paths.root);
+                    }
                     let file = select_log_file(
                         &paths,
                         component.as_str(),
@@ -1416,17 +1432,95 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             stale_in_progress_seconds,
             stale_changes_requested_seconds,
             stale_action,
+            storage_mode,
             extra_args,
         }) => {
-            let paths = ensure_initialized_paths(&absolute_cwd)?;
-            let canonical = load_canonical_config(&paths.config_path)?;
-            let coordinator = canonical.automation.coordinator.clone();
             let action_name = action.as_str();
 
             if action_name == "validate-transition" {
                 validate_coordinator_transition_action(extra_args)?;
                 return Ok(());
             }
+            if action_name == "validate-runtime-transition" {
+                validate_coordinator_runtime_transition_action(extra_args)?;
+                return Ok(());
+            }
+            if action_name == "runtime-status-from-event" {
+                coordinator_runtime_status_from_event_action(extra_args)?;
+                return Ok(());
+            }
+            if action_name == "storage-sync" {
+                coordinator_storage_sync_action(&absolute_cwd, extra_args)?;
+                return Ok(());
+            }
+            if action_name == "select-ready-task" {
+                coordinator_select_ready_task_action(&absolute_cwd, extra_args)?;
+                return Ok(());
+            }
+            if action_name == "aggregate-performer-logs" {
+                let copied = coordinator::logs::aggregate_performer_logs(&absolute_cwd)?;
+                println!("Aggregated {} performer log file(s).", copied);
+                return Ok(());
+            }
+            if action_name == "state-apply-transition" {
+                let args = parse_coordinator_extra_kv_args(extra_args)?;
+                coordinator::state::coordinator_state_apply_transition(&absolute_cwd, &args)?;
+                return Ok(());
+            }
+            if action_name == "state-set-runtime" {
+                let args = parse_coordinator_extra_kv_args(extra_args)?;
+                coordinator::state::coordinator_state_set_runtime(&absolute_cwd, &args)?;
+                return Ok(());
+            }
+            if action_name == "state-task-field" {
+                let args = parse_coordinator_extra_kv_args(extra_args)?;
+                coordinator::state::coordinator_state_task_field(&absolute_cwd, &args)?;
+                return Ok(());
+            }
+            if action_name == "state-task-exists" {
+                let args = parse_coordinator_extra_kv_args(extra_args)?;
+                coordinator::state::coordinator_state_task_exists(&absolute_cwd, &args)?;
+                return Ok(());
+            }
+            if action_name == "state-counts" {
+                let args = parse_coordinator_extra_kv_args(extra_args)?;
+                coordinator::state::coordinator_state_counts(&absolute_cwd, &args)?;
+                return Ok(());
+            }
+            if action_name == "state-locks" {
+                let args = parse_coordinator_extra_kv_args(extra_args)?;
+                coordinator::state::coordinator_state_locks(&absolute_cwd, &args)?;
+                return Ok(());
+            }
+            if action_name == "state-set-merge-pending" {
+                let args = parse_coordinator_extra_kv_args(extra_args)?;
+                coordinator::state::coordinator_state_set_merge_pending(&absolute_cwd, &args)?;
+                return Ok(());
+            }
+            if action_name == "state-set-merge-processed" {
+                let args = parse_coordinator_extra_kv_args(extra_args)?;
+                coordinator::state::coordinator_state_set_merge_processed(&absolute_cwd, &args)?;
+                return Ok(());
+            }
+            if action_name == "state-increment-retries" {
+                let args = parse_coordinator_extra_kv_args(extra_args)?;
+                coordinator::state::coordinator_state_increment_retries(&absolute_cwd, &args)?;
+                return Ok(());
+            }
+            if action_name == "state-upsert-slo-warning" {
+                let args = parse_coordinator_extra_kv_args(extra_args)?;
+                coordinator::state::coordinator_state_upsert_slo_warning(&absolute_cwd, &args)?;
+                return Ok(());
+            }
+            if action_name == "state-slo-metric" {
+                let args = parse_coordinator_extra_kv_args(extra_args)?;
+                coordinator::state::coordinator_state_slo_metric(&absolute_cwd, &args)?;
+                return Ok(());
+            }
+
+            let paths = ensure_initialized_paths(&absolute_cwd)?;
+            let canonical = load_canonical_config(&paths.config_path)?;
+            let coordinator = canonical.automation.coordinator.clone();
 
             if action_name == "run" && !*no_tui {
                 return macc_tui::run_tui_with_launch(macc_tui::LaunchMode::CoordinatorRun)
@@ -1461,7 +1555,19 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                 stale_in_progress_seconds: *stale_in_progress_seconds,
                 stale_changes_requested_seconds: *stale_changes_requested_seconds,
                 stale_action: stale_action.clone(),
+                storage_mode: storage_mode.clone(),
             };
+
+            if action_name == "control-plane-run" {
+                run_coordinator_control_plane_rust(
+                    &paths.root,
+                    &coordinator_path,
+                    &canonical,
+                    coordinator.as_ref(),
+                    &env_cfg,
+                )?;
+                return Ok(());
+            }
 
             if action_name == "stop" {
                 let stopped =
@@ -1508,15 +1614,198 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                         "Action 'run' does not accept extra args after '--'.".into(),
                     ));
                 }
-                run_coordinator_action(
+                run_coordinator_control_plane_rust(
                     &paths.root,
                     &coordinator_path,
-                    "run",
-                    &[],
                     &canonical,
                     coordinator.as_ref(),
                     &env_cfg,
                 )?;
+            } else if action_name == "dispatch" {
+                if !extra_args.is_empty() {
+                    return Err(MaccError::Validation(
+                        "Action 'dispatch' does not accept extra args in native mode.".into(),
+                    ));
+                }
+                let prd_file = env_cfg
+                    .prd
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        coordinator
+                            .as_ref()
+                            .and_then(|c| c.prd_file.clone())
+                            .map(std::path::PathBuf::from)
+                    })
+                    .unwrap_or_else(|| paths.root.join("prd.json"));
+                sync_registry_from_prd_native(&paths.root, &prd_file, None)?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .enable_io()
+                    .build()
+                    .map_err(|e| {
+                        MaccError::Validation(format!("Failed to initialize tokio runtime: {}", e))
+                    })?;
+                let logger = NativeCoordinatorLogger::new(&paths.root, "dispatch")?;
+                println!("Coordinator log file: {}", logger.file.display());
+                runtime.block_on(async {
+                    let mut state = CoordinatorRunState::new();
+                    let _ = dispatch_ready_tasks_native(
+                        &paths.root,
+                        &canonical,
+                        coordinator.as_ref(),
+                        &env_cfg,
+                        &prd_file,
+                        &mut state,
+                        Some(&logger),
+                    )
+                    .await?;
+                    let max_attempts = env_cfg
+                        .phase_runner_max_attempts
+                        .or_else(|| {
+                            coordinator
+                                .as_ref()
+                                .and_then(|c| c.phase_runner_max_attempts)
+                        })
+                        .unwrap_or(1)
+                        .max(1);
+                    let phase_timeout = env_cfg
+                        .stale_in_progress_seconds
+                        .or_else(|| {
+                            coordinator
+                                .as_ref()
+                                .and_then(|c| c.stale_in_progress_seconds)
+                        })
+                        .unwrap_or(0);
+                    while !state.active_jobs.is_empty() {
+                        monitor_active_jobs_native(
+                            &paths.root,
+                            &mut state,
+                            max_attempts,
+                            phase_timeout,
+                            Some(&logger),
+                        )
+                        .await?;
+                        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                    }
+                    Result::<()>::Ok(())
+                })?;
+            } else if action_name == "advance" {
+                if !extra_args.is_empty() {
+                    return Err(MaccError::Validation(
+                        "Action 'advance' does not accept extra args in native mode.".into(),
+                    ));
+                }
+                let logger = NativeCoordinatorLogger::new(&paths.root, "advance")?;
+                println!("Coordinator log file: {}", logger.file.display());
+                let coordinator_tool_override = env_cfg.coordinator_tool.clone().or_else(|| {
+                    coordinator
+                        .as_ref()
+                        .and_then(|c| c.coordinator_tool.clone())
+                });
+                let phase_runner_max_attempts = env_cfg
+                    .phase_runner_max_attempts
+                    .or_else(|| {
+                        coordinator
+                            .as_ref()
+                            .and_then(|c| c.phase_runner_max_attempts)
+                    })
+                    .unwrap_or(1)
+                    .max(1);
+                let advance = advance_tasks_native(
+                    &paths.root,
+                    coordinator_tool_override.as_deref(),
+                    phase_runner_max_attempts,
+                    Some(&logger),
+                )?;
+                if let Some((task_id, reason)) = advance.blocked_merge {
+                    set_task_paused_for_integrate(&paths.root, &task_id, &reason)?;
+                    write_coordinator_pause_file(&paths.root, &task_id, "integrate", &reason)?;
+                    return Err(MaccError::Validation(format!(
+                        "Coordinator paused on task {} (integrate). Resolve the merge issue, then run `macc coordinator resume`. Reason: {}",
+                        task_id, reason
+                    )));
+                }
+            } else if action_name == "resume" {
+                if !extra_args.is_empty() {
+                    return Err(MaccError::Validation(
+                        "Action 'resume' does not accept extra args in native mode.".into(),
+                    ));
+                }
+                let pause = read_coordinator_pause_file(&paths.root)?;
+                if let Some(value) = pause {
+                    let task_id = value
+                        .get("task_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if !task_id.is_empty() {
+                        resume_paused_task_integrate(&paths.root, task_id)?;
+                    }
+                    let _ = clear_coordinator_pause_file(&paths.root)?;
+                    println!("Coordinator resume signal applied.");
+                } else {
+                    println!("Coordinator is not paused.");
+                }
+            } else if action_name == "sync" {
+                if !extra_args.is_empty() {
+                    return Err(MaccError::Validation(
+                        "Action 'sync' does not accept extra args in native mode.".into(),
+                    ));
+                }
+                let prd_file = env_cfg
+                    .prd
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        coordinator
+                            .as_ref()
+                            .and_then(|c| c.prd_file.clone())
+                            .map(std::path::PathBuf::from)
+                    })
+                    .unwrap_or_else(|| paths.root.join("prd.json"));
+                let logger = NativeCoordinatorLogger::new(&paths.root, "sync")?;
+                println!("Coordinator log file: {}", logger.file.display());
+                let storage_mode =
+                    resolve_coordinator_storage_mode(&env_cfg, coordinator.as_ref())?;
+                if storage_mode != CoordinatorStorageMode::Json {
+                    let storage_paths = macc_core::ProjectPaths::from_root(&paths.root);
+                    sync_coordinator_storage(
+                        &storage_paths,
+                        storage_mode,
+                        CoordinatorStoragePhase::Pre,
+                    )?;
+                }
+                sync_registry_from_prd_native(&paths.root, &prd_file, Some(&logger))?;
+                if storage_mode != CoordinatorStorageMode::Json {
+                    let storage_paths = macc_core::ProjectPaths::from_root(&paths.root);
+                    sync_coordinator_storage(
+                        &storage_paths,
+                        storage_mode,
+                        CoordinatorStoragePhase::Post,
+                    )?;
+                }
+            } else if action_name == "reconcile" {
+                if !extra_args.is_empty() {
+                    return Err(MaccError::Validation(
+                        "Action 'reconcile' does not accept extra args in native mode.".into(),
+                    ));
+                }
+                let logger = NativeCoordinatorLogger::new(&paths.root, "reconcile")?;
+                println!("Coordinator log file: {}", logger.file.display());
+                let _ = logger.note("- Reconcile start");
+                reconcile_registry_native(&paths.root)?;
+                let _ = logger.note("- Reconcile complete");
+            } else if action_name == "cleanup" {
+                if !extra_args.is_empty() {
+                    return Err(MaccError::Validation(
+                        "Action 'cleanup' does not accept extra args in native mode.".into(),
+                    ));
+                }
+                let logger = NativeCoordinatorLogger::new(&paths.root, "cleanup")?;
+                println!("Coordinator log file: {}", logger.file.display());
+                let _ = logger.note("- Cleanup start");
+                cleanup_registry_native(&paths.root)?;
+                let _ = logger.note("- Cleanup complete");
             } else {
                 run_coordinator_action(
                     &paths.root,
@@ -2010,9 +2299,97 @@ struct CoordinatorEnvConfig {
     stale_in_progress_seconds: Option<usize>,
     stale_changes_requested_seconds: Option<usize>,
     stale_action: Option<String>,
+    storage_mode: Option<String>,
 }
 
 const COORDINATOR_TASK_REGISTRY_REL_PATH: &str = ".macc/automation/task/task_registry.json";
+const COORDINATOR_PAUSE_FILE_REL_PATH: &str = ".macc/automation/task/coordinator.pause.json";
+
+struct CoordinatorJob {
+    tool: String,
+    worktree_path: std::path::PathBuf,
+    attempt: usize,
+    started_at: std::time::Instant,
+    pid: Option<i64>,
+}
+
+struct CoordinatorJobEvent {
+    task_id: String,
+    success: bool,
+    status_text: String,
+    timed_out: bool,
+}
+
+struct AdvanceOutcome {
+    progressed: bool,
+    blocked_merge: Option<(String, String)>,
+}
+
+struct NativeCoordinatorLogger {
+    file: std::path::PathBuf,
+}
+
+impl NativeCoordinatorLogger {
+    fn new(repo_root: &std::path::Path, action: &str) -> Result<Self> {
+        let dir = repo_root.join(".macc").join("log").join("coordinator");
+        std::fs::create_dir_all(&dir).map_err(|e| MaccError::Io {
+            path: dir.to_string_lossy().into(),
+            action: "create coordinator log dir".into(),
+            source: e,
+        })?;
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let file = dir.join(format!("{}-{}.md", action, ts));
+        let header = format!(
+            "# Coordinator log\n\n- Command: {}\n- Repository: {}\n- Started (UTC): {}\n\n",
+            action,
+            repo_root.display(),
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        );
+        std::fs::write(&file, header).map_err(|e| MaccError::Io {
+            path: file.to_string_lossy().into(),
+            action: "write coordinator log header".into(),
+            source: e,
+        })?;
+        Ok(Self { file })
+    }
+
+    fn note(&self, msg: impl AsRef<str>) -> Result<()> {
+        let line = format!("{}\n", msg.as_ref());
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.file)
+            .map_err(|e| MaccError::Io {
+                path: self.file.to_string_lossy().into(),
+                action: "open coordinator log file".into(),
+                source: e,
+            })?;
+        f.write_all(line.as_bytes()).map_err(|e| MaccError::Io {
+            path: self.file.to_string_lossy().into(),
+            action: "append coordinator log".into(),
+            source: e,
+        })
+    }
+}
+
+struct CoordinatorRunState {
+    active_jobs: HashMap<String, CoordinatorJob>,
+    join_set: tokio::task::JoinSet<()>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<CoordinatorJobEvent>,
+    event_rx: tokio::sync::mpsc::UnboundedReceiver<CoordinatorJobEvent>,
+}
+
+impl CoordinatorRunState {
+    fn new() -> Self {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            active_jobs: HashMap::new(),
+            join_set: tokio::task::JoinSet::new(),
+            event_tx,
+            event_rx,
+        }
+    }
+}
 
 fn parse_coordinator_validate_transition_args(
     args: &[String],
@@ -2075,6 +2452,171 @@ fn parse_coordinator_validate_transition_args(
     Ok((from, to))
 }
 
+fn parse_coordinator_validate_runtime_transition_args(
+    args: &[String],
+) -> Result<(RuntimeStatus, RuntimeStatus)> {
+    let mut from: Option<RuntimeStatus> = None;
+    let mut to: Option<RuntimeStatus> = None;
+    let mut idx = 0usize;
+
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--from" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    MaccError::Validation(
+                        "Missing value for --from. Usage: macc coordinator validate-runtime-transition --from <status> --to <status>"
+                            .into(),
+                    )
+                })?;
+                from = Some(
+                    value
+                        .parse::<RuntimeStatus>()
+                        .map_err(MaccError::Validation)?,
+                );
+                idx += 2;
+            }
+            "--to" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    MaccError::Validation(
+                        "Missing value for --to. Usage: macc coordinator validate-runtime-transition --from <status> --to <status>"
+                            .into(),
+                    )
+                })?;
+                to = Some(
+                    value
+                        .parse::<RuntimeStatus>()
+                        .map_err(MaccError::Validation)?,
+                );
+                idx += 2;
+            }
+            other => {
+                return Err(MaccError::Validation(format!(
+                    "Unknown arg for validate-runtime-transition: '{}'. Usage: macc coordinator validate-runtime-transition --from <status> --to <status>",
+                    other
+                )));
+            }
+        }
+    }
+
+    let from = from.ok_or_else(|| {
+        MaccError::Validation(
+            "Missing --from. Usage: macc coordinator validate-runtime-transition --from <status> --to <status>"
+                .into(),
+        )
+    })?;
+    let to = to.ok_or_else(|| {
+        MaccError::Validation(
+            "Missing --to. Usage: macc coordinator validate-runtime-transition --from <status> --to <status>"
+                .into(),
+        )
+    })?;
+    Ok((from, to))
+}
+
+fn parse_coordinator_runtime_status_from_event_args(args: &[String]) -> Result<(String, String)> {
+    let mut event_type: Option<String> = None;
+    let mut status: Option<String> = None;
+    let mut idx = 0usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--type" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    MaccError::Validation(
+                        "Missing value for --type. Usage: macc coordinator runtime-status-from-event --type <event_type> --status <status>"
+                            .into(),
+                    )
+                })?;
+                event_type = Some(value.clone());
+                idx += 2;
+            }
+            "--status" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    MaccError::Validation(
+                        "Missing value for --status. Usage: macc coordinator runtime-status-from-event --type <event_type> --status <status>"
+                            .into(),
+                    )
+                })?;
+                status = Some(value.clone());
+                idx += 2;
+            }
+            other => {
+                return Err(MaccError::Validation(format!(
+                    "Unknown arg for runtime-status-from-event: '{}'. Usage: macc coordinator runtime-status-from-event --type <event_type> --status <status>",
+                    other
+                )));
+            }
+        }
+    }
+
+    let event_type = event_type.ok_or_else(|| {
+        MaccError::Validation(
+            "Missing --type. Usage: macc coordinator runtime-status-from-event --type <event_type> --status <status>"
+                .into(),
+        )
+    })?;
+    let status = status.unwrap_or_default();
+    Ok((event_type, status))
+}
+
+fn parse_coordinator_storage_sync_args(
+    args: &[String],
+) -> Result<(CoordinatorStorageMode, CoordinatorStoragePhase)> {
+    let mut mode: Option<CoordinatorStorageMode> = None;
+    let mut phase: Option<CoordinatorStoragePhase> = None;
+    let mut idx = 0usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--mode" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    MaccError::Validation(
+                        "Missing value for --mode. Usage: macc coordinator storage-sync --mode <json|dual-write|sqlite> --phase <pre|post>"
+                            .into(),
+                    )
+                })?;
+                mode = Some(
+                    value
+                        .parse::<CoordinatorStorageMode>()
+                        .map_err(MaccError::Validation)?,
+                );
+                idx += 2;
+            }
+            "--phase" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    MaccError::Validation(
+                        "Missing value for --phase. Usage: macc coordinator storage-sync --mode <json|dual-write|sqlite> --phase <pre|post>"
+                            .into(),
+                    )
+                })?;
+                phase = Some(
+                    value
+                        .parse::<CoordinatorStoragePhase>()
+                        .map_err(MaccError::Validation)?,
+                );
+                idx += 2;
+            }
+            other => {
+                return Err(MaccError::Validation(format!(
+                    "Unknown arg for storage-sync: '{}'. Usage: macc coordinator storage-sync --mode <json|dual-write|sqlite> --phase <pre|post>",
+                    other
+                )));
+            }
+        }
+    }
+    let mode = mode.ok_or_else(|| {
+        MaccError::Validation(
+            "Missing --mode. Usage: macc coordinator storage-sync --mode <json|dual-write|sqlite> --phase <pre|post>"
+                .into(),
+        )
+    })?;
+    let phase = phase.ok_or_else(|| {
+        MaccError::Validation(
+            "Missing --phase. Usage: macc coordinator storage-sync --mode <json|dual-write|sqlite> --phase <pre|post>"
+                .into(),
+        )
+    })?;
+    Ok((mode, phase))
+}
+
 fn validate_coordinator_transition_action(args: &[String]) -> Result<()> {
     let (from, to) = parse_coordinator_validate_transition_args(args)?;
     if is_valid_workflow_transition(from, to) {
@@ -2087,35 +2629,275 @@ fn validate_coordinator_transition_action(args: &[String]) -> Result<()> {
     )))
 }
 
+fn validate_coordinator_runtime_transition_action(args: &[String]) -> Result<()> {
+    let (from, to) = parse_coordinator_validate_runtime_transition_args(args)?;
+    if is_valid_runtime_transition(from, to) {
+        return Ok(());
+    }
+    Err(MaccError::Validation(format!(
+        "invalid runtime transition {} -> {}",
+        from.as_str(),
+        to.as_str()
+    )))
+}
+
+fn coordinator_runtime_status_from_event_action(args: &[String]) -> Result<()> {
+    let (event_type, status) = parse_coordinator_runtime_status_from_event_args(args)?;
+    let runtime = runtime_status_from_event(&event_type, &status);
+    println!("{}", runtime.as_str());
+    Ok(())
+}
+
+fn coordinator_storage_sync_action(repo_root: &std::path::Path, args: &[String]) -> Result<()> {
+    let (mode, phase) = parse_coordinator_storage_sync_args(args)?;
+    let paths = macc_core::ProjectPaths::from_root(repo_root);
+    sync_coordinator_storage(&paths, mode, phase)
+}
+
+fn coordinator_select_ready_task_action(
+    repo_root: &std::path::Path,
+    extra_args: &[String],
+) -> Result<()> {
+    let args = parse_coordinator_extra_kv_args(extra_args)?;
+    let registry_path = args
+        .get("registry")
+        .map(std::path::PathBuf::from)
+        .map(|p| {
+            if p.is_absolute() {
+                p
+            } else {
+                repo_root.join(p)
+            }
+        })
+        .unwrap_or_else(|| {
+            repo_root
+                .join(".macc")
+                .join("automation")
+                .join("task")
+                .join("task_registry.json")
+        });
+    let registry_raw = std::fs::read_to_string(&registry_path).map_err(|e| MaccError::Io {
+        path: registry_path.to_string_lossy().into(),
+        action: "read task registry for select-ready-task".into(),
+        source: e,
+    })?;
+    let registry: serde_json::Value = serde_json::from_str(&registry_raw).map_err(|e| {
+        MaccError::Validation(format!(
+            "Failed to parse task registry JSON '{}': {}",
+            registry_path.display(),
+            e
+        ))
+    })?;
+
+    let max_parallel_raw = args
+        .get("max-parallel")
+        .cloned()
+        .or_else(|| std::env::var("MAX_PARALLEL").ok())
+        .unwrap_or_else(|| "0".to_string());
+    let default_tool = args
+        .get("default-tool")
+        .cloned()
+        .or_else(|| std::env::var("DEFAULT_TOOL").ok())
+        .unwrap_or_else(|| "codex".to_string());
+    let default_base_branch = args
+        .get("default-base-branch")
+        .cloned()
+        .or_else(|| std::env::var("DEFAULT_BASE_BRANCH").ok())
+        .unwrap_or_else(|| "master".to_string());
+
+    let config = macc_core::coordinator::task_selector::TaskSelectorConfig {
+        enabled_tools: parse_json_string_vec(
+            args.get("enabled-tools-json")
+                .map(String::as_str)
+                .unwrap_or("[]"),
+            "enabled-tools-json",
+        )?,
+        tool_priority: parse_json_string_vec(
+            args.get("tool-priority-json")
+                .map(String::as_str)
+                .unwrap_or("[]"),
+            "tool-priority-json",
+        )?,
+        max_parallel_per_tool: parse_json_string_usize_map(
+            args.get("max-parallel-per-tool-json")
+                .map(String::as_str)
+                .unwrap_or("{}"),
+            "max-parallel-per-tool-json",
+        )?,
+        tool_specializations: parse_json_string_vec_map(
+            args.get("tool-specializations-json")
+                .map(String::as_str)
+                .unwrap_or("{}"),
+            "tool-specializations-json",
+        )?,
+        max_parallel: max_parallel_raw
+            .parse::<usize>()
+            .map_err(|e| MaccError::Validation(format!("Invalid max-parallel value: {}", e)))?,
+        default_tool,
+        default_base_branch,
+    };
+
+    if let Some(selected) =
+        macc_core::coordinator::task_selector::select_next_ready_task(&registry, &config)
+    {
+        println!(
+            "{}\t{}\t{}\t{}",
+            selected.id, selected.title, selected.tool, selected.base_branch
+        );
+    }
+    Ok(())
+}
+
+fn parse_coordinator_extra_kv_args(extra_args: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut map = BTreeMap::new();
+    let mut i = 0usize;
+    while i < extra_args.len() {
+        let key = &extra_args[i];
+        if !key.starts_with("--") {
+            return Err(MaccError::Validation(format!(
+                "Unexpected argument '{}'; expected '--key value' pairs.",
+                key
+            )));
+        }
+        let normalized = key.trim_start_matches("--");
+        let value = extra_args.get(i + 1).ok_or_else(|| {
+            MaccError::Validation(format!("Missing value for argument '--{}'", normalized))
+        })?;
+        map.insert(normalized.to_string(), value.clone());
+        i += 2;
+    }
+    Ok(map)
+}
+
+fn parse_json_string_vec(raw: &str, field_name: &str) -> Result<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| MaccError::Validation(format!("Invalid JSON for {}: {}", field_name, e)))?;
+    let arr = value
+        .as_array()
+        .ok_or_else(|| MaccError::Validation(format!("{} must be a JSON array", field_name)))?;
+    let mut out = Vec::new();
+    for item in arr {
+        let value = item.as_str().ok_or_else(|| {
+            MaccError::Validation(format!("{} must contain string values only", field_name))
+        })?;
+        if !value.is_empty() {
+            out.push(value.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn parse_json_string_usize_map(
+    raw: &str,
+    field_name: &str,
+) -> Result<std::collections::HashMap<String, usize>> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| MaccError::Validation(format!("Invalid JSON for {}: {}", field_name, e)))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| MaccError::Validation(format!("{} must be a JSON object", field_name)))?;
+    let mut out = std::collections::HashMap::new();
+    for (k, v) in obj {
+        let cap = if let Some(n) = v.as_u64() {
+            n as usize
+        } else if let Some(s) = v.as_str() {
+            s.parse::<usize>().map_err(|e| {
+                MaccError::Validation(format!(
+                    "Invalid numeric value '{}' for key '{}' in {}: {}",
+                    s, k, field_name, e
+                ))
+            })?
+        } else {
+            return Err(MaccError::Validation(format!(
+                "Invalid value type for key '{}' in {}; expected number/string",
+                k, field_name
+            )));
+        };
+        out.insert(k.clone(), cap);
+    }
+    Ok(out)
+}
+
+fn parse_json_string_vec_map(
+    raw: &str,
+    field_name: &str,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| MaccError::Validation(format!("Invalid JSON for {}: {}", field_name, e)))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| MaccError::Validation(format!("{} must be a JSON object", field_name)))?;
+    let mut out = std::collections::HashMap::new();
+    for (k, v) in obj {
+        let arr = v.as_array().ok_or_else(|| {
+            MaccError::Validation(format!(
+                "Value for key '{}' in {} must be an array of strings",
+                k, field_name
+            ))
+        })?;
+        let mut tools = Vec::new();
+        for tool in arr {
+            let value = tool.as_str().ok_or_else(|| {
+                MaccError::Validation(format!(
+                    "Value for key '{}' in {} must contain strings only",
+                    k, field_name
+                ))
+            })?;
+            if !value.is_empty() {
+                tools.push(value.to_string());
+            }
+        }
+        out.insert(k.clone(), tools);
+    }
+    Ok(out)
+}
+
 fn apply_coordinator_env(
     command: &mut std::process::Command,
     canonical: &macc_core::config::CanonicalConfig,
     coordinator: Option<&macc_core::config::CoordinatorConfig>,
     env_cfg: &CoordinatorEnvConfig,
 ) {
-    command.env("ENABLED_TOOLS_CSV", canonical.tools.enabled.join(","));
+    for (key, value) in coordinator_env_pairs(canonical, coordinator, env_cfg) {
+        command.env(key, value);
+    }
+}
+
+fn coordinator_env_pairs(
+    canonical: &macc_core::config::CanonicalConfig,
+    coordinator: Option<&macc_core::config::CoordinatorConfig>,
+    env_cfg: &CoordinatorEnvConfig,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    out.push((
+        "ENABLED_TOOLS_CSV".to_string(),
+        canonical.tools.enabled.join(","),
+    ));
+    out.push((
+        "TASK_REGISTRY_FILE".to_string(),
+        COORDINATOR_TASK_REGISTRY_REL_PATH.to_string(),
+    ));
 
     if let Some(value) = env_cfg
         .prd
         .clone()
         .or_else(|| coordinator.and_then(|c| c.prd_file.clone()))
     {
-        command.env("PRD_FILE", value);
+        out.push(("PRD_FILE".to_string(), value));
     }
-    command.env("TASK_REGISTRY_FILE", COORDINATOR_TASK_REGISTRY_REL_PATH);
     if let Some(value) = env_cfg
         .coordinator_tool
         .clone()
         .or_else(|| coordinator.and_then(|c| c.coordinator_tool.clone()))
     {
-        command.env("COORDINATOR_TOOL", value);
+        out.push(("COORDINATOR_TOOL".to_string(), value));
     }
     if let Some(value) = env_cfg
         .reference_branch
         .clone()
         .or_else(|| coordinator.and_then(|c| c.reference_branch.clone()))
     {
-        command.env("DEFAULT_BASE_BRANCH", value);
+        out.push(("DEFAULT_BASE_BRANCH".to_string(), value));
     }
     if let Some(value) = env_cfg.tool_priority.clone().or_else(|| {
         coordinator.and_then(|c| {
@@ -2126,7 +2908,7 @@ fn apply_coordinator_env(
             }
         })
     }) {
-        command.env("TOOL_PRIORITY_CSV", value);
+        out.push(("TOOL_PRIORITY_CSV".to_string(), value));
     }
     if let Some(value) = env_cfg.max_parallel_per_tool_json.clone().or_else(|| {
         coordinator.and_then(|c| {
@@ -2137,7 +2919,7 @@ fn apply_coordinator_env(
             }
         })
     }) {
-        command.env("MAX_PARALLEL_PER_TOOL_JSON", value);
+        out.push(("MAX_PARALLEL_PER_TOOL_JSON".to_string(), value));
     }
     if let Some(value) = env_cfg.tool_specializations_json.clone().or_else(|| {
         coordinator.and_then(|c| {
@@ -2148,57 +2930,68 @@ fn apply_coordinator_env(
             }
         })
     }) {
-        command.env("TOOL_SPECIALIZATIONS_JSON", value);
+        out.push(("TOOL_SPECIALIZATIONS_JSON".to_string(), value));
     }
     if let Some(value) = env_cfg
         .max_dispatch
         .or_else(|| coordinator.and_then(|c| c.max_dispatch))
     {
-        command.env("MAX_DISPATCH", value.to_string());
+        out.push(("MAX_DISPATCH".to_string(), value.to_string()));
     }
     if let Some(value) = env_cfg
         .max_parallel
         .or_else(|| coordinator.and_then(|c| c.max_parallel))
     {
-        command.env("MAX_PARALLEL", value.to_string());
+        out.push(("MAX_PARALLEL".to_string(), value.to_string()));
     }
     if let Some(value) = env_cfg
         .timeout_seconds
         .or_else(|| coordinator.and_then(|c| c.timeout_seconds))
     {
-        command.env("TIMEOUT_SECONDS", value.to_string());
+        out.push(("TIMEOUT_SECONDS".to_string(), value.to_string()));
     }
     if let Some(value) = env_cfg
         .phase_runner_max_attempts
         .or_else(|| coordinator.and_then(|c| c.phase_runner_max_attempts))
     {
-        command.env("PHASE_RUNNER_MAX_ATTEMPTS", value.to_string());
+        out.push(("PHASE_RUNNER_MAX_ATTEMPTS".to_string(), value.to_string()));
     }
     if let Some(value) = env_cfg
         .stale_claimed_seconds
         .or_else(|| coordinator.and_then(|c| c.stale_claimed_seconds))
     {
-        command.env("STALE_CLAIMED_SECONDS", value.to_string());
+        out.push(("STALE_CLAIMED_SECONDS".to_string(), value.to_string()));
     }
     if let Some(value) = env_cfg
         .stale_in_progress_seconds
         .or_else(|| coordinator.and_then(|c| c.stale_in_progress_seconds))
     {
-        command.env("STALE_IN_PROGRESS_SECONDS", value.to_string());
+        out.push(("STALE_IN_PROGRESS_SECONDS".to_string(), value.to_string()));
     }
     if let Some(value) = env_cfg
         .stale_changes_requested_seconds
         .or_else(|| coordinator.and_then(|c| c.stale_changes_requested_seconds))
     {
-        command.env("STALE_CHANGES_REQUESTED_SECONDS", value.to_string());
+        out.push((
+            "STALE_CHANGES_REQUESTED_SECONDS".to_string(),
+            value.to_string(),
+        ));
     }
     if let Some(value) = env_cfg
         .stale_action
         .clone()
         .or_else(|| coordinator.and_then(|c| c.stale_action.clone()))
     {
-        command.env("STALE_ACTION", value);
+        out.push(("STALE_ACTION".to_string(), value));
     }
+    if let Some(value) = env_cfg
+        .storage_mode
+        .clone()
+        .or_else(|| coordinator.and_then(|c| c.storage_mode.clone()))
+    {
+        out.push(("COORDINATOR_STORAGE_MODE".to_string(), value));
+    }
+    out
 }
 
 fn run_coordinator_action(
@@ -2210,14 +3003,58 @@ fn run_coordinator_action(
     coordinator: Option<&macc_core::config::CoordinatorConfig>,
     env_cfg: &CoordinatorEnvConfig,
 ) -> Result<()> {
-    let mut command = std::process::Command::new(coordinator_path);
+    run_coordinator_action_with_options(
+        repo_root,
+        coordinator_path,
+        action,
+        extra_args,
+        canonical,
+        coordinator,
+        env_cfg,
+        false,
+    )
+}
+
+fn run_coordinator_action_with_options(
+    repo_root: &std::path::Path,
+    coordinator_path: &std::path::Path,
+    action: &str,
+    extra_args: &[String],
+    canonical: &macc_core::config::CanonicalConfig,
+    coordinator: Option<&macc_core::config::CoordinatorConfig>,
+    env_cfg: &CoordinatorEnvConfig,
+    skip_storage_sync: bool,
+) -> Result<()> {
+    let use_legacy = matches!(
+        action,
+        "run"
+            | "dispatch"
+            | "advance"
+            | "sync"
+            | "status"
+            | "reconcile"
+            | "unlock"
+            | "cleanup"
+            | "retry-phase"
+            | "cutover-gate"
+    );
+    let legacy_path = coordinator_path.with_file_name("coordinator_legacy.sh");
+    let selected = if use_legacy && legacy_path.exists() {
+        legacy_path.as_path()
+    } else {
+        coordinator_path
+    };
+    let mut command = std::process::Command::new(selected);
     command.current_dir(repo_root);
     command.arg(action);
     command.args(extra_args);
     apply_coordinator_env(&mut command, canonical, coordinator, env_cfg);
+    if skip_storage_sync {
+        command.env("COORDINATOR_SKIP_STORAGE_SYNC", "1");
+    }
 
     let status = command.status().map_err(|e| MaccError::Io {
-        path: coordinator_path.to_string_lossy().into(),
+        path: selected.to_string_lossy().into(),
         action: format!("run coordinator action '{}'", action),
         source: e,
     })?;
@@ -2228,7 +3065,2386 @@ fn run_coordinator_action(
             action, status, hint
         )));
     }
+    if let Err(err) = coordinator::logs::aggregate_performer_logs(repo_root) {
+        eprintln!("warning: failed to aggregate performer logs: {}", err);
+    }
     Ok(())
+}
+
+fn coordinator_registry_path(repo_root: &std::path::Path) -> std::path::PathBuf {
+    repo_root.join(COORDINATOR_TASK_REGISTRY_REL_PATH)
+}
+
+fn coordinator_pause_file_path(repo_root: &std::path::Path) -> std::path::PathBuf {
+    repo_root.join(COORDINATOR_PAUSE_FILE_REL_PATH)
+}
+
+fn write_coordinator_pause_file(
+    repo_root: &std::path::Path,
+    task_id: &str,
+    phase: &str,
+    reason: &str,
+) -> Result<()> {
+    let path = coordinator_pause_file_path(repo_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
+            path: parent.to_string_lossy().into(),
+            action: "create coordinator pause file parent".into(),
+            source: e,
+        })?;
+    }
+    let payload = serde_json::json!({
+        "paused": true,
+        "task_id": task_id,
+        "phase": phase,
+        "reason": reason,
+        "updated_at": now_iso_coordinator(),
+    });
+    let body = serde_json::to_string_pretty(&payload).map_err(|e| {
+        MaccError::Validation(format!(
+            "Failed to serialize coordinator pause file '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+    std::fs::write(&path, body).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "write coordinator pause file".into(),
+        source: e,
+    })
+}
+
+fn clear_coordinator_pause_file(repo_root: &std::path::Path) -> Result<bool> {
+    let path = coordinator_pause_file_path(repo_root);
+    if !path.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_file(&path).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "remove coordinator pause file".into(),
+        source: e,
+    })?;
+    Ok(true)
+}
+
+fn read_coordinator_pause_file(repo_root: &std::path::Path) -> Result<Option<serde_json::Value>> {
+    let path = coordinator_pause_file_path(repo_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "read coordinator pause file".into(),
+        source: e,
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        MaccError::Validation(format!(
+            "Failed to parse coordinator pause file '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+    Ok(Some(value))
+}
+
+fn set_task_paused_for_integrate(
+    repo_root: &std::path::Path,
+    task_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let mut registry = load_registry_json(repo_root)?;
+    let tasks = registry
+        .get_mut("tasks")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
+    for task in tasks.iter_mut() {
+        if task
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            != task_id
+        {
+            continue;
+        }
+        ensure_runtime_object(task);
+        task["task_runtime"]["status"] = serde_json::Value::String("paused".to_string());
+        task["task_runtime"]["current_phase"] = serde_json::Value::String("integrate".to_string());
+        task["task_runtime"]["last_error"] = serde_json::Value::String(reason.to_string());
+        task["task_runtime"]["pid"] = serde_json::Value::Null;
+        task["updated_at"] = serde_json::Value::String(now_iso_coordinator());
+        task["state_changed_at"] = serde_json::Value::String(now_iso_coordinator());
+        break;
+    }
+    set_registry_updated_at(&mut registry);
+    save_registry_json(repo_root, &registry)
+}
+
+fn resume_paused_task_integrate(repo_root: &std::path::Path, task_id: &str) -> Result<()> {
+    let mut registry = load_registry_json(repo_root)?;
+    let tasks = registry
+        .get_mut("tasks")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
+    for task in tasks.iter_mut() {
+        if task
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            != task_id
+        {
+            continue;
+        }
+        task["state"] = serde_json::Value::String("queued".to_string());
+        ensure_runtime_object(task);
+        task["task_runtime"]["status"] = serde_json::Value::String("phase_done".to_string());
+        task["task_runtime"]["current_phase"] = serde_json::Value::String("integrate".to_string());
+        task["task_runtime"]["pid"] = serde_json::Value::Null;
+        task["updated_at"] = serde_json::Value::String(now_iso_coordinator());
+        task["state_changed_at"] = serde_json::Value::String(now_iso_coordinator());
+        break;
+    }
+    set_registry_updated_at(&mut registry);
+    save_registry_json(repo_root, &registry)
+}
+
+fn now_iso_coordinator() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn is_pid_running(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn load_registry_json(repo_root: &std::path::Path) -> Result<serde_json::Value> {
+    let path = coordinator_registry_path(repo_root);
+    if !path.exists() {
+        return Ok(serde_json::json!({
+            "schema_version": 1,
+            "tasks": [],
+            "processed_event_ids": {},
+            "resource_locks": {},
+            "state_mapping": {},
+            "updated_at": now_iso_coordinator(),
+        }));
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "read coordinator registry".into(),
+        source: e,
+    })?;
+    serde_json::from_str(&raw).map_err(|e| {
+        MaccError::Validation(format!(
+            "Failed to parse coordinator registry {}: {}",
+            path.display(),
+            e
+        ))
+    })
+}
+
+fn save_registry_json(repo_root: &std::path::Path, value: &serde_json::Value) -> Result<()> {
+    let path = coordinator_registry_path(repo_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
+            path: parent.to_string_lossy().into(),
+            action: "create coordinator registry parent".into(),
+            source: e,
+        })?;
+    }
+    let content = serde_json::to_string_pretty(value)
+        .map_err(|e| MaccError::Validation(format!("Failed to serialize registry json: {}", e)))?;
+    std::fs::write(&path, content).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "write coordinator registry".into(),
+        source: e,
+    })
+}
+
+fn set_registry_updated_at(registry: &mut serde_json::Value) {
+    registry["updated_at"] = serde_json::Value::String(now_iso_coordinator());
+}
+
+fn ensure_runtime_object(task: &mut serde_json::Value) {
+    if !task
+        .get("task_runtime")
+        .map(serde_json::Value::is_object)
+        .unwrap_or(false)
+    {
+        task["task_runtime"] = serde_json::json!({});
+    }
+}
+
+fn recompute_resource_locks_from_tasks(registry: &mut serde_json::Value) {
+    let mut locks = serde_json::Map::new();
+    let tasks = registry
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for task in tasks {
+        let state = task
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("todo");
+        if !matches!(
+            state,
+            "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued"
+        ) {
+            continue;
+        }
+        let task_id = task
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if task_id.is_empty() {
+            continue;
+        }
+        let worktree_path = task
+            .get("worktree")
+            .and_then(|w| w.get("worktree_path"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        for res in task
+            .get("exclusive_resources")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let res_name = res.as_str().unwrap_or_default();
+            if res_name.is_empty() {
+                continue;
+            }
+            locks.insert(
+                res_name.to_string(),
+                serde_json::json!({
+                    "task_id": task_id,
+                    "worktree_path": worktree_path,
+                    "locked_at": now_iso_coordinator(),
+                }),
+            );
+        }
+    }
+    registry["resource_locks"] = serde_json::Value::Object(locks);
+}
+
+fn cleanup_dead_runtime_tasks_in_registry(
+    registry: &mut serde_json::Value,
+    reason: &str,
+    logger: Option<&NativeCoordinatorLogger>,
+    repo_root: Option<&std::path::Path>,
+) -> Result<usize> {
+    let mut fixed = 0usize;
+    let now = now_iso_coordinator();
+    let tasks = registry
+        .get_mut("tasks")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
+    for task in tasks.iter_mut() {
+        ensure_runtime_object(task);
+        let Some(pid) = task["task_runtime"]["pid"].as_i64() else {
+            continue;
+        };
+        let runtime_status = task["task_runtime"]["status"].as_str().unwrap_or_default();
+        if runtime_status != "running" || is_pid_running(pid) {
+            continue;
+        }
+
+        let task_id = task
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let phase = task["task_runtime"]["current_phase"]
+            .as_str()
+            .unwrap_or("dev")
+            .to_string();
+        let old_state = task
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("todo")
+            .to_string();
+
+        task["task_runtime"]["pid"] = serde_json::Value::Null;
+        task["task_runtime"]["status"] = serde_json::Value::String("stale".to_string());
+        task["task_runtime"]["last_error"] = serde_json::Value::String(format!(
+            "runtime pid {} is not running; auto-reset ({})",
+            pid, reason
+        ));
+        task["updated_at"] = serde_json::Value::String(now.clone());
+        task["state_changed_at"] = serde_json::Value::String(now.clone());
+        if old_state == "claimed" && phase == "dev" {
+            task["state"] = serde_json::Value::String("todo".to_string());
+            task["assignee"] = serde_json::Value::Null;
+        } else {
+            task["state"] = serde_json::Value::String("blocked".to_string());
+        }
+        fixed += 1;
+        if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Runtime ghost cleanup task={} state={} phase={} pid={} -> {} ({})",
+                task_id,
+                old_state,
+                phase,
+                pid,
+                task["state"].as_str().unwrap_or("blocked"),
+                reason
+            ));
+        }
+    }
+    if fixed > 0 {
+        recompute_resource_locks_from_tasks(registry);
+        set_registry_updated_at(registry);
+        if let (Some(log), Some(root)) = (logger, repo_root) {
+            let _ = log.note(format!(
+                "- Runtime ghost cleanup applied count={} registry={}",
+                fixed,
+                coordinator_registry_path(root).display()
+            ));
+        }
+    }
+    Ok(fixed)
+}
+
+fn cleanup_dead_runtime_tasks(
+    repo_root: &std::path::Path,
+    reason: &str,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<usize> {
+    let mut registry = load_registry_json(repo_root)?;
+    let fixed =
+        cleanup_dead_runtime_tasks_in_registry(&mut registry, reason, logger, Some(repo_root))?;
+    if fixed > 0 {
+        save_registry_json(repo_root, &registry)?;
+    }
+    Ok(fixed)
+}
+
+fn reconcile_registry_native(repo_root: &std::path::Path) -> Result<()> {
+    let mut registry = load_registry_json(repo_root)?;
+    let _ =
+        cleanup_dead_runtime_tasks_in_registry(&mut registry, "reconcile", None, Some(repo_root))?;
+    recompute_resource_locks_from_tasks(&mut registry);
+    set_registry_updated_at(&mut registry);
+    save_registry_json(repo_root, &registry)
+}
+
+fn cleanup_registry_native(repo_root: &std::path::Path) -> Result<()> {
+    let mut registry = load_registry_json(repo_root)?;
+    let mut changed = false;
+    if let Some(tasks) = registry
+        .get_mut("tasks")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for task in tasks.iter_mut() {
+            let state = task
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("todo");
+            if state == "abandoned" || state == "todo" {
+                if task.get("worktree").is_some() && !task.get("worktree").unwrap().is_null() {
+                    task["worktree"] = serde_json::Value::Null;
+                    changed = true;
+                }
+                if task.get("assignee").is_some() && !task.get("assignee").unwrap().is_null() {
+                    task["assignee"] = serde_json::Value::Null;
+                    changed = true;
+                }
+                ensure_runtime_object(task);
+                if task["task_runtime"]["pid"].is_number() {
+                    task["task_runtime"]["pid"] = serde_json::Value::Null;
+                    changed = true;
+                }
+            } else if state == "merged" {
+                if task.get("assignee").is_some() && !task.get("assignee").unwrap().is_null() {
+                    task["assignee"] = serde_json::Value::Null;
+                    changed = true;
+                }
+                ensure_runtime_object(task);
+                if task["task_runtime"]["pid"].is_number() {
+                    task["task_runtime"]["pid"] = serde_json::Value::Null;
+                    changed = true;
+                }
+            }
+        }
+    }
+    if changed {
+        recompute_resource_locks_from_tasks(&mut registry);
+        set_registry_updated_at(&mut registry);
+        save_registry_json(repo_root, &registry)?;
+    }
+    Ok(())
+}
+
+fn sanitize_slug(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch == '-' || ch == '_' || ch == ' ' {
+            out.push('-');
+        }
+    }
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn is_worktree_clean(worktree_path: &std::path::Path) -> Result<bool> {
+    let output = std::process::Command::new("git")
+        .current_dir(worktree_path)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|e| MaccError::Io {
+            path: worktree_path.to_string_lossy().into(),
+            action: "check worktree clean status".into(),
+            source: e,
+        })?;
+    Ok(output.status.success() && String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+fn active_task_worktree_paths(registry: &serde_json::Value) -> HashSet<String> {
+    let mut out = HashSet::new();
+    if let Some(tasks) = registry.get("tasks").and_then(serde_json::Value::as_array) {
+        for task in tasks {
+            let state = task
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("todo");
+            if !matches!(
+                state,
+                "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued"
+            ) {
+                continue;
+            }
+            if let Some(path) = task
+                .get("worktree")
+                .and_then(|w| w.get("worktree_path"))
+                .and_then(serde_json::Value::as_str)
+            {
+                if !path.is_empty() {
+                    out.insert(path.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn can_reuse_worktree_slot(registry: &serde_json::Value, worktree_path: &std::path::Path) -> bool {
+    let key = worktree_path.to_string_lossy().to_string();
+    let mut seen = false;
+    let mut all_merged = true;
+    if let Some(tasks) = registry.get("tasks").and_then(serde_json::Value::as_array) {
+        for task in tasks {
+            let path = task
+                .get("worktree")
+                .and_then(|w| w.get("worktree_path"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if path != key {
+                continue;
+            }
+            seen = true;
+            let state = task
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("todo");
+            if state != "merged" {
+                all_merged = false;
+                break;
+            }
+        }
+    }
+    !seen || all_merged
+}
+
+fn write_worktree_metadata_file(
+    worktree_path: &std::path::Path,
+    metadata: &macc_core::WorktreeMetadata,
+) -> Result<()> {
+    let macc_dir = worktree_path.join(".macc");
+    std::fs::create_dir_all(&macc_dir).map_err(|e| MaccError::Io {
+        path: macc_dir.to_string_lossy().into(),
+        action: "create worktree .macc dir".into(),
+        source: e,
+    })?;
+    let path = macc_dir.join("worktree.json");
+    let data = serde_json::to_string_pretty(metadata).map_err(|e| {
+        MaccError::Validation(format!("Failed to serialize worktree metadata: {}", e))
+    })?;
+    std::fs::write(&path, data).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "write worktree metadata".into(),
+        source: e,
+    })
+}
+
+fn build_non_task_worker_slug(worker_count: usize) -> String {
+    format!("worker-{:02}", worker_count + 1)
+}
+
+fn build_reuse_branch_name(tool: &str, worktree_path: &std::path::Path) -> String {
+    let slot = sanitize_slug(
+        worktree_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("worker"),
+    );
+    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    format!(
+        "ai/{}/{}-{}",
+        tool,
+        if slot.is_empty() { "worker" } else { &slot },
+        ts
+    )
+}
+
+fn git_rev_parse(worktree_path: &std::path::Path, rev: &str) -> Option<String> {
+    std::process::Command::new("git")
+        .current_dir(worktree_path)
+        .args(["rev-parse", rev])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn git_current_branch_name(worktree_path: &std::path::Path) -> Option<String> {
+    std::process::Command::new("git")
+        .current_dir(worktree_path)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn prepare_reused_worktree_base(
+    worktree_path: &std::path::Path,
+    base_branch: &str,
+) -> Result<(bool, bool)> {
+    let Some(base_head) = git_rev_parse(worktree_path, base_branch) else {
+        return Ok((false, false));
+    };
+    let current_head = git_rev_parse(worktree_path, "HEAD").unwrap_or_default();
+    let current_branch = git_current_branch_name(worktree_path).unwrap_or_default();
+    if current_branch == base_branch && current_head == base_head {
+        return Ok((true, true));
+    }
+    let checkout = std::process::Command::new("git")
+        .current_dir(worktree_path)
+        .args(["checkout", base_branch])
+        .status()
+        .map_err(|e| MaccError::Io {
+            path: worktree_path.to_string_lossy().into(),
+            action: "checkout base branch in reused worktree".into(),
+            source: e,
+        })?;
+    if !checkout.success() {
+        return Ok((false, false));
+    }
+    let checked_out_head = git_rev_parse(worktree_path, "HEAD").unwrap_or_default();
+    if checked_out_head == base_head {
+        return Ok((true, true));
+    }
+    let reset = std::process::Command::new("git")
+        .current_dir(worktree_path)
+        .args(["reset", "--hard", base_branch])
+        .status()
+        .map_err(|e| MaccError::Io {
+            path: worktree_path.to_string_lossy().into(),
+            action: "reset reused worktree to base branch".into(),
+            source: e,
+        })?;
+    Ok((reset.success(), false))
+}
+
+fn find_reusable_worktree_native(
+    repo_root: &std::path::Path,
+    registry: &serde_json::Value,
+    tool: &str,
+    base_branch: &str,
+) -> Result<Option<(std::path::PathBuf, String, String, bool)>> {
+    let active_paths = active_task_worktree_paths(registry);
+    let pool_root = repo_root.join(".macc").join("worktree");
+    let entries = macc_core::list_worktrees(repo_root)?;
+    for entry in entries {
+        if !entry.path.starts_with(&pool_root) {
+            continue;
+        }
+        let key = entry.path.to_string_lossy().to_string();
+        if active_paths.contains(&key) {
+            continue;
+        }
+        if !can_reuse_worktree_slot(registry, &entry.path) {
+            continue;
+        }
+        if !is_worktree_clean(&entry.path)? {
+            continue;
+        }
+        let merge_head = std::process::Command::new("git")
+            .current_dir(&entry.path)
+            .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if merge_head {
+            continue;
+        }
+        let base_ok = std::process::Command::new("git")
+            .current_dir(&entry.path)
+            .args(["rev-parse", "--verify", base_branch])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !base_ok {
+            continue;
+        }
+
+        let (prepared, skipped_reset) = prepare_reused_worktree_base(&entry.path, base_branch)?;
+        if !prepared {
+            continue;
+        }
+        if !is_worktree_clean(&entry.path)? {
+            continue;
+        }
+
+        let mut branch = build_reuse_branch_name(tool, &entry.path);
+        let mut i = 0usize;
+        loop {
+            let exists = std::process::Command::new("git")
+                .current_dir(repo_root)
+                .args(["rev-parse", "--verify", &branch])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !exists {
+                break;
+            }
+            i += 1;
+            branch = format!("{}-{}", build_reuse_branch_name(tool, &entry.path), i);
+        }
+        let status = std::process::Command::new("git")
+            .current_dir(&entry.path)
+            .args(["checkout", "-B", &branch, base_branch])
+            .status()
+            .map_err(|e| MaccError::Io {
+                path: entry.path.to_string_lossy().into(),
+                action: "create branch in reused worktree".into(),
+                source: e,
+            })?;
+        if !status.success() {
+            continue;
+        }
+        let last_commit = std::process::Command::new("git")
+            .current_dir(&entry.path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+
+        let existing = macc_core::read_worktree_metadata(&entry.path)?.unwrap_or(
+            macc_core::WorktreeMetadata {
+                id: entry
+                    .path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("worker")
+                    .to_string(),
+                tool: tool.to_string(),
+                scope: None,
+                feature: None,
+                base: base_branch.to_string(),
+                branch: branch.clone(),
+            },
+        );
+        let updated = macc_core::WorktreeMetadata {
+            id: existing.id,
+            tool: tool.to_string(),
+            scope: existing.scope,
+            feature: existing.feature,
+            base: base_branch.to_string(),
+            branch: branch.clone(),
+        };
+        write_worktree_metadata_file(&entry.path, &updated)?;
+        return Ok(Some((entry.path, branch, last_commit, skipped_reset)));
+    }
+    Ok(None)
+}
+
+fn count_pool_worktrees(repo_root: &std::path::Path) -> Result<usize> {
+    let pool_root = repo_root.join(".macc").join("worktree");
+    let entries = macc_core::list_worktrees(repo_root)?;
+    Ok(entries
+        .into_iter()
+        .filter(|e| e.path.starts_with(&pool_root))
+        .count())
+}
+
+fn read_coordinator_counts(
+    paths: &macc_core::ProjectPaths,
+) -> Result<coordinator_engine::CoordinatorCounts> {
+    let registry_path = paths
+        .root
+        .join(".macc")
+        .join("automation")
+        .join("task")
+        .join("task_registry.json");
+    let raw = std::fs::read_to_string(&registry_path).map_err(|e| MaccError::Io {
+        path: registry_path.to_string_lossy().into(),
+        action: "read coordinator registry".into(),
+        source: e,
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        MaccError::Validation(format!(
+            "Failed to parse coordinator registry {}: {}",
+            registry_path.display(),
+            e
+        ))
+    })?;
+    let tasks = value
+        .get("tasks")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
+
+    let mut counts = coordinator_engine::CoordinatorCounts {
+        total: tasks.len(),
+        todo: 0,
+        active: 0,
+        blocked: 0,
+        merged: 0,
+    };
+    for task in tasks {
+        let state = task
+            .get("state")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default();
+        match state {
+            "todo" => counts.todo += 1,
+            "blocked" => counts.blocked += 1,
+            "merged" => counts.merged += 1,
+            "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued" => {
+                counts.active += 1
+            }
+            _ => {}
+        }
+    }
+    Ok(counts)
+}
+
+fn sync_registry_from_prd_native(
+    repo_root: &std::path::Path,
+    prd_file: &std::path::Path,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<()> {
+    let mut registry = load_registry_json(repo_root)?;
+    let raw_prd = std::fs::read_to_string(prd_file).map_err(|e| MaccError::Io {
+        path: prd_file.to_string_lossy().into(),
+        action: "read coordinator prd".into(),
+        source: e,
+    })?;
+    let prd: serde_json::Value = serde_json::from_str(&raw_prd).map_err(|e| {
+        MaccError::Validation(format!("Failed to parse PRD {}: {}", prd_file.display(), e))
+    })?;
+    let prd_tasks = prd
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if !registry
+        .get("tasks")
+        .map(serde_json::Value::is_array)
+        .unwrap_or(false)
+    {
+        registry["tasks"] = serde_json::Value::Array(Vec::new());
+    }
+
+    let existing_tasks = registry["tasks"].as_array().cloned().unwrap_or_default();
+    let mut by_id: HashMap<String, serde_json::Value> = HashMap::new();
+    for task in existing_tasks {
+        if let Some(id) = task
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string())
+        {
+            by_id.insert(id, task);
+        }
+    }
+
+    let mut merged = Vec::new();
+    for prd_task in prd_tasks {
+        let id = if let Some(v) = prd_task.get("id").and_then(serde_json::Value::as_str) {
+            v.to_string()
+        } else if let Some(v) = prd_task.get("id").and_then(serde_json::Value::as_i64) {
+            v.to_string()
+        } else {
+            String::new()
+        };
+        if id.is_empty() {
+            continue;
+        }
+        let mut task = by_id.remove(&id).unwrap_or_else(|| {
+            serde_json::json!({
+                "id": id,
+                "state": "todo",
+                "dependencies": [],
+                "exclusive_resources": [],
+                "task_runtime": {
+                    "status": "idle",
+                    "pid": null,
+                    "current_phase": null,
+                    "merge_result_pending": false,
+                    "merge_result_file": null
+                }
+            })
+        });
+
+        for key in [
+            "title",
+            "description",
+            "objective",
+            "result",
+            "steps",
+            "notes",
+            "category",
+            "priority",
+            "dependencies",
+            "exclusive_resources",
+            "base_branch",
+            "scope",
+        ] {
+            if let Some(v) = prd_task.get(key) {
+                task[key] = v.clone();
+            }
+        }
+        ensure_runtime_object(&mut task);
+        task["updated_at"] = serde_json::Value::String(now_iso_coordinator());
+        merged.push(task);
+    }
+
+    registry["tasks"] = serde_json::Value::Array(merged);
+    recompute_resource_locks_from_tasks(&mut registry);
+    set_registry_updated_at(&mut registry);
+    save_registry_json(repo_root, &registry)?;
+    if let Some(log) = logger {
+        let count = registry
+            .get("tasks")
+            .and_then(serde_json::Value::as_array)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let _ = log.note(format!("Registry synced from PRD (tasks={})", count));
+    }
+    Ok(())
+}
+
+fn coordinator_log_dir(repo_root: &std::path::Path) -> std::path::PathBuf {
+    repo_root.join(".macc").join("log").join("coordinator")
+}
+
+fn coordinator_merge_fix_hook(repo_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Ok(v) = std::env::var("COORDINATOR_MERGE_FIX_HOOK") {
+        if !v.trim().is_empty() {
+            let p = std::path::PathBuf::from(v);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    let default = repo_root
+        .join("automat")
+        .join("hooks")
+        .join("ai-merge-fix.sh");
+    if default.exists() {
+        Some(default)
+    } else {
+        None
+    }
+}
+
+fn is_truthy_env(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
+fn summarize_output(text: &str) -> String {
+    let normalized = text.replace('\n', " ").replace('\r', " ");
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() > 1000 {
+        format!("{}...", &collapsed[..1000])
+    } else {
+        collapsed
+    }
+}
+
+fn merge_task_with_policy_native(
+    repo_root: &std::path::Path,
+    task_id: &str,
+    branch: &str,
+    base: &str,
+) -> Result<std::result::Result<(), String>> {
+    let log_dir = coordinator_log_dir(repo_root);
+    std::fs::create_dir_all(&log_dir).map_err(|e| MaccError::Io {
+        path: log_dir.to_string_lossy().into(),
+        action: "create coordinator log dir".into(),
+        source: e,
+    })?;
+    let suggestion = format!("git checkout {} && git merge {}", base, branch);
+
+    let verify_branch = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "--verify", branch])
+        .output();
+    if !verify_branch
+        .as_ref()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok(Err(format!(
+            "failure:local_merge step=verify_branch branch={} base={} suggestion=\"{}\"",
+            branch, base, suggestion
+        )));
+    }
+    let verify_base = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "--verify", base])
+        .output();
+    if !verify_base
+        .as_ref()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok(Err(format!(
+            "failure:local_merge step=verify_base branch={} base={} suggestion=\"{}\"",
+            branch, base, suggestion
+        )));
+    }
+
+    let clean = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|e| MaccError::Io {
+            path: repo_root.to_string_lossy().into(),
+            action: "check git status".into(),
+            source: e,
+        })?;
+    if !String::from_utf8_lossy(&clean.stdout).trim().is_empty() {
+        return Ok(Err(format!(
+            "failure:local_merge step=precheck_clean branch={} base={} suggestion=\"{}\"",
+            branch, base, suggestion
+        )));
+    }
+
+    let _ = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["checkout", base])
+        .status();
+    let merge_msg = format!("macc: merge task {}", task_id);
+    let merge = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["merge", "--no-ff", "-m", &merge_msg, branch])
+        .output()
+        .map_err(|e| MaccError::Io {
+            path: repo_root.to_string_lossy().into(),
+            action: "run local merge".into(),
+            source: e,
+        })?;
+    if merge.status.success() {
+        return Ok(Ok(()));
+    }
+
+    let merge_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&merge.stdout),
+        String::from_utf8_lossy(&merge.stderr)
+    );
+    let conflicts = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().replace('\n', ","))
+        .unwrap_or_default();
+
+    let mut hook_output = String::new();
+    let allow_ai_fix = is_truthy_env("COORDINATOR_MERGE_AI_FIX", false);
+    if allow_ai_fix {
+        if let Some(hook) = coordinator_merge_fix_hook(repo_root) {
+            let output = std::process::Command::new(hook)
+                .current_dir(repo_root)
+                .arg("--repo")
+                .arg(repo_root)
+                .arg("--task-id")
+                .arg(task_id)
+                .arg("--branch")
+                .arg(branch)
+                .arg("--base-branch")
+                .arg(base)
+                .arg("--failure-step")
+                .arg("merge")
+                .arg("--failure-reason")
+                .arg("git merge reported conflicts")
+                .arg("--conflicts")
+                .arg(&conflicts)
+                .output();
+            if let Ok(out) = output {
+                hook_output = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            let unresolved = std::process::Command::new("git")
+                .current_dir(repo_root)
+                .args(["diff", "--name-only", "--diff-filter=U"])
+                .output()
+                .ok()
+                .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+                .unwrap_or(true);
+            let in_merge = std::process::Command::new("git")
+                .current_dir(repo_root)
+                .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !unresolved && !in_merge {
+                return Ok(Ok(()));
+            }
+        }
+    }
+
+    let in_merge = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if in_merge {
+        let _ = std::process::Command::new("git")
+            .current_dir(repo_root)
+            .args(["merge", "--abort"])
+            .status();
+    }
+
+    let report_file = log_dir.join(format!(
+        "merge-fail-{}-{}.md",
+        task_id,
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+    ));
+    let report = format!(
+        "# Local merge failure report\n\n- Task: {}\n- Branch: {}\n- Base: {}\n- UTC: {}\n\n## Conflicts\n\n{}\n\n## Suggested manual command\n\n`cd \"{}\" && {}`\n\n## Merge stdout/stderr\n\n```text\n{}\n```\n\n## Merge-fix hook output\n\n```text\n{}\n```\n",
+        task_id,
+        branch,
+        base,
+        now_iso_coordinator(),
+        if conflicts.is_empty() { "none" } else { &conflicts },
+        repo_root.display(),
+        suggestion,
+        merge_output,
+        hook_output
+    );
+    let _ = std::fs::write(&report_file, report);
+    let err = format!(
+        "failure:local_merge step=merge branch={} base={} conflicts=[{}] git_output=\"{}\" suggestion=\"{}\" report=\"{}\"",
+        branch,
+        base,
+        if conflicts.is_empty() { "none" } else { &conflicts },
+        summarize_output(&merge_output),
+        suggestion,
+        report_file.display()
+    );
+    Ok(Err(err))
+}
+
+fn resolve_phase_runner_native(
+    repo_root: &std::path::Path,
+    worktree_path: &std::path::Path,
+    tool: &str,
+) -> Result<Option<std::path::PathBuf>> {
+    let explicit = worktree_path
+        .join(".macc")
+        .join("automation")
+        .join("runners")
+        .join(format!("{}.performer.sh", tool));
+    if explicit.exists() {
+        return Ok(Some(explicit));
+    }
+    let tool_json_path = worktree_path.join(".macc").join("tool.json");
+    if !tool_json_path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&tool_json_path).map_err(|e| MaccError::Io {
+        path: tool_json_path.to_string_lossy().into(),
+        action: "read tool.json for phase runner".into(),
+        source: e,
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        MaccError::Validation(format!(
+            "Failed to parse tool.json for phase runner {}: {}",
+            tool_json_path.display(),
+            e
+        ))
+    })?;
+    let runner = value
+        .get("performer")
+        .and_then(|v| v.get("runner"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if runner.is_empty() {
+        return Ok(None);
+    }
+    let path = if std::path::Path::new(runner).is_absolute() {
+        std::path::PathBuf::from(runner)
+    } else {
+        repo_root.join(runner)
+    };
+    Ok(Some(path))
+}
+
+fn build_phase_prompt_native(
+    mode: &str,
+    task_id: &str,
+    tool: &str,
+    task_json: &serde_json::Value,
+) -> Result<String> {
+    let task_payload = serde_json::to_string(task_json).map_err(|e| {
+        MaccError::Validation(format!(
+            "Failed to serialize task payload for '{}' phase prompt (task={}): {}",
+            mode, task_id, e
+        ))
+    })?;
+    Ok(format!(
+        "You are the assigned {} performer running inside a MACC worktree.\n\nMode: {}\nTask ID: {}\n\nTask registry entry (JSON):\n{}\n\nInstructions:\n1) Execute the {} phase only.\n2) Keep changes minimal and focused on this task.\n3) Update code/tests/docs as needed for this phase.\n4) Do not modify task registry state directly.\n",
+        tool, mode, task_id, task_payload, mode
+    ))
+}
+
+fn run_coordinator_phase_native(
+    repo_root: &std::path::Path,
+    task: &serde_json::Value,
+    mode: &str,
+    coordinator_tool_override: Option<&str>,
+    max_attempts: usize,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<std::result::Result<(), String>> {
+    let task_id = task
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let worktree_path = task
+        .get("worktree")
+        .and_then(|w| w.get("worktree_path"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if task_id.is_empty() || worktree_path.is_empty() {
+        return Ok(Err(format!(
+            "phase '{}' cannot run: missing task id or worktree path",
+            mode
+        )));
+    }
+    let phase_tool = coordinator_tool_override
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            task.get("coordinator_tool")
+                .and_then(serde_json::Value::as_str)
+                .filter(|v| !v.trim().is_empty())
+        })
+        .or_else(|| {
+            task.get("tool")
+                .and_then(serde_json::Value::as_str)
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_default()
+        .to_string();
+    if phase_tool.is_empty() {
+        return Ok(Err(format!(
+            "phase '{}' cannot run for task {}: missing coordinator tool",
+            mode, task_id
+        )));
+    }
+    let worktree = std::path::PathBuf::from(worktree_path);
+    let tool_json = worktree.join(".macc").join("tool.json");
+    if !tool_json.exists() {
+        return Ok(Err(format!(
+            "phase '{}' cannot run for task {}: missing {}",
+            mode,
+            task_id,
+            tool_json.display()
+        )));
+    }
+    let Some(runner_path) = resolve_phase_runner_native(repo_root, &worktree, &phase_tool)? else {
+        return Ok(Err(format!(
+            "phase '{}' cannot run for task {}: missing runner for tool '{}'",
+            mode, task_id, phase_tool
+        )));
+    };
+    if !runner_path.exists() {
+        return Ok(Err(format!(
+            "phase '{}' cannot run for task {}: runner path not found {}",
+            mode,
+            task_id,
+            runner_path.display()
+        )));
+    }
+    let prompt = build_phase_prompt_native(mode, task_id, &phase_tool, task)?;
+    let prompt_dir = worktree.join(".macc").join("tmp");
+    std::fs::create_dir_all(&prompt_dir).map_err(|e| MaccError::Io {
+        path: prompt_dir.to_string_lossy().into(),
+        action: "create coordinator phase prompt directory".into(),
+        source: e,
+    })?;
+    let prompt_path = prompt_dir.join(format!(
+        "coordinator-phase-{}-{}.prompt.txt",
+        mode,
+        task_id.replace('/', "-")
+    ));
+    std::fs::write(&prompt_path, prompt).map_err(|e| MaccError::Io {
+        path: prompt_path.to_string_lossy().into(),
+        action: "write coordinator phase prompt".into(),
+        source: e,
+    })?;
+    let events_file = repo_root
+        .join(".macc")
+        .join("log")
+        .join("coordinator")
+        .join("events.jsonl");
+    let attempts = max_attempts.max(1);
+    if let Some(log) = logger {
+        let _ = log.note(format!(
+            "- Phase {} start task={} tool={} attempts={}",
+            mode, task_id, phase_tool, attempts
+        ));
+    }
+    let mut last_reason = String::new();
+    for attempt in 1..=attempts {
+        let output = std::process::Command::new(&runner_path)
+            .current_dir(&worktree)
+            .env(
+                "COORD_EVENTS_FILE",
+                events_file.to_string_lossy().to_string(),
+            )
+            .env(
+                "MACC_EVENT_SOURCE",
+                format!(
+                    "coordinator-phase:{}:{}:{}:{}",
+                    mode,
+                    phase_tool,
+                    task_id,
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                ),
+            )
+            .env("MACC_EVENT_TASK_ID", task_id)
+            .arg("--prompt-file")
+            .arg(&prompt_path)
+            .arg("--tool-json")
+            .arg(&tool_json)
+            .arg("--repo")
+            .arg(repo_root)
+            .arg("--worktree")
+            .arg(&worktree)
+            .arg("--task-id")
+            .arg(task_id)
+            .arg("--attempt")
+            .arg(attempt.to_string())
+            .arg("--max-attempts")
+            .arg(attempts.to_string())
+            .output();
+        let Ok(out) = output else {
+            last_reason = format!(
+                "phase '{}' failed to execute runner '{}'",
+                mode,
+                runner_path.display()
+            );
+            continue;
+        };
+        if out.status.success() {
+            let _ = std::fs::remove_file(&prompt_path);
+            if let Some(log) = logger {
+                let _ = log.note(format!(
+                    "- Phase {} done task={} attempt={}",
+                    mode, task_id, attempt
+                ));
+            }
+            return Ok(Ok(()));
+        }
+        last_reason = format!(
+            "phase '{}' failed for task {} on attempt {}/{}: status={} stdout=\"{}\" stderr=\"{}\"",
+            mode,
+            task_id,
+            attempt,
+            attempts,
+            out.status,
+            summarize_output(&String::from_utf8_lossy(&out.stdout)),
+            summarize_output(&String::from_utf8_lossy(&out.stderr))
+        );
+    }
+    let _ = std::fs::remove_file(&prompt_path);
+    if let Some(log) = logger {
+        let _ = log.note(format!(
+            "- Phase {} failed task={} reason={}",
+            mode, task_id, last_reason
+        ));
+    }
+    Ok(Err(last_reason))
+}
+
+fn advance_tasks_native(
+    repo_root: &std::path::Path,
+    coordinator_tool_override: Option<&str>,
+    phase_runner_max_attempts: usize,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<AdvanceOutcome> {
+    let mut registry = load_registry_json(repo_root)?;
+    let mut progressed = false;
+    let mut blocked_merge: Option<(String, String)> = None;
+    let now = now_iso_coordinator();
+    let tasks = registry
+        .get_mut("tasks")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
+
+    for task in tasks.iter_mut() {
+        let state = task
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("todo")
+            .to_string();
+        let workflow_state = state.parse::<WorkflowState>().ok();
+        match workflow_state
+            .map(coordinator_engine::plan_advance)
+            .unwrap_or(coordinator_engine::AdvancePlan::Noop)
+        {
+            coordinator_engine::AdvancePlan::RunPhase(transition) => {
+                match run_coordinator_phase_native(
+                    repo_root,
+                    task,
+                    transition.mode,
+                    coordinator_tool_override,
+                    phase_runner_max_attempts,
+                    logger,
+                )? {
+                    Ok(()) => {
+                        coordinator_engine::apply_phase_success(task, transition, &now);
+                        if transition.next_state == WorkflowState::PrOpen
+                            && task
+                                .get("pr_url")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
+                                .is_empty()
+                        {
+                            let branch = task
+                                .get("worktree")
+                                .and_then(|w| w.get("branch"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown");
+                            task["pr_url"] =
+                                serde_json::Value::String(format!("local://{}", branch));
+                        }
+                    }
+                    Err(reason) => {
+                        coordinator_engine::apply_phase_failure(
+                            task,
+                            transition.runtime_phase,
+                            &reason,
+                            &now,
+                        );
+                    }
+                }
+                progressed = true;
+            }
+            coordinator_engine::AdvancePlan::Merge => {
+                let task_id = task
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let branch = task
+                    .get("worktree")
+                    .and_then(|w| w.get("branch"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let base = task
+                    .get("worktree")
+                    .and_then(|w| w.get("base_branch"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("master")
+                    .to_string();
+                if !branch.is_empty() {
+                    if let Some(log) = logger {
+                        let _ = log.note(format!(
+                            "- Merge start task={} branch={} base={}",
+                            task_id, branch, base
+                        ));
+                    }
+                    match merge_task_with_policy_native(repo_root, &task_id, &branch, &base)? {
+                        Ok(()) => {
+                            coordinator_engine::apply_merge_success(task, &now);
+                            if let Some(log) = logger {
+                                let _ = log.note(format!("- Merge done task={}", task_id));
+                            }
+                            progressed = true;
+                        }
+                        Err(reason) => {
+                            coordinator_engine::apply_merge_failure(task, &reason, &now);
+                            blocked_merge = Some((
+                                task_id.clone(),
+                                task["task_runtime"]["last_error"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            ));
+                            if let Some(log) = logger {
+                                let _ = log.note(format!(
+                                    "- Merge failed task={} reason={}",
+                                    task_id,
+                                    task["task_runtime"]["last_error"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                ));
+                            }
+                            progressed = true;
+                        }
+                    }
+                }
+            }
+            coordinator_engine::AdvancePlan::Noop => {}
+        }
+    }
+
+    recompute_resource_locks_from_tasks(&mut registry);
+    set_registry_updated_at(&mut registry);
+    save_registry_json(repo_root, &registry)?;
+    Ok(AdvanceOutcome {
+        progressed,
+        blocked_merge,
+    })
+}
+
+async fn monitor_active_jobs_native(
+    repo_root: &std::path::Path,
+    state: &mut CoordinatorRunState,
+    max_attempts: usize,
+    phase_timeout_seconds: usize,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<()> {
+    loop {
+        match state.event_rx.try_recv() {
+            Ok(evt) => {
+                let maybe_job = state.active_jobs.remove(&evt.task_id);
+                let Some(job) = maybe_job else {
+                    continue;
+                };
+                let mut registry = load_registry_json(repo_root)?;
+                let tasks = registry
+                    .get_mut("tasks")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
+
+                let mut should_retry = false;
+                for task in tasks.iter_mut() {
+                    if task
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        != evt.task_id
+                    {
+                        continue;
+                    }
+                    ensure_runtime_object(task);
+                    if evt.success {
+                        task["state"] = serde_json::Value::String("in_progress".to_string());
+                        task["task_runtime"]["status"] =
+                            serde_json::Value::String("phase_done".to_string());
+                        task["task_runtime"]["current_phase"] =
+                            serde_json::Value::String("dev".to_string());
+                        task["task_runtime"]["pid"] = serde_json::Value::Null;
+                    } else if job.attempt < max_attempts {
+                        should_retry = true;
+                        task["state"] = serde_json::Value::String("claimed".to_string());
+                        task["task_runtime"]["status"] =
+                            serde_json::Value::String("running".to_string());
+                        task["task_runtime"]["current_phase"] =
+                            serde_json::Value::String("dev".to_string());
+                        task["task_runtime"]["pid"] = serde_json::Value::Null;
+                        let reason = if evt.timed_out {
+                            format!(
+                                "performer timed out after {}s on attempt {} (elapsed={}s)",
+                                phase_timeout_seconds,
+                                job.attempt,
+                                job.started_at.elapsed().as_secs()
+                            )
+                        } else {
+                            format!(
+                                "performer failed on attempt {}: {}",
+                                job.attempt, evt.status_text
+                            )
+                        };
+                        task["task_runtime"]["last_error"] = serde_json::Value::String(reason);
+                    } else {
+                        task["state"] = serde_json::Value::String("blocked".to_string());
+                        task["task_runtime"]["status"] =
+                            serde_json::Value::String("failed".to_string());
+                        task["task_runtime"]["pid"] = serde_json::Value::Null;
+                        let reason = if evt.timed_out {
+                            format!(
+                                "performer timed out after {}s (max attempts reached: {}, elapsed={}s)",
+                                phase_timeout_seconds,
+                                max_attempts,
+                                job.started_at.elapsed().as_secs()
+                            )
+                        } else {
+                            format!(
+                                "performer failed after {} attempts: {}",
+                                job.attempt, evt.status_text
+                            )
+                        };
+                        task["task_runtime"]["last_error"] = serde_json::Value::String(reason);
+                    }
+                    task["state_changed_at"] = serde_json::Value::String(now_iso_coordinator());
+                    break;
+                }
+
+                recompute_resource_locks_from_tasks(&mut registry);
+                set_registry_updated_at(&mut registry);
+                save_registry_json(repo_root, &registry)?;
+
+                if should_retry {
+                    let task_id = evt.task_id.clone();
+                    let retry_pid = spawn_performer_job_native(
+                        repo_root,
+                        &task_id,
+                        &job.worktree_path,
+                        &state.event_tx,
+                        &mut state.join_set,
+                        phase_timeout_seconds,
+                    )?;
+                    state.active_jobs.insert(
+                        task_id,
+                        CoordinatorJob {
+                            tool: job.tool,
+                            worktree_path: job.worktree_path,
+                            attempt: job.attempt + 1,
+                            started_at: std::time::Instant::now(),
+                            pid: retry_pid,
+                        },
+                    );
+                    if let Some(log) = logger {
+                        let _ = log.note(format!(
+                            "- Task {} retry scheduled attempt={}",
+                            evt.task_id,
+                            job.attempt + 1
+                        ));
+                    }
+                } else if let Some(log) = logger {
+                    let status = if evt.success { "phase_done" } else { "failed" };
+                    let _ = log.note(format!(
+                        "- Task {} completion status={} attempt={} detail={}",
+                        evt.task_id, status, job.attempt, evt.status_text
+                    ));
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+    while let Some(joined) = state.join_set.try_join_next() {
+        let _ = joined;
+    }
+    Ok(())
+}
+
+fn spawn_performer_job_native(
+    repo_root: &std::path::Path,
+    task_id: &str,
+    worktree_path: &std::path::Path,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<CoordinatorJobEvent>,
+    join_set: &mut tokio::task::JoinSet<()>,
+    phase_timeout_seconds: usize,
+) -> Result<Option<i64>> {
+    let mut run_cmd = tokio::process::Command::new(std::env::current_exe().map_err(|e| {
+        MaccError::Validation(format!("Failed to resolve current executable path: {}", e))
+    })?);
+    run_cmd
+        .current_dir(repo_root)
+        .arg("--cwd")
+        .arg(repo_root)
+        .arg("worktree")
+        .arg("run")
+        .arg(worktree_path.to_string_lossy().to_string());
+    let mut child = run_cmd.spawn().map_err(|e| MaccError::Io {
+        path: worktree_path.to_string_lossy().into(),
+        action: "spawn performer process".into(),
+        source: e,
+    })?;
+    let pid = child.id().map(|v| v as i64);
+    let task_id_owned = task_id.to_string();
+    let tx = event_tx.clone();
+    join_set.spawn(async move {
+        let (success, status_text, timed_out) = if phase_timeout_seconds > 0 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(phase_timeout_seconds as u64),
+                child.wait(),
+            )
+            .await
+            {
+                Ok(Ok(status)) => (status.success(), status.to_string(), false),
+                Ok(Err(err)) => (false, err.to_string(), false),
+                Err(_) => {
+                    let _ = child.kill().await;
+                    (false, "timeout".to_string(), true)
+                }
+            }
+        } else {
+            match child.wait().await {
+                Ok(status) => (status.success(), status.to_string(), false),
+                Err(err) => (false, err.to_string(), false),
+            }
+        };
+        let _ = tx.send(CoordinatorJobEvent {
+            task_id: task_id_owned,
+            success,
+            status_text,
+            timed_out,
+        });
+    });
+    Ok(pid)
+}
+
+fn write_worktree_prd_for_task(
+    prd_file: &std::path::Path,
+    task_id: &str,
+    worktree_path: &std::path::Path,
+) -> Result<()> {
+    let prd_raw = std::fs::read_to_string(prd_file).map_err(|e| MaccError::Io {
+        path: prd_file.to_string_lossy().into(),
+        action: "read prd for worktree".into(),
+        source: e,
+    })?;
+    let prd: serde_json::Value = serde_json::from_str(&prd_raw).map_err(|e| {
+        MaccError::Validation(format!(
+            "Failed to parse PRD {} for worktree: {}",
+            prd_file.display(),
+            e
+        ))
+    })?;
+    let selected = prd
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|t| {
+            t.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| id == task_id)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            MaccError::Validation(format!(
+                "Task '{}' not found in PRD {}",
+                task_id,
+                prd_file.display()
+            ))
+        })?;
+    let payload = serde_json::json!({
+        "lot": prd.get("lot").cloned().unwrap_or(serde_json::Value::Null),
+        "version": prd.get("version").cloned().unwrap_or(serde_json::Value::Null),
+        "generated_at": prd.get("generated_at").cloned().unwrap_or(serde_json::Value::Null),
+        "timezone": prd.get("timezone").cloned().unwrap_or(serde_json::Value::String("UTC".to_string())),
+        "priority_mapping": prd.get("priority_mapping").cloned().unwrap_or_else(|| serde_json::json!({})),
+        "assumptions": prd.get("assumptions").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "tasks": [selected],
+    });
+    let out_path = worktree_path.join("worktree.prd.json");
+    std::fs::write(
+        &out_path,
+        serde_json::to_string_pretty(&payload).map_err(|e| {
+            MaccError::Validation(format!(
+                "Failed to serialize worktree.prd.json payload: {}",
+                e
+            ))
+        })?,
+    )
+    .map_err(|e| MaccError::Io {
+        path: out_path.to_string_lossy().into(),
+        action: "write worktree.prd.json".into(),
+        source: e,
+    })
+}
+
+async fn dispatch_ready_tasks_native(
+    repo_root: &std::path::Path,
+    canonical: &macc_core::config::CanonicalConfig,
+    coordinator: Option<&macc_core::config::CoordinatorConfig>,
+    env_cfg: &CoordinatorEnvConfig,
+    prd_file: &std::path::Path,
+    state: &mut CoordinatorRunState,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<usize> {
+    let mut dispatched = 0usize;
+    let max_dispatch = env_cfg
+        .max_dispatch
+        .or_else(|| coordinator.and_then(|c| c.max_dispatch))
+        .unwrap_or(10);
+    let max_parallel = env_cfg
+        .max_parallel
+        .or_else(|| coordinator.and_then(|c| c.max_parallel))
+        .unwrap_or(3);
+
+    while max_dispatch == 0 || dispatched < max_dispatch {
+        if max_parallel > 0 && state.active_jobs.len() >= max_parallel {
+            break;
+        }
+
+        let mut registry = load_registry_json(repo_root)?;
+        let config = macc_core::coordinator::task_selector::TaskSelectorConfig {
+            enabled_tools: canonical.tools.enabled.clone(),
+            tool_priority: env_cfg
+                .tool_priority
+                .clone()
+                .map(|csv| {
+                    csv.split(',')
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .or_else(|| coordinator.map(|c| c.tool_priority.clone()))
+                .unwrap_or_default(),
+            max_parallel_per_tool: env_cfg
+                .max_parallel_per_tool_json
+                .clone()
+                .and_then(|raw| serde_json::from_str::<HashMap<String, usize>>(&raw).ok())
+                .or_else(|| {
+                    coordinator.map(|c| {
+                        c.max_parallel_per_tool
+                            .clone()
+                            .into_iter()
+                            .collect::<HashMap<_, _>>()
+                    })
+                })
+                .unwrap_or_default(),
+            tool_specializations: env_cfg
+                .tool_specializations_json
+                .clone()
+                .and_then(|raw| serde_json::from_str::<HashMap<String, Vec<String>>>(&raw).ok())
+                .or_else(|| {
+                    coordinator.map(|c| {
+                        c.tool_specializations
+                            .clone()
+                            .into_iter()
+                            .collect::<HashMap<_, _>>()
+                    })
+                })
+                .unwrap_or_default(),
+            max_parallel,
+            default_tool: canonical
+                .tools
+                .enabled
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "codex".to_string()),
+            default_base_branch: env_cfg
+                .reference_branch
+                .clone()
+                .or_else(|| coordinator.and_then(|c| c.reference_branch.clone()))
+                .unwrap_or_else(|| "master".to_string()),
+        };
+
+        let Some(selected) =
+            macc_core::coordinator::task_selector::select_next_ready_task(&registry, &config)
+        else {
+            break;
+        };
+        if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Dispatch candidate task={} tool={} base={}",
+                selected.id, selected.tool, selected.base_branch
+            ));
+        }
+
+        let reusable = find_reusable_worktree_native(
+            repo_root,
+            &registry,
+            &selected.tool,
+            &selected.base_branch,
+        )?;
+
+        let (worktree_path, branch, last_commit) = if let Some(reused) = reusable {
+            let (path, branch, last_commit, skipped_reset) = reused;
+            if let Some(log) = logger {
+                let _ = log.note(format!(
+                    "- reused_worktree path={} skipped_reset={}",
+                    path.display(),
+                    skipped_reset
+                ));
+            }
+            (path, branch, last_commit)
+        } else {
+            let pool_count = count_pool_worktrees(repo_root)?;
+            if max_parallel > 0 && pool_count >= max_parallel {
+                break;
+            }
+            let create_spec = macc_core::WorktreeCreateSpec {
+                slug: build_non_task_worker_slug(pool_count),
+                tool: selected.tool.clone(),
+                count: 1,
+                base: selected.base_branch.clone(),
+                dir: std::path::PathBuf::from(".macc/worktree"),
+                scope: None,
+                feature: None,
+            };
+            let mut created = macc_core::create_worktrees(repo_root, &create_spec)?;
+            let created = created
+                .pop()
+                .ok_or_else(|| MaccError::Validation("No worktree created".into()))?;
+            let last_commit = std::process::Command::new("git")
+                .current_dir(&created.path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            (created.path, created.branch, last_commit)
+        };
+        write_worktree_prd_for_task(prd_file, &selected.id, &worktree_path)?;
+        ensure_tool_json(repo_root, &worktree_path, &selected.tool)?;
+        let worktree_paths = macc_core::ProjectPaths::from_root(&worktree_path);
+        macc_core::init(&worktree_paths, false)?;
+        let canonical_yaml = canonical.to_yaml().map_err(|e| {
+            MaccError::Validation(format!(
+                "Failed to serialize canonical config for worktree dispatch apply: {}",
+                e
+            ))
+        })?;
+        macc_core::atomic_write(
+            &worktree_paths,
+            &worktree_paths.config_path,
+            canonical_yaml.as_bytes(),
+        )?;
+
+        let mut apply_cmd = tokio::process::Command::new(std::env::current_exe().map_err(|e| {
+            MaccError::Validation(format!("Failed to resolve current executable path: {}", e))
+        })?);
+        apply_cmd
+            .current_dir(repo_root)
+            .arg("--cwd")
+            .arg(repo_root)
+            .arg("worktree")
+            .arg("apply")
+            .arg(worktree_path.to_string_lossy().to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let apply_output = apply_cmd.output().await.map_err(|e| MaccError::Io {
+            path: worktree_path.to_string_lossy().into(),
+            action: "run worktree apply for coordinator dispatch".into(),
+            source: e,
+        })?;
+        if !apply_output.status.success() {
+            let detail = format!(
+                "stdout=\"{}\" stderr=\"{}\"",
+                summarize_output(&String::from_utf8_lossy(&apply_output.stdout)),
+                summarize_output(&String::from_utf8_lossy(&apply_output.stderr))
+            );
+            if let Some(log) = logger {
+                let _ = log.note(format!(
+                    "- Worktree apply failed task={} status={} {}",
+                    selected.id, apply_output.status, detail
+                ));
+            }
+            return Err(MaccError::Validation(format!(
+                "worktree apply failed for {} with status {} ({})",
+                selected.id, apply_output.status, detail
+            )));
+        }
+        if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Worktree ready task={} path={}",
+                selected.id,
+                worktree_path.display()
+            ));
+        }
+
+        let dispatch_now = now_iso_coordinator();
+        let dispatch_session_id = format!("coordinator-{}-{}", selected.id, dispatch_now);
+        let tasks = registry
+            .get_mut("tasks")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
+        for task in tasks.iter_mut() {
+            if task
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                == selected.id
+            {
+                let update = coordinator_engine::DispatchClaimUpdate {
+                    task_id: selected.id.clone(),
+                    tool: selected.tool.clone(),
+                    worktree_path: worktree_path.to_string_lossy().to_string(),
+                    branch: branch.clone(),
+                    base_branch: selected.base_branch.clone(),
+                    last_commit: last_commit.clone(),
+                    session_id: dispatch_session_id.clone(),
+                    pid: None,
+                    phase: "dev".to_string(),
+                    now: dispatch_now.clone(),
+                };
+                coordinator_engine::apply_dispatch_claim(task, &update);
+                break;
+            }
+        }
+        recompute_resource_locks_from_tasks(&mut registry);
+        set_registry_updated_at(&mut registry);
+        save_registry_json(repo_root, &registry)?;
+
+        let phase_timeout_seconds = env_cfg
+            .stale_in_progress_seconds
+            .or_else(|| coordinator.and_then(|c| c.stale_in_progress_seconds))
+            .unwrap_or(0);
+        let pid = spawn_performer_job_native(
+            repo_root,
+            &selected.id,
+            &worktree_path,
+            &state.event_tx,
+            &mut state.join_set,
+            phase_timeout_seconds,
+        )?;
+        let mut registry = load_registry_json(repo_root)?;
+        let tasks = registry
+            .get_mut("tasks")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
+        for task in tasks.iter_mut() {
+            if task
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                == selected.id
+            {
+                coordinator_engine::apply_dispatch_pid(task, pid);
+                break;
+            }
+        }
+        set_registry_updated_at(&mut registry);
+        save_registry_json(repo_root, &registry)?;
+
+        state.active_jobs.insert(
+            selected.id.clone(),
+            CoordinatorJob {
+                tool: selected.tool,
+                worktree_path,
+                attempt: 1,
+                started_at: std::time::Instant::now(),
+                pid,
+            },
+        );
+        if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Task dispatched task={} pid={}",
+                selected.id,
+                pid.map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        dispatched += 1;
+    }
+    Ok(dispatched)
+}
+
+fn terminate_active_jobs(state: &CoordinatorRunState, logger: Option<&NativeCoordinatorLogger>) {
+    for (task_id, job) in &state.active_jobs {
+        let Some(pid) = job.pid else {
+            continue;
+        };
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(format!("-{}", pid))
+            .status();
+        if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Sent TERM to active task={} pid={}",
+                task_id, pid
+            ));
+        }
+    }
+}
+
+async fn wait_for_resume_signal(
+    repo_root: &std::path::Path,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<()> {
+    loop {
+        if !coordinator_pause_file_path(repo_root).exists() {
+            if let Some(log) = logger {
+                let _ = log.note("- Resume signal received; continuing run loop");
+            }
+            return Ok(());
+        }
+        if let Some(log) = logger {
+            let _ = log.note("- Waiting for resume signal (`macc coordinator resume`)");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+fn run_coordinator_control_plane_rust(
+    repo_root: &std::path::Path,
+    coordinator_path: &std::path::Path,
+    canonical: &macc_core::config::CanonicalConfig,
+    coordinator: Option<&macc_core::config::CoordinatorConfig>,
+    env_cfg: &CoordinatorEnvConfig,
+) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .enable_io()
+        .build()
+        .map_err(|e| MaccError::Validation(format!("Failed to initialize tokio runtime: {}", e)))?;
+    runtime.block_on(run_coordinator_control_plane_rust_async(
+        repo_root,
+        coordinator_path,
+        canonical,
+        coordinator,
+        env_cfg,
+    ))
+}
+
+async fn run_coordinator_control_plane_rust_async(
+    repo_root: &std::path::Path,
+    _coordinator_path: &std::path::Path,
+    canonical: &macc_core::config::CanonicalConfig,
+    coordinator: Option<&macc_core::config::CoordinatorConfig>,
+    env_cfg: &CoordinatorEnvConfig,
+) -> Result<()> {
+    let logger = NativeCoordinatorLogger::new(repo_root, "run")?;
+    println!("Coordinator log file: {}", logger.file.display());
+    let _ = logger.note("- Native Rust control-plane run started");
+    let prd_file = env_cfg
+        .prd
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            coordinator
+                .and_then(|c| c.prd_file.clone())
+                .map(std::path::PathBuf::from)
+        })
+        .unwrap_or_else(|| repo_root.join("prd.json"));
+    if !prd_file.exists() {
+        #[cfg(test)]
+        {
+            return run_coordinator_full_cycle(
+                repo_root,
+                _coordinator_path,
+                canonical,
+                coordinator,
+                env_cfg,
+            );
+        }
+        #[cfg(not(test))]
+        {
+            return Err(MaccError::Validation(format!(
+                "Coordinator PRD file not found: {}. Configure `automation.coordinator.prd_file` or pass `--prd`.",
+                prd_file.display()
+            )));
+        }
+    }
+
+    let storage_mode = resolve_coordinator_storage_mode(env_cfg, coordinator)?;
+    let storage_paths = macc_core::ProjectPaths::from_root(repo_root);
+    sync_storage_with_startup_reconcile(&storage_paths, storage_mode, Some(&logger))?;
+    let startup_cleaned = cleanup_dead_runtime_tasks(repo_root, "run-startup", Some(&logger))?;
+    if startup_cleaned > 0 {
+        let _ = logger.note(format!(
+            "- Startup runtime cleanup fixed {} ghost task(s)",
+            startup_cleaned
+        ));
+    }
+    let timeout_seconds = env_cfg
+        .timeout_seconds
+        .or_else(|| coordinator.and_then(|c| c.timeout_seconds))
+        .unwrap_or(0);
+    let phase_runner_max_attempts = env_cfg
+        .phase_runner_max_attempts
+        .or_else(|| coordinator.and_then(|c| c.phase_runner_max_attempts))
+        .unwrap_or(1)
+        .max(1);
+    let coordinator_tool_override = env_cfg
+        .coordinator_tool
+        .clone()
+        .or_else(|| coordinator.and_then(|c| c.coordinator_tool.clone()));
+    let phase_timeout_seconds = env_cfg
+        .stale_in_progress_seconds
+        .or_else(|| coordinator.and_then(|c| c.stale_in_progress_seconds))
+        .unwrap_or(0);
+    let mut run_state = CoordinatorRunState::new();
+    let loop_cfg = coordinator_engine::ControlPlaneLoopConfig {
+        timeout: if timeout_seconds > 0 {
+            Some(std::time::Duration::from_secs(timeout_seconds as u64))
+        } else {
+            None
+        },
+        max_no_progress_cycles: 2,
+    };
+    let mut controller = coordinator_engine::CoordinatorRunController::new(loop_cfg);
+    let mut cycle: usize = 0;
+    loop {
+        cycle += 1;
+        let _ = logger.note(format!("- Cycle {} start", cycle));
+        sync_registry_from_prd_native(repo_root, &prd_file, Some(&logger))?;
+        let cycle_cleaned = cleanup_dead_runtime_tasks(repo_root, "run-cycle", Some(&logger))?;
+        if cycle_cleaned > 0 {
+            let _ = logger.note(format!(
+                "- Cycle {} runtime cleanup fixed {} ghost task(s)",
+                cycle, cycle_cleaned
+            ));
+        }
+        monitor_active_jobs_native(
+            repo_root,
+            &mut run_state,
+            phase_runner_max_attempts,
+            phase_timeout_seconds,
+            Some(&logger),
+        )
+        .await?;
+        let advance = advance_tasks_native(
+            repo_root,
+            coordinator_tool_override.as_deref(),
+            phase_runner_max_attempts,
+            Some(&logger),
+        )?;
+        monitor_active_jobs_native(
+            repo_root,
+            &mut run_state,
+            phase_runner_max_attempts,
+            phase_timeout_seconds,
+            Some(&logger),
+        )
+        .await?;
+        if let Some((task_id, reason)) = advance.blocked_merge {
+            terminate_active_jobs(&run_state, Some(&logger));
+            set_task_paused_for_integrate(repo_root, &task_id, &reason)?;
+            write_coordinator_pause_file(repo_root, &task_id, "integrate", &reason)?;
+            println!(
+                "Coordinator paused on task {} (integrate). Resolve the merge issue, then run `macc coordinator resume`.",
+                task_id
+            );
+            let _ = logger.note(format!(
+                "- Run paused task={} phase=integrate reason={}",
+                task_id, reason
+            ));
+            wait_for_resume_signal(repo_root, Some(&logger)).await?;
+            resume_paused_task_integrate(repo_root, &task_id)?;
+        }
+        let dispatched = dispatch_ready_tasks_native(
+            repo_root,
+            canonical,
+            coordinator,
+            env_cfg,
+            &prd_file,
+            &mut run_state,
+            Some(&logger),
+        )
+        .await?;
+        let _ = logger.note(format!(
+            "- Cycle {} transition summary progressed={} dispatched={}",
+            cycle, advance.progressed, dispatched
+        ));
+        if storage_mode != CoordinatorStorageMode::Json {
+            if let Err(err) = sync_coordinator_storage(
+                &storage_paths,
+                storage_mode,
+                CoordinatorStoragePhase::Post,
+            ) {
+                if is_storage_mismatch_error(&err) {
+                    let _ = logger.note(format!(
+                        "- Storage post-sync mismatch on cycle {} ({}); rebuilding sqlite",
+                        cycle, err
+                    ));
+                    if let Err(rebuild_err) =
+                        rebuild_sqlite_storage_from_json(&storage_paths, Some(&logger))
+                    {
+                        if is_storage_mismatch_error(&rebuild_err) {
+                            let _ = logger.note(format!(
+                                "- Storage post-sync warning: mismatch persists after rebuild; continuing ({})",
+                                rebuild_err
+                            ));
+                            // Keep running with JSON as the active source for this cycle.
+                        }
+                        if !is_storage_mismatch_error(&rebuild_err) {
+                            return Err(rebuild_err);
+                        }
+                    }
+                    if storage_mode == CoordinatorStorageMode::DualWrite {
+                        sync_coordinator_storage(
+                            &storage_paths,
+                            storage_mode,
+                            CoordinatorStoragePhase::Post,
+                        )?;
+                    }
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+        let _ = coordinator::logs::aggregate_performer_logs(repo_root);
+
+        let paths = macc_core::ProjectPaths::from_root(repo_root);
+        let counts = read_coordinator_counts(&paths)?;
+        println!(
+            "Coordinator cycle {}: total={} todo={} active={} blocked={} merged={}",
+            cycle, counts.total, counts.todo, counts.active, counts.blocked, counts.merged
+        );
+        let _ = logger.note(format!(
+            "- Cycle {} counts total={} todo={} active={} blocked={} merged={}",
+            cycle, counts.total, counts.todo, counts.active, counts.blocked, counts.merged
+        ));
+
+        match controller.on_cycle_counts(counts) {
+            Ok(coordinator_engine::ControlPlaneDecision::Continue) => {}
+            Ok(coordinator_engine::ControlPlaneDecision::Complete) => break,
+            Err(err) => {
+                terminate_active_jobs(&run_state, Some(&logger));
+                run_state.active_jobs.clear();
+                run_state.join_set.abort_all();
+                return Err(err);
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    let _ = logger.note("- Run complete");
+    println!("Coordinator run complete.");
+    Ok(())
+}
+
+fn resolve_coordinator_storage_mode(
+    env_cfg: &CoordinatorEnvConfig,
+    coordinator: Option<&macc_core::config::CoordinatorConfig>,
+) -> Result<CoordinatorStorageMode> {
+    let raw = env_cfg
+        .storage_mode
+        .clone()
+        .or_else(|| coordinator.and_then(|c| c.storage_mode.clone()))
+        .unwrap_or_else(|| "sqlite".to_string());
+    raw.parse::<CoordinatorStorageMode>()
+        .map_err(MaccError::Validation)
+}
+
+fn is_storage_mismatch_error(err: &MaccError) -> bool {
+    match err {
+        MaccError::Validation(msg) => msg.contains("Coordinator storage mismatch"),
+        _ => false,
+    }
+}
+
+fn rebuild_sqlite_storage_from_json(
+    project_paths: &macc_core::ProjectPaths,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<()> {
+    let sqlite_path = project_paths
+        .macc_dir
+        .join("state")
+        .join("coordinator.sqlite");
+    if sqlite_path.exists() {
+        let backup = sqlite_path.with_extension(format!(
+            "bak-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+        ));
+        if let Err(err) = std::fs::rename(&sqlite_path, &backup) {
+            let _ = std::fs::remove_file(&sqlite_path);
+            if let Some(log) = logger {
+                let _ = log.note(format!(
+                    "- Storage reconcile warning: failed to backup sqlite {} -> {} ({})",
+                    sqlite_path.display(),
+                    backup.display(),
+                    err
+                ));
+            }
+        } else if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Storage reconcile: sqlite backup={} from={}",
+                backup.display(),
+                sqlite_path.display()
+            ));
+        }
+    }
+    sync_coordinator_storage(
+        project_paths,
+        CoordinatorStorageMode::Sqlite,
+        CoordinatorStoragePhase::Pre,
+    )?;
+    sync_coordinator_storage(
+        project_paths,
+        CoordinatorStorageMode::Sqlite,
+        CoordinatorStoragePhase::Post,
+    )?;
+    Ok(())
+}
+
+fn sync_storage_with_startup_reconcile(
+    project_paths: &macc_core::ProjectPaths,
+    storage_mode: CoordinatorStorageMode,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<()> {
+    if storage_mode == CoordinatorStorageMode::Json {
+        return Ok(());
+    }
+    sync_coordinator_storage(project_paths, storage_mode, CoordinatorStoragePhase::Pre)?;
+    match sync_coordinator_storage(project_paths, storage_mode, CoordinatorStoragePhase::Post) {
+        Ok(()) => Ok(()),
+        Err(err) if is_storage_mismatch_error(&err) => {
+            if let Some(log) = logger {
+                let _ = log.note(format!(
+                    "- Storage reconcile: detected mismatch on startup ({}), rebuilding sqlite",
+                    err
+                ));
+            }
+            match rebuild_sqlite_storage_from_json(project_paths, logger) {
+                Ok(()) => Ok(()),
+                Err(rebuild_err) if is_storage_mismatch_error(&rebuild_err) => {
+                    if let Some(log) = logger {
+                        let _ = log.note(format!(
+                            "- Storage reconcile warning: mismatch persists after rebuild; continuing with JSON source ({})",
+                            rebuild_err
+                        ));
+                    }
+                    Ok(())
+                }
+                Err(rebuild_err) => Err(rebuild_err),
+            }
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn coordinator_action_hint(action: &str) -> &'static str {
@@ -2247,6 +5463,12 @@ fn coordinator_action_hint(action: &str) -> &'static str {
         }
         "retry-phase" => {
             "Verify task/worktree consistency with `macc coordinator status` and inspect errors in `macc logs tail --component coordinator`."
+        }
+        "resume" => {
+            "After fixing merge conflicts manually, run `macc coordinator run` to continue orchestration."
+        }
+        "cutover-gate" => {
+            "Inspect cutover metrics in .macc/log/coordinator/events.jsonl and rerun `macc coordinator cutover-gate`."
         }
         "unlock" => {
             "Inspect lock owners in .macc/automation/task/task_registry.json then retry dispatch."
@@ -5872,6 +9094,89 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_coordinator_validate_runtime_transition_args() {
+        let args = vec![
+            "--from".to_string(),
+            "running".to_string(),
+            "--to".to_string(),
+            "phase_done".to_string(),
+        ];
+        let (from, to) = parse_coordinator_validate_runtime_transition_args(&args).unwrap();
+        assert_eq!(from, RuntimeStatus::Running);
+        assert_eq!(to, RuntimeStatus::PhaseDone);
+    }
+
+    #[test]
+    fn test_validate_coordinator_runtime_transition_action_rejects_invalid() {
+        let args = vec![
+            "--from".to_string(),
+            "idle".to_string(),
+            "--to".to_string(),
+            "phase_done".to_string(),
+        ];
+        let err = validate_coordinator_runtime_transition_action(&args).unwrap_err();
+        assert!(err.to_string().contains("invalid runtime transition"));
+    }
+
+    #[test]
+    fn test_parse_coordinator_runtime_status_from_event_args() {
+        let args = vec![
+            "--type".to_string(),
+            "heartbeat".to_string(),
+            "--status".to_string(),
+            "running".to_string(),
+        ];
+        let (event_type, status) = parse_coordinator_runtime_status_from_event_args(&args).unwrap();
+        assert_eq!(event_type, "heartbeat");
+        assert_eq!(status, "running");
+    }
+
+    #[test]
+    fn test_parse_coordinator_storage_sync_args() {
+        let args = vec![
+            "--mode".to_string(),
+            "dual-write".to_string(),
+            "--phase".to_string(),
+            "post".to_string(),
+        ];
+        let (mode, phase) = parse_coordinator_storage_sync_args(&args).unwrap();
+        assert_eq!(mode, CoordinatorStorageMode::DualWrite);
+        assert_eq!(phase, CoordinatorStoragePhase::Post);
+    }
+
+    #[test]
+    fn test_read_coordinator_counts() {
+        let root = std::env::temp_dir().join(format!("macc_counts_test_{}", uuid_v4_like()));
+        let registry = root
+            .join(".macc")
+            .join("automation")
+            .join("task")
+            .join("task_registry.json");
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::write(
+            &registry,
+            r#"{
+  "tasks": [
+    {"id":"A","state":"todo"},
+    {"id":"B","state":"in_progress"},
+    {"id":"C","state":"blocked"},
+    {"id":"D","state":"merged"},
+    {"id":"E","state":"queued"}
+  ]
+}"#,
+        )
+        .unwrap();
+        let paths = macc_core::ProjectPaths::from_root(&root);
+        let counts = read_coordinator_counts(&paths).unwrap();
+        assert_eq!(counts.total, 5);
+        assert_eq!(counts.todo, 1);
+        assert_eq!(counts.active, 2);
+        assert_eq!(counts.blocked, 1);
+        assert_eq!(counts.merged, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn test_cwd_support() -> macc_core::Result<()> {
         let temp_base = std::env::temp_dir().join(format!("macc_cli_test_{}", uuid_v4_like()));
         let project_dir = temp_base.join("nested/project");
@@ -6098,6 +9403,7 @@ esac
             stale_in_progress_seconds: None,
             stale_changes_requested_seconds: None,
             stale_action: None,
+            storage_mode: None,
         };
 
         run_coordinator_full_cycle(&root, &script, &canonical, Some(&coordinator_cfg), &env_cfg)?;
@@ -6166,6 +9472,7 @@ exit 0
             stale_in_progress_seconds: None,
             stale_changes_requested_seconds: None,
             stale_action: None,
+            storage_mode: None,
         };
 
         let err = run_coordinator_full_cycle(
@@ -6182,6 +9489,285 @@ exit 0
             "expected no-progress error, got: {}",
             msg
         );
+        std::fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_coordinator_control_plane_same_input_same_final_state() -> macc_core::Result<()> {
+        fn run_once(
+            root: &std::path::Path,
+            script: &std::path::Path,
+        ) -> macc_core::Result<serde_json::Value> {
+            let registry = root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
+            std::fs::create_dir_all(registry.parent().expect("registry parent")).unwrap();
+            fs::write(
+                &registry,
+                r#"{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"T1","state":"todo","dependencies":[],"exclusive_resources":[]},
+    {"id":"T2","state":"todo","dependencies":[],"exclusive_resources":[]}
+  ],
+  "resource_locks": {},
+  "state_mapping": {}
+}"#,
+            )
+            .unwrap();
+
+            let canonical = macc_core::config::CanonicalConfig::default();
+            let coordinator_cfg = macc_core::config::CoordinatorConfig {
+                timeout_seconds: Some(10),
+                ..Default::default()
+            };
+            let env_cfg = CoordinatorEnvConfig {
+                prd: None,
+                coordinator_tool: None,
+                reference_branch: None,
+                tool_priority: None,
+                max_parallel_per_tool_json: None,
+                tool_specializations_json: None,
+                max_dispatch: None,
+                max_parallel: None,
+                timeout_seconds: Some(10),
+                phase_runner_max_attempts: None,
+                stale_claimed_seconds: None,
+                stale_in_progress_seconds: None,
+                stale_changes_requested_seconds: None,
+                stale_action: None,
+                storage_mode: None,
+            };
+
+            run_coordinator_control_plane_rust(
+                root,
+                script,
+                &canonical,
+                Some(&coordinator_cfg),
+                &env_cfg,
+            )?;
+
+            let final_state: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&registry).unwrap()).unwrap();
+            Ok(final_state)
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("macc_cli_cp_deterministic_{}", uuid_v4_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("fake-cp-deterministic.sh");
+        write_executable_script(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+action="${1:-dispatch}"
+case "$action" in
+  dispatch)
+    tmp="$(mktemp)"
+    jq '
+      .tasks |= map(
+        if .state == "todo" then .state = "in_progress" else . end
+      )
+    ' "$TASK_REGISTRY_FILE" >"$tmp"
+    mv "$tmp" "$TASK_REGISTRY_FILE"
+    ;;
+  advance)
+    tmp="$(mktemp)"
+    jq '
+      .tasks |= map(
+        if .state == "in_progress" then .state = "merged" else . end
+      )
+    ' "$TASK_REGISTRY_FILE" >"$tmp"
+    mv "$tmp" "$TASK_REGISTRY_FILE"
+    ;;
+  sync|reconcile|cleanup) ;;
+  *) ;;
+esac
+"#,
+        );
+
+        let first = run_once(&root, &script)?;
+        let second = run_once(&root, &script)?;
+        assert_eq!(first, second, "same inputs must yield same final state");
+
+        std::fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_coordinator_parallel_dispatch_behavior() -> macc_core::Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("macc_cli_parallel_dispatch_{}", uuid_v4_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
+        std::fs::create_dir_all(registry.parent().expect("registry parent")).unwrap();
+        fs::write(
+            &registry,
+            r#"{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"T1","state":"todo","dependencies":[],"exclusive_resources":[]},
+    {"id":"T2","state":"todo","dependencies":[],"exclusive_resources":[]},
+    {"id":"T3","state":"todo","dependencies":[],"exclusive_resources":[]}
+  ],
+  "resource_locks": {},
+  "state_mapping": {}
+}"#,
+        )
+        .unwrap();
+
+        let script = root.join("fake-parallel-dispatch.sh");
+        write_executable_script(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+action="${1:-dispatch}"
+if [[ "$action" == "dispatch" ]]; then
+  tmp="$(mktemp)"
+  jq '
+    .tasks |= (
+      reduce .[] as $task ({count: 0, out: []};
+        if ($task.state == "todo" and .count < 2) then
+          {count: (.count + 1), out: (.out + [($task + {state: "in_progress"})])}
+        else
+          {count: .count, out: (.out + [$task])}
+        end
+      ) | .out
+    )
+  ' "$TASK_REGISTRY_FILE" >"$tmp"
+  mv "$tmp" "$TASK_REGISTRY_FILE"
+fi
+"#,
+        );
+
+        let canonical = macc_core::config::CanonicalConfig::default();
+        let env_cfg = CoordinatorEnvConfig {
+            prd: None,
+            coordinator_tool: None,
+            reference_branch: None,
+            tool_priority: None,
+            max_parallel_per_tool_json: None,
+            tool_specializations_json: None,
+            max_dispatch: None,
+            max_parallel: None,
+            timeout_seconds: None,
+            phase_runner_max_attempts: None,
+            stale_claimed_seconds: None,
+            stale_in_progress_seconds: None,
+            stale_changes_requested_seconds: None,
+            stale_action: None,
+            storage_mode: None,
+        };
+
+        run_coordinator_action(&root, &script, "dispatch", &[], &canonical, None, &env_cfg)?;
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&registry).unwrap()).unwrap();
+        let active = value["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["state"].as_str() == Some("in_progress"))
+            .count();
+        let todo = value["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["state"].as_str() == Some("todo"))
+            .count();
+        assert_eq!(active, 2, "dispatch should activate two tasks in parallel");
+        assert_eq!(todo, 1, "one task should remain todo");
+
+        std::fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_coordinator_retry_phase_behavior() -> macc_core::Result<()> {
+        let root = std::env::temp_dir().join(format!("macc_cli_retry_phase_{}", uuid_v4_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
+        std::fs::create_dir_all(registry.parent().expect("registry parent")).unwrap();
+        fs::write(
+            &registry,
+            r#"{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-R","state":"blocked","dependencies":[],"exclusive_resources":[]}
+  ],
+  "resource_locks": {},
+  "state_mapping": {}
+}"#,
+        )
+        .unwrap();
+
+        let script = root.join("fake-retry-phase.sh");
+        write_executable_script(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+action="${1:-dispatch}"
+if [[ "$action" == "retry-phase" ]]; then
+  shift
+  task=""
+  phase=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --retry-task) task="$2"; shift 2 ;;
+      --retry-phase) phase="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ "$task" == "TASK-R" ]] || exit 2
+  [[ "$phase" == "integrate" ]] || exit 3
+  tmp="$(mktemp)"
+  jq '.tasks |= map(if .id=="TASK-R" then .state="queued" else . end)' "$TASK_REGISTRY_FILE" >"$tmp"
+  mv "$tmp" "$TASK_REGISTRY_FILE"
+fi
+"#,
+        );
+
+        let canonical = macc_core::config::CanonicalConfig::default();
+        let env_cfg = CoordinatorEnvConfig {
+            prd: None,
+            coordinator_tool: None,
+            reference_branch: None,
+            tool_priority: None,
+            max_parallel_per_tool_json: None,
+            tool_specializations_json: None,
+            max_dispatch: None,
+            max_parallel: None,
+            timeout_seconds: None,
+            phase_runner_max_attempts: None,
+            stale_claimed_seconds: None,
+            stale_in_progress_seconds: None,
+            stale_changes_requested_seconds: None,
+            stale_action: None,
+            storage_mode: None,
+        };
+
+        run_coordinator_action(
+            &root,
+            &script,
+            "retry-phase",
+            &[
+                "--retry-task".to_string(),
+                "TASK-R".to_string(),
+                "--retry-phase".to_string(),
+                "integrate".to_string(),
+            ],
+            &canonical,
+            None,
+            &env_cfg,
+        )?;
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&registry).unwrap()).unwrap();
+        assert_eq!(
+            value["tasks"][0]["state"].as_str(),
+            Some("queued"),
+            "retry-phase integrate should update blocked task to queued in this test harness"
+        );
+
         std::fs::remove_dir_all(&root).ok();
         Ok(())
     }
@@ -6307,6 +9893,7 @@ exit 0
                     stale_in_progress_seconds: None,
                     stale_changes_requested_seconds: None,
                     stale_action: None,
+                    storage_mode: None,
                     extra_args: Vec::new(),
                 }),
             },

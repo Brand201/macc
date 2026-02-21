@@ -206,7 +206,7 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         KeyCode::Char('s') if current_screen != Screen::Apply => {
             state.save_config();
         }
-        KeyCode::Char('u') => {
+        KeyCode::Char('u') if current_screen != Screen::CoordinatorLive => {
             state.undo_config_change();
         }
         KeyCode::Char('U') => {
@@ -274,6 +274,11 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         KeyCode::Char('c') => {
             if current_screen == Screen::CoordinatorLive {
                 state.start_coordinator_action("reconcile");
+            }
+        }
+        KeyCode::Char('u') => {
+            if current_screen == Screen::CoordinatorLive {
+                state.start_coordinator_action("resume");
             }
         }
         KeyCode::Char('k') => {
@@ -349,6 +354,7 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
         config_label: &config_status,
         errors: state.errors.len(),
         coordinator_active: state.is_coordinator_running(),
+        coordinator_paused: state.is_coordinator_paused(),
         coordinator_action: state.coordinator_running_action.as_deref(),
         status: state.status_line(),
         width: chunks[0].width,
@@ -1144,7 +1150,9 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
                 .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
                 .split(body_chunks[1]);
 
-            let status_line = if state.is_coordinator_running() {
+            let status_line = if state.is_coordinator_paused() {
+                "PAUSED (awaiting resume)".to_string()
+            } else if state.is_coordinator_running() {
                 format!(
                     "Running: {} ({}) {}",
                     state
@@ -1182,7 +1190,7 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
                 .clone()
                 .unwrap_or_else(|| "Last result: n/a".to_string());
             let runtime = format!(
-                "Coordinator runtime\n\n{}\n{}\n{}\n{}\n{}\n\n{}\n\nActions:\n- r: run full cycle\n- y: sync registry\n- c: reconcile\n- k: stop\n- l: refresh status",
+                "Coordinator runtime\n\n{}\n{}\n{}\n{}\n{}\n\n{}\n\nActions:\n- r: run full cycle\n- y: sync registry\n- c: reconcile\n- u: resume paused run\n- k: stop\n- l: refresh status",
                 status_line,
                 snapshot_line,
                 refresh_line,
@@ -1572,7 +1580,7 @@ fn render_coordinator_pause_overlay(f: &mut Frame, state: &AppState) {
     ) {
         (Some(task), Some(phase)) => format!("task={} phase={}", task, phase),
         (Some(task), None) => format!("task={} phase=dev", task),
-        _ => "task=unknown phase=dev".to_string(),
+        _ => "global/blocking (no task context)".to_string(),
     };
     let text = format!(
         "Coordinator Paused (blocking error)\n\n{}\n\nTarget:\n- {}\n\nFix the issue in your repo/worktree, then choose:\n\n- Press 'r' or Enter: retry failed phase, then resume run\n- Press 's': skip failed phase (move task to todo), then resume run\n- Press 'o': open Logs screen\n- Press 'k' or Esc: stop and keep paused state\n- Press 'c': resume run without retry\n\nAction: {}\n",

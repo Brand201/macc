@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiStatusLevel {
@@ -125,6 +125,12 @@ enum CoordinatorPauseNextAction {
     ResumeRun,
 }
 
+struct CoordinatorFailureContext {
+    message: String,
+    task_id: Option<String>,
+    phase: Option<String>,
+}
+
 pub struct AppState {
     pub engine: Arc<dyn Engine>,
     pub project_paths: Option<ProjectPaths>,
@@ -185,6 +191,7 @@ pub struct AppState {
     pub coordinator_events_last_refresh: Option<Instant>,
     pub coordinator_events_per_sec: Option<f64>,
     pub coordinator_last_event_age: Option<Duration>,
+    pub coordinator_paused: bool,
     coordinator_events_last_seen_count: usize,
     pub search_query: String,
     pub search_editing: bool,
@@ -200,6 +207,7 @@ impl AppState {
     const COORDINATOR_TASK_REGISTRY_REL_PATH: &'static str =
         ".macc/automation/task/task_registry.json";
     const COORDINATOR_EVENTS_REL_PATH: &'static str = ".macc/log/coordinator/events.jsonl";
+    const COORDINATOR_PAUSE_REL_PATH: &'static str = ".macc/automation/task/coordinator.pause.json";
 
     pub fn automation_field_count(&self) -> usize {
         Self::AUTOMATION_FIELD_COUNT
@@ -273,6 +281,7 @@ impl AppState {
             coordinator_events_last_refresh: None,
             coordinator_events_per_sec: None,
             coordinator_last_event_age: None,
+            coordinator_paused: false,
             coordinator_events_last_seen_count: 0,
             search_query: String::new(),
             search_editing: false,
@@ -582,6 +591,7 @@ impl AppState {
     }
 
     pub fn refresh_coordinator_snapshot(&mut self) {
+        self.refresh_coordinator_pause_state();
         let Some(registry_path) = self.coordinator_registry_path() else {
             return;
         };
@@ -599,6 +609,15 @@ impl AppState {
     fn coordinator_events_path(&self) -> Option<PathBuf> {
         let paths = self.project_paths.as_ref()?;
         Some(paths.root.join(Self::COORDINATOR_EVENTS_REL_PATH))
+    }
+
+    fn refresh_coordinator_pause_state(&mut self) {
+        let paused = self
+            .project_paths
+            .as_ref()
+            .map(|p| p.root.join(Self::COORDINATOR_PAUSE_REL_PATH).exists())
+            .unwrap_or(false);
+        self.coordinator_paused = paused;
     }
 
     fn is_essential_coordinator_event(event: &str) -> bool {
@@ -854,7 +873,7 @@ impl AppState {
     }
 
     fn start_coordinator_action_with_args(&mut self, action: &str, args: &[String]) {
-        if self.coordinator_process.is_some() {
+        if self.coordinator_process.is_some() && action != "resume" {
             self.set_status(
                 UiStatusLevel::Warning,
                 "Coordinator already running.",
@@ -862,10 +881,6 @@ impl AppState {
             );
             return;
         }
-        self.coordinator_pause_error = None;
-        self.coordinator_pause_action = None;
-        self.coordinator_pause_task_id = None;
-        self.coordinator_pause_phase = None;
         let Some(paths) = self.project_paths.as_ref() else {
             self.set_status(
                 UiStatusLevel::Error,
@@ -875,6 +890,59 @@ impl AppState {
             return;
         };
         let root = paths.root.clone();
+        if action == "resume" {
+            let current_exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(err) => {
+                    self.set_status(
+                        UiStatusLevel::Error,
+                        format!("Failed to locate executable for resume: {}", err),
+                        Some(Duration::from_secs(6)),
+                    );
+                    return;
+                }
+            };
+            let mut cmd = Command::new(current_exe);
+            cmd.current_dir(&root)
+                .arg("--cwd")
+                .arg(&root)
+                .arg("coordinator")
+                .arg("resume")
+                .arg("--no-tui")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let status = cmd.status();
+            match status {
+                Ok(s) if s.success() => {
+                    self.refresh_coordinator_snapshot();
+                    self.refresh_coordinator_events();
+                    self.set_status(
+                        UiStatusLevel::Success,
+                        "Resume signal sent to coordinator.",
+                        Some(Duration::from_secs(4)),
+                    );
+                }
+                Ok(s) => {
+                    self.set_status(
+                        UiStatusLevel::Error,
+                        format!("Resume failed (status {}).", s),
+                        Some(Duration::from_secs(6)),
+                    );
+                }
+                Err(err) => {
+                    self.set_status(
+                        UiStatusLevel::Error,
+                        format!("Failed to send resume signal: {}", err),
+                        Some(Duration::from_secs(6)),
+                    );
+                }
+            }
+            return;
+        }
+        self.coordinator_pause_error = None;
+        self.coordinator_pause_action = None;
+        self.coordinator_pause_task_id = None;
+        self.coordinator_pause_phase = None;
         if action == "run" {
             let current_exe = match std::env::current_exe() {
                 Ok(p) => p,
@@ -1276,6 +1344,8 @@ impl AppState {
         if self.is_coordinator_running() {
             let action = self.coordinator_running_action.as_deref().unwrap_or("run");
             badges.push(format!("coord:{}", action));
+        } else if self.coordinator_paused {
+            badges.push("coord:paused".to_string());
         } else {
             badges.push("coord:off".to_string());
         }
@@ -1331,7 +1401,51 @@ impl AppState {
         self.coordinator_pause_error.is_some()
     }
 
-    fn parse_retry_context_from_events(&self) -> Option<(String, String)> {
+    pub fn is_coordinator_paused(&self) -> bool {
+        self.coordinator_paused
+    }
+
+    fn coordinator_logs_dir(&self) -> Option<PathBuf> {
+        let paths = self.project_paths.as_ref()?;
+        Some(paths.root.join(".macc/log/coordinator"))
+    }
+
+    fn infer_phase_from_state(state: &str) -> Option<String> {
+        match state {
+            "claimed" | "in_progress" => Some("dev".to_string()),
+            "pr_open" => Some("review".to_string()),
+            "changes_requested" => Some("fix".to_string()),
+            "queued" => Some("integrate".to_string()),
+            _ => None,
+        }
+    }
+
+    fn parse_failure_context_from_pause_file(&self) -> Option<CoordinatorFailureContext> {
+        let paths = self.project_paths.as_ref()?;
+        let pause_path = paths.root.join(Self::COORDINATOR_PAUSE_REL_PATH);
+        let raw = std::fs::read_to_string(pause_path).ok()?;
+        let parsed: Value = serde_json::from_str(&raw).ok()?;
+        let message = parsed
+            .get("reason")
+            .and_then(|x| x.as_str())
+            .unwrap_or("Coordinator paused due to a blocking error.")
+            .to_string();
+        let task_id = parsed
+            .get("task_id")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        let phase = parsed
+            .get("phase")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        Some(CoordinatorFailureContext {
+            message,
+            task_id,
+            phase,
+        })
+    }
+
+    fn parse_failure_context_from_events(&self) -> Option<CoordinatorFailureContext> {
         let path = self.coordinator_events_path()?;
         let content = std::fs::read_to_string(path).ok()?;
         for line in content.lines().rev() {
@@ -1342,50 +1456,149 @@ impl AppState {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let task_id = parsed
-                .get("task_id")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string());
-            let status = parsed
-                .get("status")
-                .or_else(|| parsed.get("state"))
-                .and_then(|x| x.as_str())
-                .unwrap_or("");
             let event = parsed
                 .get("type")
                 .or_else(|| parsed.get("event"))
                 .and_then(|x| x.as_str())
                 .unwrap_or("");
-            if !matches!(status, "failed" | "error")
-                && !matches!(event, "task_blocked" | "command_error" | "phase_result")
+            let status = parsed
+                .get("status")
+                .or_else(|| parsed.get("state"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if !matches!(
+                event,
+                "command_error" | "task_blocked" | "failed" | "phase_result"
+            ) && !matches!(status, "failed" | "error")
             {
                 continue;
             }
-            let Some(task_id) = task_id else {
-                continue;
-            };
+            let task_id = parsed
+                .get("task_id")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string());
             let phase = parsed
                 .get("phase")
                 .and_then(|x| x.as_str())
                 .map(|s| s.to_string())
                 .or_else(|| {
-                    let state = parsed
+                    parsed
                         .get("state")
                         .or_else(|| parsed.get("status"))
                         .and_then(|x| x.as_str())
-                        .unwrap_or("");
-                    match state {
-                        "claimed" | "in_progress" => Some("dev".to_string()),
-                        "pr_open" => Some("review".to_string()),
-                        "changes_requested" => Some("fix".to_string()),
-                        "queued" => Some("integrate".to_string()),
-                        _ => None,
-                    }
+                        .and_then(Self::infer_phase_from_state)
+                });
+            let message = parsed
+                .get("detail")
+                .and_then(|x| x.as_str())
+                .or_else(|| parsed.get("msg").and_then(|x| x.as_str()))
+                .or_else(|| {
+                    parsed
+                        .get("payload")
+                        .and_then(|p| p.get("reason"))
+                        .and_then(|x| x.as_str())
                 })
-                .unwrap_or_else(|| "dev".to_string());
-            return Some((task_id, phase));
+                .or_else(|| {
+                    parsed
+                        .get("payload")
+                        .and_then(|p| p.get("message"))
+                        .and_then(|x| x.as_str())
+                })
+                .unwrap_or(event)
+                .to_string();
+            return Some(CoordinatorFailureContext {
+                message,
+                task_id,
+                phase,
+            });
         }
         None
+    }
+
+    fn parse_failure_context_from_latest_run_log(&self) -> Option<CoordinatorFailureContext> {
+        let log_dir = self.coordinator_logs_dir()?;
+        let mut latest: Option<(SystemTime, PathBuf)> = None;
+        for entry in std::fs::read_dir(log_dir).ok()? {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let name = path.file_name()?.to_string_lossy();
+            if !(name.starts_with("run-") && name.ends_with(".md")) {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            match latest {
+                Some((best, _)) if modified <= best => {}
+                _ => latest = Some((modified, path)),
+            }
+        }
+        let (_, path) = latest?;
+        let content = std::fs::read_to_string(path).ok()?;
+        for line in content.lines().rev() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("- Run paused task=") {
+                let mut task_id: Option<String> = None;
+                let mut phase: Option<String> = None;
+                let mut message = "Coordinator paused due to merge failure.".to_string();
+                for segment in rest.split_whitespace() {
+                    if let Some(v) = segment.strip_prefix("task=") {
+                        task_id = Some(v.to_string());
+                    } else if let Some(v) = segment.strip_prefix("phase=") {
+                        phase = Some(v.to_string());
+                    } else if let Some(v) = segment.strip_prefix("reason=") {
+                        message = v.to_string();
+                    }
+                }
+                return Some(CoordinatorFailureContext {
+                    message,
+                    task_id,
+                    phase,
+                });
+            }
+            if let Some(rest) = trimmed.strip_prefix("- Merge failed task=") {
+                let mut task_id: Option<String> = None;
+                let mut message = "Local merge failed".to_string();
+                for segment in rest.split_whitespace() {
+                    if let Some(v) = segment.strip_prefix("task=") {
+                        task_id = Some(v.to_string());
+                    } else if let Some(v) = segment.strip_prefix("reason=") {
+                        message = v.to_string();
+                    }
+                }
+                return Some(CoordinatorFailureContext {
+                    message,
+                    task_id,
+                    phase: Some("integrate".to_string()),
+                });
+            }
+            if trimmed.contains("Storage reconcile")
+                || trimmed.contains("storage mismatch")
+                || trimmed.contains("Worktree apply failed")
+            {
+                return Some(CoordinatorFailureContext {
+                    message: trimmed.trim_start_matches('-').trim().to_string(),
+                    task_id: None,
+                    phase: None,
+                });
+            }
+        }
+        None
+    }
+
+    fn parse_coordinator_failure_context(&self) -> Option<CoordinatorFailureContext> {
+        self.parse_failure_context_from_pause_file()
+            .or_else(|| self.parse_failure_context_from_events())
+            .or_else(|| self.parse_failure_context_from_latest_run_log())
+    }
+
+    fn parse_retry_context_from_events(&self) -> Option<(String, String)> {
+        let context = self.parse_failure_context_from_events()?;
+        let task_id = context.task_id?;
+        let phase = context.phase.unwrap_or_else(|| "dev".to_string());
+        Some((task_id, phase))
     }
 
     pub fn retry_after_coordinator_pause(&mut self) {
@@ -1491,6 +1704,7 @@ impl AppState {
     }
 
     pub fn tick(&mut self) {
+        self.refresh_coordinator_pause_state();
         // Advance spinner globally so live task animation also moves when
         // observing a coordinator process started outside this TUI instance.
         self.coordinator_spinner_tick = self.coordinator_spinner_tick.wrapping_add(1);
@@ -1525,17 +1739,32 @@ impl AppState {
                         self.coordinator_pause_task_id = None;
                         self.coordinator_pause_phase = None;
                     } else {
-                        let msg = format!(
+                        let mut msg = format!(
                             "Coordinator '{}' failed in {} (status {}).",
                             action,
                             format_hms(elapsed),
                             status
                         );
+                        let mut task_phase: Option<(String, String)> = None;
+                        if let Some(context) = self.parse_coordinator_failure_context() {
+                            if !context.message.trim().is_empty() {
+                                msg = format!("{}\n\nCause: {}", msg, context.message.trim());
+                            }
+                            if let Some(task_id) = context.task_id {
+                                task_phase = Some((
+                                    task_id,
+                                    context.phase.unwrap_or_else(|| "dev".to_string()),
+                                ));
+                            }
+                        }
+                        if task_phase.is_none() {
+                            task_phase = self.parse_retry_context_from_events();
+                        }
                         finished_message = Some((UiStatusLevel::Error, msg.clone()));
                         self.coordinator_pause_error = Some(msg);
                         self.coordinator_pause_action = Some(action);
                         self.coordinator_pause_next_action = None;
-                        if let Some((task_id, phase)) = self.parse_retry_context_from_events() {
+                        if let Some((task_id, phase)) = task_phase {
                             self.coordinator_pause_task_id = Some(task_id);
                             self.coordinator_pause_phase = Some(phase);
                         } else {

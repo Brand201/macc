@@ -61,7 +61,23 @@
         "phase_retry",
         "phase_skipped",
         "events_rotated",
-        "events_compacted"
+        "events_compacted",
+        "storage_sync",
+        "storage_sync_ok",
+        "storage_sync_failed",
+        "storage_sync_latency_ms",
+        "storage_mismatch_count",
+        "task_phase_duration_seconds",
+        "task_retries_total",
+        "stale_runtime_total",
+        "merge_fail_total",
+        "merge_fix_attempt_total",
+        "task_retry_count",
+        "task_slo_warning",
+        "task_runtime_orphan",
+        "local_merge_failed",
+        "merge_worker_started",
+        "merge_worker_complete"
       ]
     },
     "phase": {
@@ -70,18 +86,7 @@
     },
     "status": {
       "type": "string",
-      "enum": [
-        "started",
-        "running",
-        "progress",
-        "done",
-        "failed",
-        "error",
-        "paused",
-        "dispatched",
-        "stale",
-        "skipped"
-      ]
+      "minLength": 1
     },
     "payload": {
       "type": "object"

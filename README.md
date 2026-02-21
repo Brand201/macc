@@ -186,6 +186,10 @@ macc coordinator
 ```
 
 `macc coordinator` runs the full loop (`sync -> dispatch -> advance -> reconcile -> cleanup`) until convergence.
+If a merge conflict stays unresolved (even after AI merge-fix hook), coordinator enters a paused state and waits for operator signal:
+```bash
+macc coordinator resume
+```
 
 Useful commands during execution:
 
@@ -306,7 +310,7 @@ Worktrees let MACC run multiple isolated task branches and tool sessions in para
 
 ### Coordinator
 
-Coordinator orchestrates the end-to-end automation cycle: it reads the task registry, dispatches work to tools, tracks state transitions, and reconciles/cleans up until convergence.
+Coordinator orchestrates the end-to-end automation cycle: it reads the task registry, dispatches work to tools, tracks state transitions, supervises performers, and reconciles/cleans up until convergence.
 
 - `macc coordinator` (default full cycle: sync -> dispatch -> advance -> reconcile -> cleanup in loop until convergence)
 - `macc coordinator` opens the TUI `Coordinator Live` screen and starts coordinator run.
@@ -322,8 +326,12 @@ Coordinator orchestrates the end-to-end automation cycle: it reads the task regi
   - Runtime stale heartbeat policy via env: `STALE_HEARTBEAT_SECONDS`, `STALE_HEARTBEAT_ACTION=retry|block|requeue`
 - Task registry path is fixed to `.macc/automation/task/task_registry.json`.
 - Coordinator emits event bus lines to `.macc/log/coordinator/events.jsonl` (used by TUI live screen).
+- `run`, `dispatch`, `advance`, `reconcile`, and `cleanup` are executed by native Rust handlers (async supervision + retries/timeouts per phase).
+- Legacy shell coordinator remains only as a compatibility path for non-migrated actions.
+- Worktrees are managed as a reusable worker pool (not task-named): a merged/clean slot is reset to the reference branch, switched to a fresh branch, updated (`worktree.prd.json` + apply), then reused for the next task.
+- If no reusable slot is available, coordinator creates a new worker worktree; total pool size is bounded by `--max-parallel` / `automation.coordinator.max_parallel`.
 - Realtime orchestrator target design (state model + event contract + rollout): `docs/COORDINATOR_REALTIME.md`.
-- Use `--` to forward raw args directly to `coordinator.sh`.
+- Use `--` only for legacy compatibility actions that still forward to the shell path.
 
 ## TUI overview
 
@@ -389,12 +397,10 @@ Important paths:
 
 ## Automation: coordinator + performer
 
-MACC installs embedded scripts into `.macc/automation/`:
+MACC installs embedded automation assets into `.macc/automation/`:
 
-- `coordinator.sh`: orchestration loop for task registry + dispatch + sync/reconcile/cleanup/unlock.
-  - Includes `advance` phase for PR/review/CI/merge queue progression.
-  - Supports optional VCS integration hook via `COORDINATOR_VCS_HOOK` for PR create/status, review status, CI status, queue status, and merge status.
-  - If no hook is configured, local fallback can auto-progress and locally merge (`COORDINATOR_AUTOMERGE=true`).
+- Native Rust coordinator control-plane (primary runtime path for `run` + core actions).
+- `coordinator.sh`: legacy compatibility wrapper for non-migrated flows.
 - `performer.sh`: worktree executor.
 - `runners/<tool>.performer.sh`: tool-specific execution scripts.
 - All automation logs are written under `.macc/log/` (coordinator + performer).

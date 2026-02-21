@@ -2,6 +2,7 @@ pub mod automation;
 pub mod catalog;
 pub mod config;
 pub mod coordinator;
+pub mod coordinator_storage;
 pub mod doctor;
 pub mod engine;
 pub use config::migrate;
@@ -209,6 +210,10 @@ impl ProjectPaths {
 
     pub fn automation_coordinator_path(&self) -> PathBuf {
         self.automation_dir().join("coordinator.sh")
+    }
+
+    pub fn automation_coordinator_legacy_path(&self) -> PathBuf {
+        self.automation_dir().join("coordinator_legacy.sh")
     }
 
     pub fn automation_merge_worker_path(&self) -> PathBuf {
