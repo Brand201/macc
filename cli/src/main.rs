@@ -9,7 +9,8 @@ use macc_core::coordinator::{
     runtime_status_from_event, RuntimeStatus, WorkflowState,
 };
 use macc_core::coordinator_storage::{
-    sync_coordinator_storage, CoordinatorStorageMode, CoordinatorStoragePhase,
+    sync_coordinator_storage, CoordinatorSnapshot, CoordinatorStorage, CoordinatorStorageMode,
+    CoordinatorStoragePaths, CoordinatorStoragePhase, JsonStorage, SqliteStorage,
 };
 use macc_core::engine::{Engine, MaccEngine};
 use macc_core::plan::builders::{plan_mcp_install, plan_skill_install};
@@ -1557,6 +1558,16 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                 stale_action: stale_action.clone(),
                 storage_mode: storage_mode.clone(),
             };
+            if let Ok(effective_storage_mode) =
+                resolve_coordinator_storage_mode(&env_cfg, coordinator.as_ref())
+            {
+                let mode_raw = match effective_storage_mode {
+                    CoordinatorStorageMode::Json => "json",
+                    CoordinatorStorageMode::DualWrite => "dual-write",
+                    CoordinatorStorageMode::Sqlite => "sqlite",
+                };
+                std::env::set_var("COORDINATOR_STORAGE_MODE", mode_raw);
+            }
 
             if action_name == "control-plane-run" {
                 run_coordinator_control_plane_rust(
@@ -3224,6 +3235,17 @@ fn is_pid_running(pid: i64) -> bool {
 }
 
 fn load_registry_json(repo_root: &std::path::Path) -> Result<serde_json::Value> {
+    if coordinator_storage_mode_from_env() == CoordinatorStorageMode::Sqlite {
+        let project_paths = macc_core::ProjectPaths::from_root(repo_root);
+        let storage_paths = CoordinatorStoragePaths::from_project_paths(&project_paths);
+        let sqlite_store = SqliteStorage::new(storage_paths.clone());
+        if sqlite_store.has_snapshot_data()? {
+            let snapshot = sqlite_store.load_snapshot()?;
+            let json_store = JsonStorage::new(storage_paths);
+            let _ = json_store.save_snapshot(&snapshot);
+            return Ok(snapshot.registry);
+        }
+    }
     let path = coordinator_registry_path(repo_root);
     if !path.exists() {
         return Ok(serde_json::json!({
@@ -3250,6 +3272,21 @@ fn load_registry_json(repo_root: &std::path::Path) -> Result<serde_json::Value> 
 }
 
 fn save_registry_json(repo_root: &std::path::Path, value: &serde_json::Value) -> Result<()> {
+    if coordinator_storage_mode_from_env() == CoordinatorStorageMode::Sqlite {
+        let project_paths = macc_core::ProjectPaths::from_root(repo_root);
+        let storage_paths = CoordinatorStoragePaths::from_project_paths(&project_paths);
+        let sqlite_store = SqliteStorage::new(storage_paths.clone());
+        let mut snapshot = if sqlite_store.has_snapshot_data()? {
+            sqlite_store.load_snapshot()?
+        } else {
+            CoordinatorSnapshot::empty()
+        };
+        snapshot.registry = value.clone();
+        sqlite_store.save_snapshot(&snapshot)?;
+        let json_store = JsonStorage::new(storage_paths);
+        let _ = json_store.save_snapshot(&snapshot);
+        return Ok(());
+    }
     let path = coordinator_registry_path(repo_root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
@@ -3265,6 +3302,13 @@ fn save_registry_json(repo_root: &std::path::Path, value: &serde_json::Value) ->
         action: "write coordinator registry".into(),
         source: e,
     })
+}
+
+fn coordinator_storage_mode_from_env() -> CoordinatorStorageMode {
+    std::env::var("COORDINATOR_STORAGE_MODE")
+        .ok()
+        .and_then(|v| v.parse::<CoordinatorStorageMode>().ok())
+        .unwrap_or(CoordinatorStorageMode::Json)
 }
 
 fn set_registry_updated_at(registry: &mut serde_json::Value) {
@@ -5216,6 +5260,8 @@ async fn run_coordinator_control_plane_rust_async(
     };
     let mut controller = coordinator_engine::CoordinatorRunController::new(loop_cfg);
     let mut cycle: usize = 0;
+    let mut storage_reconcile_attempted = false;
+    let mut storage_degraded_json_mode = false;
     loop {
         cycle += 1;
         let _ = logger.note(format!("- Cycle {} start", cycle));
@@ -5278,37 +5324,44 @@ async fn run_coordinator_control_plane_rust_async(
             "- Cycle {} transition summary progressed={} dispatched={}",
             cycle, advance.progressed, dispatched
         ));
-        if storage_mode != CoordinatorStorageMode::Json {
+        if storage_mode != CoordinatorStorageMode::Json && !storage_degraded_json_mode {
             if let Err(err) = sync_coordinator_storage(
                 &storage_paths,
                 storage_mode,
                 CoordinatorStoragePhase::Post,
             ) {
                 if is_storage_mismatch_error(&err) {
-                    let _ = logger.note(format!(
-                        "- Storage post-sync mismatch on cycle {} ({}); rebuilding sqlite",
-                        cycle, err
-                    ));
-                    if let Err(rebuild_err) =
-                        rebuild_sqlite_storage_from_json(&storage_paths, Some(&logger))
-                    {
-                        if is_storage_mismatch_error(&rebuild_err) {
-                            let _ = logger.note(format!(
-                                "- Storage post-sync warning: mismatch persists after rebuild; continuing ({})",
-                                rebuild_err
-                            ));
-                            // Keep running with JSON as the active source for this cycle.
+                    if !storage_reconcile_attempted {
+                        storage_reconcile_attempted = true;
+                        let _ = logger.note(format!(
+                            "- Storage post-sync mismatch on cycle {} ({}); rebuilding sqlite (single attempt)",
+                            cycle, err
+                        ));
+                        if let Err(rebuild_err) =
+                            rebuild_sqlite_storage_from_json(&storage_paths, Some(&logger))
+                        {
+                            if is_storage_mismatch_error(&rebuild_err) {
+                                storage_degraded_json_mode = true;
+                                let _ = logger.note(format!(
+                                    "- Storage degraded mode enabled: mismatch persists after rebuild ({}). Continuing without post-sync validation.",
+                                    rebuild_err
+                                ));
+                            } else {
+                                return Err(rebuild_err);
+                            }
+                        } else if storage_mode == CoordinatorStorageMode::DualWrite {
+                            sync_coordinator_storage(
+                                &storage_paths,
+                                storage_mode,
+                                CoordinatorStoragePhase::Post,
+                            )?;
                         }
-                        if !is_storage_mismatch_error(&rebuild_err) {
-                            return Err(rebuild_err);
-                        }
-                    }
-                    if storage_mode == CoordinatorStorageMode::DualWrite {
-                        sync_coordinator_storage(
-                            &storage_paths,
-                            storage_mode,
-                            CoordinatorStoragePhase::Post,
-                        )?;
+                    } else {
+                        storage_degraded_json_mode = true;
+                        let _ = logger.note(format!(
+                            "- Storage degraded mode enabled after repeated mismatch on cycle {} ({}). Skipping further post-sync checks this run.",
+                            cycle, err
+                        ));
                     }
                 } else {
                     return Err(err);

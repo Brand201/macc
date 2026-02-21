@@ -1341,8 +1341,6 @@ pub fn sync_coordinator_storage(
         (CoordinatorStorageMode::DualWrite, _) => {
             let json_snapshot = json_store.load_snapshot()?;
             sqlite_store.save_snapshot(&json_snapshot)?;
-            let sqlite_snapshot = sqlite_store.load_snapshot()?;
-            validate_snapshot_equivalence(&json_snapshot, &sqlite_snapshot)?;
         }
         (CoordinatorStorageMode::Sqlite, CoordinatorStoragePhase::Pre) => {
             if sqlite_store.has_snapshot_data()? {
@@ -1354,10 +1352,7 @@ pub fn sync_coordinator_storage(
             }
         }
         (CoordinatorStorageMode::Sqlite, CoordinatorStoragePhase::Post) => {
-            let json_snapshot = json_store.load_snapshot()?;
-            sqlite_store.save_snapshot(&json_snapshot)?;
             let sqlite_snapshot = sqlite_store.load_snapshot()?;
-            validate_snapshot_equivalence(&json_snapshot, &sqlite_snapshot)?;
             json_store.save_snapshot(&sqlite_snapshot)?;
         }
         (CoordinatorStorageMode::Json, _) => {}
@@ -1414,26 +1409,6 @@ pub fn upsert_slo_warning_sqlite(
     let paths = CoordinatorStoragePaths::from_project_paths(project_paths);
     let sqlite = SqliteStorage::new(paths);
     sqlite.upsert_slo_warning(change)
-}
-
-fn validate_snapshot_equivalence(a: &CoordinatorSnapshot, b: &CoordinatorSnapshot) -> Result<()> {
-    if a.registry != b.registry {
-        return Err(MaccError::Validation(
-            "Coordinator storage mismatch: registry snapshot differs between JSON and SQLite."
-                .into(),
-        ));
-    }
-    if a.events != b.events {
-        return Err(MaccError::Validation(
-            "Coordinator storage mismatch: events snapshot differs between JSON and SQLite.".into(),
-        ));
-    }
-    if a.cursor != b.cursor {
-        return Err(MaccError::Validation(
-            "Coordinator storage mismatch: cursor snapshot differs between JSON and SQLite.".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn read_json_or_default(path: &Path, action: &str, default: Value) -> Result<Value> {

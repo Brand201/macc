@@ -1289,7 +1289,7 @@ fn cleanup_empty_parents(paths: &ProjectPaths, removed: &[PathBuf]) {
         }
     }
 }
-pub const BASELINE_IGNORE_ENTRIES: &[&str] = &[".macc/"];
+pub const BASELINE_IGNORE_ENTRIES: &[&str] = &[".macc/", "performer.sh", "worktree.prd.json"];
 
 fn collect_tool_gitignore_entries(
     paths: &ProjectPaths,
