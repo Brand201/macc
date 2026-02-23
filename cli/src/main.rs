@@ -2331,11 +2331,6 @@ struct CoordinatorJobEvent {
     timed_out: bool,
 }
 
-struct AdvanceOutcome {
-    progressed: bool,
-    blocked_merge: Option<(String, String)>,
-}
-
 struct NativeCoordinatorLogger {
     file: std::path::PathBuf,
 }
@@ -3384,61 +3379,18 @@ fn cleanup_dead_runtime_tasks_in_registry(
     logger: Option<&NativeCoordinatorLogger>,
     repo_root: Option<&std::path::Path>,
 ) -> Result<usize> {
-    let mut fixed = 0usize;
     let now = now_iso_coordinator();
-    let tasks = registry
-        .get_mut("tasks")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
-    for task in tasks.iter_mut() {
-        ensure_runtime_object(task);
-        let Some(pid) = task["task_runtime"]["pid"].as_i64() else {
-            continue;
-        };
-        let runtime_status = task["task_runtime"]["status"].as_str().unwrap_or_default();
-        if runtime_status != "running" || is_pid_running(pid) {
-            continue;
-        }
-
-        let task_id = task
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let phase = task["task_runtime"]["current_phase"]
-            .as_str()
-            .unwrap_or("dev")
-            .to_string();
-        let old_state = task
-            .get("state")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("todo")
-            .to_string();
-
-        task["task_runtime"]["pid"] = serde_json::Value::Null;
-        task["task_runtime"]["status"] = serde_json::Value::String("stale".to_string());
-        task["task_runtime"]["last_error"] = serde_json::Value::String(format!(
-            "runtime pid {} is not running; auto-reset ({})",
-            pid, reason
-        ));
-        task["updated_at"] = serde_json::Value::String(now.clone());
-        task["state_changed_at"] = serde_json::Value::String(now.clone());
-        if old_state == "claimed" && phase == "dev" {
-            task["state"] = serde_json::Value::String("todo".to_string());
-            task["assignee"] = serde_json::Value::Null;
-        } else {
-            task["state"] = serde_json::Value::String("blocked".to_string());
-        }
-        fixed += 1;
+    let cleaned = coordinator_engine::cleanup_dead_runtime_tasks_in_registry_with(
+        registry,
+        &now,
+        is_pid_running,
+    )?;
+    let fixed = cleaned.len();
+    for entry in cleaned {
         if let Some(log) = logger {
             let _ = log.note(format!(
                 "- Runtime ghost cleanup task={} state={} phase={} pid={} -> {} ({})",
-                task_id,
-                old_state,
-                phase,
-                pid,
-                task["state"].as_str().unwrap_or("blocked"),
-                reason
+                entry.task_id, entry.old_state, entry.phase, entry.pid, entry.new_state, reason
             ));
         }
     }
@@ -4462,7 +4414,7 @@ fn advance_tasks_native(
     coordinator_tool_override: Option<&str>,
     phase_runner_max_attempts: usize,
     logger: Option<&NativeCoordinatorLogger>,
-) -> Result<AdvanceOutcome> {
+) -> Result<coordinator_engine::AdvanceResult> {
     let mut registry = load_registry_json(repo_root)?;
     let mut progressed = false;
     let mut blocked_merge: Option<(String, String)> = None;
@@ -4584,7 +4536,7 @@ fn advance_tasks_native(
     recompute_resource_locks_from_tasks(&mut registry);
     set_registry_updated_at(&mut registry);
     save_registry_json(repo_root, &registry)?;
-    Ok(AdvanceOutcome {
+    Ok(coordinator_engine::AdvanceResult {
         progressed,
         blocked_merge,
     })
@@ -4620,57 +4572,20 @@ async fn monitor_active_jobs_native(
                     {
                         continue;
                     }
-                    ensure_runtime_object(task);
-                    if evt.success {
-                        task["state"] = serde_json::Value::String("in_progress".to_string());
-                        task["task_runtime"]["status"] =
-                            serde_json::Value::String("phase_done".to_string());
-                        task["task_runtime"]["current_phase"] =
-                            serde_json::Value::String("dev".to_string());
-                        task["task_runtime"]["pid"] = serde_json::Value::Null;
-                    } else if job.attempt < max_attempts {
-                        should_retry = true;
-                        task["state"] = serde_json::Value::String("claimed".to_string());
-                        task["task_runtime"]["status"] =
-                            serde_json::Value::String("running".to_string());
-                        task["task_runtime"]["current_phase"] =
-                            serde_json::Value::String("dev".to_string());
-                        task["task_runtime"]["pid"] = serde_json::Value::Null;
-                        let reason = if evt.timed_out {
-                            format!(
-                                "performer timed out after {}s on attempt {} (elapsed={}s)",
-                                phase_timeout_seconds,
-                                job.attempt,
-                                job.started_at.elapsed().as_secs()
-                            )
-                        } else {
-                            format!(
-                                "performer failed on attempt {}: {}",
-                                job.attempt, evt.status_text
-                            )
-                        };
-                        task["task_runtime"]["last_error"] = serde_json::Value::String(reason);
-                    } else {
-                        task["state"] = serde_json::Value::String("blocked".to_string());
-                        task["task_runtime"]["status"] =
-                            serde_json::Value::String("failed".to_string());
-                        task["task_runtime"]["pid"] = serde_json::Value::Null;
-                        let reason = if evt.timed_out {
-                            format!(
-                                "performer timed out after {}s (max attempts reached: {}, elapsed={}s)",
-                                phase_timeout_seconds,
-                                max_attempts,
-                                job.started_at.elapsed().as_secs()
-                            )
-                        } else {
-                            format!(
-                                "performer failed after {} attempts: {}",
-                                job.attempt, evt.status_text
-                            )
-                        };
-                        task["task_runtime"]["last_error"] = serde_json::Value::String(reason);
-                    }
-                    task["state_changed_at"] = serde_json::Value::String(now_iso_coordinator());
+                    let completion = coordinator_engine::apply_job_completion(
+                        task,
+                        &coordinator_engine::JobCompletionInput {
+                            success: evt.success,
+                            attempt: job.attempt,
+                            max_attempts: max_attempts.max(1),
+                            timed_out: evt.timed_out,
+                            phase_timeout_seconds,
+                            elapsed_seconds: job.started_at.elapsed().as_secs(),
+                            status_text: evt.status_text.clone(),
+                        },
+                        &now_iso_coordinator(),
+                    );
+                    should_retry = completion.should_retry;
                     break;
                 }
 

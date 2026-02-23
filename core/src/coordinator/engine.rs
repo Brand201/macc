@@ -17,6 +17,12 @@ pub enum AdvancePlan {
     Noop,
 }
 
+#[derive(Debug, Clone)]
+pub struct AdvanceResult {
+    pub progressed: bool,
+    pub blocked_merge: Option<(String, String)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinatorCounts {
     pub total: usize,
@@ -38,6 +44,33 @@ pub struct DispatchClaimUpdate {
     pub pid: Option<i64>,
     pub phase: String,
     pub now: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobCompletionInput {
+    pub success: bool,
+    pub attempt: usize,
+    pub max_attempts: usize,
+    pub timed_out: bool,
+    pub phase_timeout_seconds: usize,
+    pub elapsed_seconds: u64,
+    pub status_text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobCompletionResult {
+    pub should_retry: bool,
+    pub status_label: &'static str,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeadRuntimeCleanupEntry {
+    pub task_id: String,
+    pub old_state: String,
+    pub phase: String,
+    pub pid: i64,
+    pub new_state: String,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +184,166 @@ pub fn apply_merge_failure(task: &mut Value, reason: &str, now: &str) {
     task["state_changed_at"] = Value::String(now.to_string());
 }
 
+pub fn apply_job_completion(
+    task: &mut Value,
+    input: &JobCompletionInput,
+    now: &str,
+) -> JobCompletionResult {
+    ensure_runtime_object(task);
+    if input.attempt == 0 || input.max_attempts == 0 {
+        task["state"] = Value::String(WorkflowState::Blocked.as_str().to_string());
+        task["task_runtime"]["status"] = Value::String(RuntimeStatus::Failed.as_str().to_string());
+        task["task_runtime"]["pid"] = Value::Null;
+        let detail = "performer completion received with invalid attempt counters".to_string();
+        task["task_runtime"]["last_error"] = Value::String(detail.clone());
+        task["state_changed_at"] = Value::String(now.to_string());
+        return JobCompletionResult {
+            should_retry: false,
+            status_label: "failed",
+            detail,
+        };
+    }
+
+    if input.status_text.is_empty() {
+        task["state"] = Value::String(WorkflowState::Blocked.as_str().to_string());
+        task["task_runtime"]["status"] = Value::String(RuntimeStatus::Failed.as_str().to_string());
+        task["task_runtime"]["pid"] = Value::Null;
+        let detail = "performer completion received without status detail".to_string();
+        task["task_runtime"]["last_error"] = Value::String(detail.clone());
+        task["state_changed_at"] = Value::String(now.to_string());
+        return JobCompletionResult {
+            should_retry: false,
+            status_label: "failed",
+            detail,
+        };
+    }
+
+    if input.success {
+        task["state"] = Value::String(WorkflowState::InProgress.as_str().to_string());
+        task["task_runtime"]["status"] =
+            Value::String(RuntimeStatus::PhaseDone.as_str().to_string());
+        task["task_runtime"]["current_phase"] = Value::String("dev".to_string());
+        task["task_runtime"]["pid"] = Value::Null;
+        task["state_changed_at"] = Value::String(now.to_string());
+        return JobCompletionResult {
+            should_retry: false,
+            status_label: "phase_done",
+            detail: input.status_text.clone(),
+        };
+    }
+
+    if input.attempt < input.max_attempts {
+        task["state"] = Value::String(WorkflowState::Claimed.as_str().to_string());
+        task["task_runtime"]["status"] = Value::String(RuntimeStatus::Running.as_str().to_string());
+        task["task_runtime"]["current_phase"] = Value::String("dev".to_string());
+        task["task_runtime"]["pid"] = Value::Null;
+        let reason = if input.timed_out {
+            format!(
+                "performer timed out after {}s on attempt {} (elapsed={}s)",
+                input.phase_timeout_seconds, input.attempt, input.elapsed_seconds
+            )
+        } else {
+            format!(
+                "performer failed on attempt {}: {}",
+                input.attempt, input.status_text
+            )
+        };
+        task["task_runtime"]["last_error"] = Value::String(reason.clone());
+        task["state_changed_at"] = Value::String(now.to_string());
+        return JobCompletionResult {
+            should_retry: true,
+            status_label: "retry",
+            detail: reason,
+        };
+    }
+
+    task["state"] = Value::String(WorkflowState::Blocked.as_str().to_string());
+    task["task_runtime"]["status"] = Value::String(RuntimeStatus::Failed.as_str().to_string());
+    task["task_runtime"]["pid"] = Value::Null;
+    let reason = if input.timed_out {
+        format!(
+            "performer timed out after {}s (max attempts reached: {}, elapsed={}s)",
+            input.phase_timeout_seconds, input.max_attempts, input.elapsed_seconds
+        )
+    } else {
+        format!(
+            "performer failed after {} attempts: {}",
+            input.attempt, input.status_text
+        )
+    };
+    task["task_runtime"]["last_error"] = Value::String(reason.clone());
+    task["state_changed_at"] = Value::String(now.to_string());
+    JobCompletionResult {
+        should_retry: false,
+        status_label: "failed",
+        detail: reason,
+    }
+}
+
+pub fn cleanup_dead_runtime_tasks_in_registry_with<F>(
+    registry: &mut Value,
+    now: &str,
+    mut is_pid_running: F,
+) -> Result<Vec<DeadRuntimeCleanupEntry>>
+where
+    F: FnMut(i64) -> bool,
+{
+    let mut cleaned = Vec::new();
+    let tasks = registry
+        .get_mut("tasks")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
+    for task in tasks.iter_mut() {
+        ensure_runtime_object(task);
+        let Some(pid) = task["task_runtime"]["pid"].as_i64() else {
+            continue;
+        };
+        let runtime_status = task["task_runtime"]["status"].as_str().unwrap_or_default();
+        if runtime_status != RuntimeStatus::Running.as_str() || is_pid_running(pid) {
+            continue;
+        }
+
+        let task_id = task
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let phase = task["task_runtime"]["current_phase"]
+            .as_str()
+            .unwrap_or("dev")
+            .to_string();
+        let old_state = task
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or(WorkflowState::Todo.as_str())
+            .to_string();
+
+        task["task_runtime"]["pid"] = Value::Null;
+        task["task_runtime"]["status"] = Value::String(RuntimeStatus::Stale.as_str().to_string());
+        task["task_runtime"]["last_error"] =
+            Value::String(format!("runtime pid {} is not running; auto-reset", pid));
+        task["updated_at"] = Value::String(now.to_string());
+        task["state_changed_at"] = Value::String(now.to_string());
+        let new_state = if old_state == WorkflowState::Claimed.as_str() && phase == "dev" {
+            task["state"] = Value::String(WorkflowState::Todo.as_str().to_string());
+            task["assignee"] = Value::Null;
+            WorkflowState::Todo.as_str().to_string()
+        } else {
+            task["state"] = Value::String(WorkflowState::Blocked.as_str().to_string());
+            WorkflowState::Blocked.as_str().to_string()
+        };
+
+        cleaned.push(DeadRuntimeCleanupEntry {
+            task_id,
+            old_state,
+            phase,
+            pid,
+            new_state,
+        });
+    }
+    Ok(cleaned)
+}
+
 impl CoordinatorRunController {
     pub fn new(cfg: ControlPlaneLoopConfig) -> Self {
         Self {
@@ -260,5 +453,55 @@ mod tests {
         assert_eq!(task["state"], "claimed");
         assert_eq!(task["task_runtime"]["status"], "running");
         assert_eq!(task["task_runtime"]["pid"], 123);
+    }
+
+    #[test]
+    fn apply_job_completion_success_sets_in_progress() {
+        let mut task =
+            json!({"id":"T3","state":"claimed","task_runtime":{"status":"running","pid":123}});
+        let out = apply_job_completion(
+            &mut task,
+            &JobCompletionInput {
+                success: true,
+                attempt: 1,
+                max_attempts: 1,
+                timed_out: false,
+                phase_timeout_seconds: 0,
+                elapsed_seconds: 2,
+                status_text: "exit status: 0".to_string(),
+            },
+            "2026-02-21T00:00:00Z",
+        );
+        assert!(!out.should_retry);
+        assert_eq!(task["state"], "in_progress");
+        assert_eq!(task["task_runtime"]["status"], "phase_done");
+        assert!(task["task_runtime"]["pid"].is_null());
+    }
+
+    #[test]
+    fn cleanup_dead_runtime_tasks_resets_claimed_dev_to_todo() {
+        let mut registry = json!({
+            "tasks": [{
+                "id":"T4",
+                "state":"claimed",
+                "assignee":"agentA",
+                "task_runtime":{
+                    "status":"running",
+                    "current_phase":"dev",
+                    "pid":999
+                }
+            }]
+        });
+        let cleaned = cleanup_dead_runtime_tasks_in_registry_with(
+            &mut registry,
+            "2026-02-21T00:00:00Z",
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(registry["tasks"][0]["state"], "todo");
+        assert!(registry["tasks"][0]["assignee"].is_null());
+        assert_eq!(registry["tasks"][0]["task_runtime"]["status"], "stale");
+        assert!(registry["tasks"][0]["task_runtime"]["pid"].is_null());
     }
 }
