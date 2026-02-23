@@ -3769,6 +3769,7 @@ fn find_reusable_worktree_native(
             i += 1;
             branch = format!("{}-{}", build_reuse_branch_name(tool, &entry.path), i);
         }
+        let previous_branch = git_current_branch_name(&entry.path);
         let status = std::process::Command::new("git")
             .current_dir(&entry.path)
             .args(["checkout", "-B", &branch, base_branch])
@@ -3780,6 +3781,18 @@ fn find_reusable_worktree_native(
             })?;
         if !status.success() {
             continue;
+        }
+        if let Some(prev) = previous_branch {
+            if !prev.is_empty() && prev != base_branch && prev != branch {
+                if let Err(err) = cleanup_merged_local_branch(repo_root, &prev, base_branch) {
+                    eprintln!(
+                        "warning: failed to cleanup previous local branch '{}' for reused worktree '{}': {}",
+                        prev,
+                        entry.path.display(),
+                        err
+                    );
+                }
+            }
         }
         let last_commit = std::process::Command::new("git")
             .current_dir(&entry.path)
@@ -4228,6 +4241,12 @@ fn merge_task_with_policy_native(
             source: e,
         })?;
     if merge.status.success() {
+        if let Err(err) = cleanup_merged_local_branch(repo_root, branch, base) {
+            eprintln!(
+                "warning: merged task '{}' but failed to cleanup local branch '{}' (base='{}'): {}",
+                task_id, branch, base, err
+            );
+        }
         return Ok(Ok(()));
     }
 
@@ -4286,6 +4305,12 @@ fn merge_task_with_policy_native(
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !unresolved && !in_merge {
+                if let Err(err) = cleanup_merged_local_branch(repo_root, branch, base) {
+                    eprintln!(
+                        "warning: merged task '{}' via AI merge-fix but failed to cleanup local branch '{}' (base='{}'): {}",
+                        task_id, branch, base, err
+                    );
+                }
                 return Ok(Ok(()));
             }
         }
@@ -4332,6 +4357,17 @@ fn merge_task_with_policy_native(
         report_file.display()
     );
     Ok(Err(err))
+}
+
+fn cleanup_merged_local_branch(
+    repo_root: &std::path::Path,
+    branch: &str,
+    base: &str,
+) -> Result<()> {
+    if branch.is_empty() || branch == base {
+        return Ok(());
+    }
+    delete_branch(repo_root, Some(branch), false)
 }
 
 fn resolve_phase_runner_native(
