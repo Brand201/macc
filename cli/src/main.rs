@@ -4445,7 +4445,7 @@ fn advance_tasks_native(
                     logger,
                 )? {
                     Ok(()) => {
-                        coordinator_engine::apply_phase_success(task, transition, &now);
+                        coordinator_engine::apply_phase_success(task, transition, &now)?;
                         if transition.next_state == WorkflowState::PrOpen
                             && task
                                 .get("pr_url")
@@ -4465,10 +4465,10 @@ fn advance_tasks_native(
                     Err(reason) => {
                         coordinator_engine::apply_phase_failure(
                             task,
-                            transition.runtime_phase,
+                            transition.mode,
                             &reason,
                             &now,
-                        );
+                        )?;
                     }
                 }
                 progressed = true;
@@ -4500,14 +4500,14 @@ fn advance_tasks_native(
                     }
                     match merge_task_with_policy_native(repo_root, &task_id, &branch, &base)? {
                         Ok(()) => {
-                            coordinator_engine::apply_merge_success(task, &now);
+                            coordinator_engine::apply_merge_success(task, &now)?;
                             if let Some(log) = logger {
                                 let _ = log.note(format!("- Merge done task={}", task_id));
                             }
                             progressed = true;
                         }
                         Err(reason) => {
-                            coordinator_engine::apply_merge_failure(task, &reason, &now);
+                            coordinator_engine::apply_merge_failure(task, &reason, &now)?;
                             blocked_merge = Some((
                                 task_id.clone(),
                                 task["task_runtime"]["last_error"]

@@ -17,6 +17,14 @@ pub enum AdvancePlan {
     Noop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowEvent {
+    PhaseSucceeded(&'static str),
+    PhaseFailed(&'static str),
+    MergeSucceeded,
+    MergeFailed,
+}
+
 #[derive(Debug, Clone)]
 pub struct AdvanceResult {
     pub progressed: bool,
@@ -114,6 +122,50 @@ pub fn plan_advance(state: WorkflowState) -> AdvancePlan {
     }
 }
 
+fn transition_workflow_state(from: WorkflowState, event: WorkflowEvent) -> Result<WorkflowState> {
+    let to = match (from, event) {
+        (WorkflowState::InProgress, WorkflowEvent::PhaseSucceeded("review")) => {
+            WorkflowState::PrOpen
+        }
+        (WorkflowState::PrOpen, WorkflowEvent::PhaseSucceeded("integrate")) => {
+            WorkflowState::Queued
+        }
+        (WorkflowState::ChangesRequested, WorkflowEvent::PhaseSucceeded("fix")) => {
+            WorkflowState::PrOpen
+        }
+        (WorkflowState::InProgress, WorkflowEvent::PhaseFailed("review"))
+        | (WorkflowState::PrOpen, WorkflowEvent::PhaseFailed("integrate"))
+        | (WorkflowState::ChangesRequested, WorkflowEvent::PhaseFailed("fix"))
+        | (WorkflowState::Queued, WorkflowEvent::MergeFailed) => WorkflowState::Blocked,
+        (WorkflowState::Queued, WorkflowEvent::MergeSucceeded) => WorkflowState::Merged,
+        _ => {
+            return Err(MaccError::Validation(format!(
+                "Invalid coordinator FSM transition: from={} event={:?}",
+                from.as_str(),
+                event
+            )));
+        }
+    };
+
+    if !super::is_valid_workflow_transition(from, to) {
+        return Err(MaccError::Validation(format!(
+            "Coordinator FSM produced invalid workflow transition {} -> {}",
+            from.as_str(),
+            to.as_str()
+        )));
+    }
+
+    Ok(to)
+}
+
+fn task_workflow_state(task: &Value) -> Result<WorkflowState> {
+    task.get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("todo")
+        .parse::<WorkflowState>()
+        .map_err(MaccError::Validation)
+}
+
 pub fn ensure_runtime_object(task: &mut Value) {
     if !task
         .get("task_runtime")
@@ -147,41 +199,66 @@ pub fn apply_dispatch_pid(task: &mut Value, pid: Option<i64>) {
     task["task_runtime"]["pid"] = pid.map(Value::from).unwrap_or(Value::Null);
 }
 
-pub fn apply_phase_success(task: &mut Value, transition: PhaseTransition, now: &str) {
-    task["state"] = Value::String(transition.next_state.as_str().to_string());
+pub fn apply_phase_success(task: &mut Value, transition: PhaseTransition, now: &str) -> Result<()> {
+    let from = task_workflow_state(task)?;
+    let to = transition_workflow_state(from, WorkflowEvent::PhaseSucceeded(transition.mode))?;
+    if to != transition.next_state {
+        return Err(MaccError::Validation(format!(
+            "Coordinator FSM mismatch for mode='{}': expected next={} got {}",
+            transition.mode,
+            transition.next_state.as_str(),
+            to.as_str()
+        )));
+    }
+    task["state"] = Value::String(to.as_str().to_string());
     ensure_runtime_object(task);
     task["task_runtime"]["status"] = Value::String(RuntimeStatus::PhaseDone.as_str().to_string());
     task["task_runtime"]["current_phase"] = Value::String(transition.runtime_phase.to_string());
     task["task_runtime"]["pid"] = Value::Null;
     task["state_changed_at"] = Value::String(now.to_string());
+    Ok(())
 }
 
-pub fn apply_phase_failure(task: &mut Value, runtime_phase: &str, reason: &str, now: &str) {
-    task["state"] = Value::String(WorkflowState::Blocked.as_str().to_string());
+pub fn apply_phase_failure(
+    task: &mut Value,
+    phase_mode: &'static str,
+    reason: &str,
+    now: &str,
+) -> Result<()> {
+    let from = task_workflow_state(task)?;
+    let to = transition_workflow_state(from, WorkflowEvent::PhaseFailed(phase_mode))?;
+    task["state"] = Value::String(to.as_str().to_string());
     ensure_runtime_object(task);
     task["task_runtime"]["status"] = Value::String(RuntimeStatus::Failed.as_str().to_string());
-    task["task_runtime"]["current_phase"] = Value::String(runtime_phase.to_string());
+    task["task_runtime"]["current_phase"] = Value::String(phase_mode.to_string());
     task["task_runtime"]["last_error"] = Value::String(reason.to_string());
     task["task_runtime"]["pid"] = Value::Null;
     task["state_changed_at"] = Value::String(now.to_string());
+    Ok(())
 }
 
-pub fn apply_merge_success(task: &mut Value, now: &str) {
-    task["state"] = Value::String(WorkflowState::Merged.as_str().to_string());
+pub fn apply_merge_success(task: &mut Value, now: &str) -> Result<()> {
+    let from = task_workflow_state(task)?;
+    let to = transition_workflow_state(from, WorkflowEvent::MergeSucceeded)?;
+    task["state"] = Value::String(to.as_str().to_string());
     ensure_runtime_object(task);
     task["task_runtime"]["status"] = Value::String(RuntimeStatus::Idle.as_str().to_string());
     task["task_runtime"]["pid"] = Value::Null;
     task["state_changed_at"] = Value::String(now.to_string());
+    Ok(())
 }
 
-pub fn apply_merge_failure(task: &mut Value, reason: &str, now: &str) {
-    task["state"] = Value::String(WorkflowState::Blocked.as_str().to_string());
+pub fn apply_merge_failure(task: &mut Value, reason: &str, now: &str) -> Result<()> {
+    let from = task_workflow_state(task)?;
+    let to = transition_workflow_state(from, WorkflowEvent::MergeFailed)?;
+    task["state"] = Value::String(to.as_str().to_string());
     ensure_runtime_object(task);
     task["task_runtime"]["status"] = Value::String(RuntimeStatus::Paused.as_str().to_string());
     task["task_runtime"]["current_phase"] = Value::String("integrate".to_string());
     task["task_runtime"]["last_error"] = Value::String(reason.to_string());
     task["task_runtime"]["pid"] = Value::Null;
     task["state_changed_at"] = Value::String(now.to_string());
+    Ok(())
 }
 
 pub fn apply_job_completion(
@@ -428,7 +505,7 @@ mod tests {
     #[test]
     fn apply_phase_failure_sets_blocked_failed() {
         let mut task = json!({ "id": "T1", "state": "in_progress" });
-        apply_phase_failure(&mut task, "review", "boom", "2026-02-20T00:00:00Z");
+        apply_phase_failure(&mut task, "review", "boom", "2026-02-20T00:00:00Z").unwrap();
         assert_eq!(task["state"], "blocked");
         assert_eq!(task["task_runtime"]["status"], "failed");
         assert_eq!(task["task_runtime"]["current_phase"], "review");
@@ -503,5 +580,26 @@ mod tests {
         assert!(registry["tasks"][0]["assignee"].is_null());
         assert_eq!(registry["tasks"][0]["task_runtime"]["status"], "stale");
         assert!(registry["tasks"][0]["task_runtime"]["pid"].is_null());
+    }
+
+    #[test]
+    fn fsm_rejects_skipping_review_phase() {
+        let mut task = json!({"id":"T5","state":"in_progress","task_runtime":{"status":"running"}});
+        let err = apply_phase_success(
+            &mut task,
+            PhaseTransition {
+                mode: "integrate",
+                next_state: WorkflowState::Queued,
+                runtime_phase: "integrate",
+            },
+            "2026-02-21T00:00:00Z",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid coordinator FSM transition"),
+            "unexpected error: {}",
+            err
+        );
     }
 }
