@@ -2,6 +2,7 @@ use super::{RuntimeStatus, WorkflowState};
 use crate::{MaccError, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +79,20 @@ pub struct JobCompletionResult {
     pub should_retry: bool,
     pub status_label: &'static str,
     pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum AdvanceTaskAction {
+    RunPhase {
+        task_id: String,
+        mode: &'static str,
+        transition: PhaseTransition,
+    },
+    QueueMerge {
+        task_id: String,
+        branch: String,
+        base: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +207,187 @@ fn task_workflow_state(task: &Value) -> Result<WorkflowState> {
         .unwrap_or("todo")
         .parse::<WorkflowState>()
         .map_err(MaccError::Validation)
+}
+
+fn tasks_array_mut(registry: &mut Value) -> Result<&mut Vec<Value>> {
+    registry
+        .get_mut("tasks")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))
+}
+
+fn find_task_mut<'a>(registry: &'a mut Value, task_id: &str) -> Result<&'a mut Value> {
+    tasks_array_mut(registry)?
+        .iter_mut()
+        .find(|task| {
+            task.get("id")
+                .and_then(Value::as_str)
+                .map(|id| id == task_id)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| MaccError::Validation(format!("Task '{}' not found in registry", task_id)))
+}
+
+pub fn apply_dispatch_claim_in_registry(
+    registry: &mut Value,
+    update: &DispatchClaimUpdate,
+) -> Result<()> {
+    let task = find_task_mut(registry, &update.task_id)?;
+    apply_dispatch_claim(task, update);
+    Ok(())
+}
+
+pub fn apply_dispatch_pid_in_registry(
+    registry: &mut Value,
+    task_id: &str,
+    pid: Option<i64>,
+) -> Result<()> {
+    let task = find_task_mut(registry, task_id)?;
+    apply_dispatch_pid(task, pid);
+    Ok(())
+}
+
+pub fn build_advance_actions(
+    registry: &Value,
+    active_merge_jobs: &HashSet<String>,
+) -> Result<Vec<AdvanceTaskAction>> {
+    let tasks = registry
+        .get("tasks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
+    let mut actions = Vec::new();
+    for task in tasks {
+        let task_id = task
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let workflow_raw = task
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("todo")
+            .to_string();
+        let workflow_state = workflow_raw.parse::<WorkflowState>().ok();
+        match workflow_state
+            .map(plan_advance)
+            .unwrap_or(AdvancePlan::Noop)
+        {
+            AdvancePlan::RunPhase(transition) => {
+                actions.push(AdvanceTaskAction::RunPhase {
+                    task_id,
+                    mode: transition.mode,
+                    transition,
+                });
+            }
+            AdvancePlan::Merge => {
+                if active_merge_jobs.contains(&task_id) {
+                    continue;
+                }
+                let branch = task
+                    .get("worktree")
+                    .and_then(|w| w.get("branch"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if branch.is_empty() {
+                    continue;
+                }
+                let base = task
+                    .get("worktree")
+                    .and_then(|w| w.get("base_branch"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("master")
+                    .to_string();
+                actions.push(AdvanceTaskAction::QueueMerge {
+                    task_id,
+                    branch,
+                    base,
+                });
+            }
+            AdvancePlan::Noop => {}
+        }
+    }
+    Ok(actions)
+}
+
+pub fn apply_phase_outcome_in_registry(
+    registry: &mut Value,
+    task_id: &str,
+    mode: &'static str,
+    transition: PhaseTransition,
+    review_verdict: Option<ReviewVerdict>,
+    phase_error: Option<&str>,
+    now: &str,
+) -> Result<()> {
+    let task = find_task_mut(registry, task_id)?;
+    if let Some(reason) = phase_error {
+        return apply_phase_failure(task, mode, reason, now);
+    }
+    if mode == "review" {
+        let verdict = review_verdict.ok_or_else(|| {
+            MaccError::Validation(format!(
+                "Missing review verdict for task '{}' during review phase",
+                task_id
+            ))
+        })?;
+        let next = apply_review_phase_success(task, verdict, now)?;
+        if next == WorkflowState::PrOpen
+            && task
+                .get("pr_url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            let branch = task
+                .get("worktree")
+                .and_then(|w| w.get("branch"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            task["pr_url"] = Value::String(format!("local://{}", branch));
+        }
+        return Ok(());
+    }
+    apply_phase_success(task, transition, now)?;
+    if transition.next_state == WorkflowState::PrOpen
+        && task
+            .get("pr_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .is_empty()
+    {
+        let branch = task
+            .get("worktree")
+            .and_then(|w| w.get("branch"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        task["pr_url"] = Value::String(format!("local://{}", branch));
+    }
+    Ok(())
+}
+
+pub fn apply_job_completion_in_registry(
+    registry: &mut Value,
+    task_id: &str,
+    input: &JobCompletionInput,
+    now: &str,
+) -> Result<JobCompletionResult> {
+    let task = find_task_mut(registry, task_id)?;
+    Ok(apply_job_completion(task, input, now))
+}
+
+pub fn apply_merge_result_in_registry(
+    registry: &mut Value,
+    task_id: &str,
+    success: bool,
+    reason: &str,
+    now: &str,
+) -> Result<()> {
+    let task = find_task_mut(registry, task_id)?;
+    if success {
+        apply_merge_success(task, now)
+    } else {
+        apply_merge_failure(task, reason, now)
+    }
 }
 
 pub fn ensure_runtime_object(task: &mut Value) {

@@ -4677,149 +4677,126 @@ async fn advance_tasks_native(
     let mut progressed = false;
     let blocked_merge: Option<(String, String)> = None;
     let now = now_iso_coordinator();
-    let tasks = registry
-        .get_mut("tasks")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
-
-    for task in tasks.iter_mut() {
-        let workflow_raw = task
-            .get("state")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("todo")
-            .to_string();
-        let workflow_state = workflow_raw.parse::<WorkflowState>().ok();
-        match workflow_state
-            .map(coordinator_engine::plan_advance)
-            .unwrap_or(coordinator_engine::AdvancePlan::Noop)
-        {
-            coordinator_engine::AdvancePlan::RunPhase(transition) => {
-                if transition.mode == "review" {
+    let active_merge_ids = state
+        .active_merge_jobs
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let actions = coordinator_engine::build_advance_actions(&registry, &active_merge_ids)?;
+    for action in actions {
+        match action {
+            coordinator_engine::AdvanceTaskAction::RunPhase {
+                task_id,
+                mode,
+                transition,
+            } => {
+                let task_snapshot = registry
+                    .get("tasks")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|tasks| {
+                        tasks.iter().find(|t| {
+                            t.get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|id| id == task_id)
+                                .unwrap_or(false)
+                        })
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        MaccError::Validation(format!(
+                            "Task '{}' not found while advancing phase",
+                            task_id
+                        ))
+                    })?;
+                if mode == "review" {
                     match run_coordinator_review_phase_native(
                         repo_root,
-                        task,
+                        &task_snapshot,
                         coordinator_tool_override,
                         phase_runner_max_attempts,
                         logger,
                     )? {
-                        Ok(verdict) => {
-                            let next = coordinator_engine::apply_review_phase_success(
-                                task, verdict, &now,
-                            )?;
-                            if next == WorkflowState::PrOpen
-                                && task
-                                    .get("pr_url")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or_default()
-                                    .is_empty()
-                            {
-                                let branch = task
-                                    .get("worktree")
-                                    .and_then(|w| w.get("branch"))
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("unknown");
-                                task["pr_url"] =
-                                    serde_json::Value::String(format!("local://{}", branch));
-                            }
-                        }
-                        Err(reason) => {
-                            coordinator_engine::apply_phase_failure(
-                                task,
-                                transition.mode,
-                                &reason,
-                                &now,
-                            )?;
-                        }
+                        Ok(verdict) => coordinator_engine::apply_phase_outcome_in_registry(
+                            &mut registry,
+                            &task_id,
+                            mode,
+                            transition,
+                            Some(verdict),
+                            None,
+                            &now,
+                        )?,
+                        Err(reason) => coordinator_engine::apply_phase_outcome_in_registry(
+                            &mut registry,
+                            &task_id,
+                            mode,
+                            transition,
+                            None,
+                            Some(&reason),
+                            &now,
+                        )?,
                     }
                 } else {
                     match run_coordinator_phase_native(
                         repo_root,
-                        task,
-                        transition.mode,
+                        &task_snapshot,
+                        mode,
                         coordinator_tool_override,
                         phase_runner_max_attempts,
                         logger,
                     )? {
-                        Ok(_) => {
-                            coordinator_engine::apply_phase_success(task, transition, &now)?;
-                            if transition.next_state == WorkflowState::PrOpen
-                                && task
-                                    .get("pr_url")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or_default()
-                                    .is_empty()
-                            {
-                                let branch = task
-                                    .get("worktree")
-                                    .and_then(|w| w.get("branch"))
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("unknown");
-                                task["pr_url"] =
-                                    serde_json::Value::String(format!("local://{}", branch));
-                            }
-                        }
-                        Err(reason) => {
-                            coordinator_engine::apply_phase_failure(
-                                task,
-                                transition.mode,
-                                &reason,
-                                &now,
-                            )?;
-                        }
+                        Ok(_) => coordinator_engine::apply_phase_outcome_in_registry(
+                            &mut registry,
+                            &task_id,
+                            mode,
+                            transition,
+                            None,
+                            None,
+                            &now,
+                        )?,
+                        Err(reason) => coordinator_engine::apply_phase_outcome_in_registry(
+                            &mut registry,
+                            &task_id,
+                            mode,
+                            transition,
+                            None,
+                            Some(&reason),
+                            &now,
+                        )?,
                     }
                 }
                 progressed = true;
             }
-            coordinator_engine::AdvancePlan::Merge => {
-                let task_id = task
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let branch = task
-                    .get("worktree")
-                    .and_then(|w| w.get("branch"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let base = task
-                    .get("worktree")
-                    .and_then(|w| w.get("base_branch"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("master")
-                    .to_string();
-                if !branch.is_empty() {
-                    if state.active_merge_jobs.contains_key(&task_id) {
-                        continue;
-                    }
-                    if let Some(log) = logger {
-                        let _ = log.note(format!(
-                            "- Merge start task={} branch={} base={}",
-                            task_id, branch, base
-                        ));
-                    }
-                    spawn_merge_job_native(
-                        repo_root,
-                        &task_id,
-                        &branch,
-                        &base,
-                        &state.merge_event_tx,
-                        &mut state.merge_join_set,
-                    )
-                    .await?;
-                    state.active_merge_jobs.insert(
-                        task_id.clone(),
-                        CoordinatorMergeJob {
-                            started_at: std::time::Instant::now(),
-                        },
-                    );
-                    if let Some(log) = logger {
-                        let _ = log.note(format!("- Merge queued task={}", task_id));
-                    }
-                    progressed = true;
+            coordinator_engine::AdvanceTaskAction::QueueMerge {
+                task_id,
+                branch,
+                base,
+            } => {
+                if let Some(log) = logger {
+                    let _ = log.note(format!(
+                        "- Merge start task={} branch={} base={}",
+                        task_id, branch, base
+                    ));
                 }
+                spawn_merge_job_native(
+                    repo_root,
+                    &task_id,
+                    &branch,
+                    &base,
+                    &state.merge_event_tx,
+                    &mut state.merge_join_set,
+                )
+                .await?;
+                state.active_merge_jobs.insert(
+                    task_id.clone(),
+                    CoordinatorMergeJob {
+                        started_at: std::time::Instant::now(),
+                    },
+                );
+                if let Some(log) = logger {
+                    let _ = log.note(format!("- Merge queued task={}", task_id));
+                }
+                progressed = true;
             }
-            coordinator_engine::AdvancePlan::Noop => {}
         }
     }
 
@@ -4850,39 +4827,22 @@ async fn monitor_active_jobs_native(
                     repo_root,
                     &BTreeMap::new(),
                 )?;
-                let tasks = registry
-                    .get_mut("tasks")
-                    .and_then(serde_json::Value::as_array_mut)
-                    .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
-
-                let mut should_retry = false;
-                let mut completion_status: Option<&'static str> = None;
-                for task in tasks.iter_mut() {
-                    if task
-                        .get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        != evt.task_id
-                    {
-                        continue;
-                    }
-                    let completion = coordinator_engine::apply_job_completion(
-                        task,
-                        &coordinator_engine::JobCompletionInput {
-                            success: evt.success,
-                            attempt: job.attempt,
-                            max_attempts: max_attempts.max(1),
-                            timed_out: evt.timed_out,
-                            phase_timeout_seconds,
-                            elapsed_seconds: job.started_at.elapsed().as_secs(),
-                            status_text: evt.status_text.clone(),
-                        },
-                        &now_iso_coordinator(),
-                    );
-                    should_retry = completion.should_retry;
-                    completion_status = Some(completion.status_label);
-                    break;
-                }
+                let completion = coordinator_engine::apply_job_completion_in_registry(
+                    &mut registry,
+                    &evt.task_id,
+                    &coordinator_engine::JobCompletionInput {
+                        success: evt.success,
+                        attempt: job.attempt,
+                        max_attempts: max_attempts.max(1),
+                        timed_out: evt.timed_out,
+                        phase_timeout_seconds,
+                        elapsed_seconds: job.started_at.elapsed().as_secs(),
+                        status_text: evt.status_text.clone(),
+                    },
+                    &now_iso_coordinator(),
+                )?;
+                let should_retry = completion.should_retry;
+                let completion_status = Some(completion.status_label);
 
                 recompute_resource_locks_from_tasks(&mut registry);
                 set_registry_updated_at(&mut registry);
@@ -5028,39 +4988,29 @@ async fn monitor_merge_jobs_native(
                     repo_root,
                     &BTreeMap::new(),
                 )?;
-                let tasks = registry
-                    .get_mut("tasks")
-                    .and_then(serde_json::Value::as_array_mut)
-                    .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
-                for task in tasks.iter_mut() {
-                    if task
-                        .get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        != evt.task_id
-                    {
-                        continue;
+                let now = now_iso_coordinator();
+                coordinator_engine::apply_merge_result_in_registry(
+                    &mut registry,
+                    &evt.task_id,
+                    evt.success,
+                    &evt.reason,
+                    &now,
+                )?;
+                if evt.success {
+                    if let Some(log) = logger {
+                        let _ = log.note(format!(
+                            "- Merge done task={} elapsed={}s",
+                            evt.task_id, elapsed
+                        ));
                     }
-                    let now = now_iso_coordinator();
-                    if evt.success {
-                        coordinator_engine::apply_merge_success(task, &now)?;
-                        if let Some(log) = logger {
-                            let _ = log.note(format!(
-                                "- Merge done task={} elapsed={}s",
-                                evt.task_id, elapsed
-                            ));
-                        }
-                    } else {
-                        coordinator_engine::apply_merge_failure(task, &evt.reason, &now)?;
-                        blocked_merge = Some((evt.task_id.clone(), evt.reason.clone()));
-                        if let Some(log) = logger {
-                            let _ = log.note(format!(
-                                "- Merge failed task={} elapsed={}s reason={}",
-                                evt.task_id, elapsed, evt.reason
-                            ));
-                        }
+                } else {
+                    blocked_merge = Some((evt.task_id.clone(), evt.reason.clone()));
+                    if let Some(log) = logger {
+                        let _ = log.note(format!(
+                            "- Merge failed task={} elapsed={}s reason={}",
+                            evt.task_id, elapsed, evt.reason
+                        ));
                     }
-                    break;
                 }
                 recompute_resource_locks_from_tasks(&mut registry);
                 set_registry_updated_at(&mut registry);
@@ -5394,33 +5344,19 @@ async fn dispatch_ready_tasks_native(
 
         let dispatch_now = now_iso_coordinator();
         let dispatch_session_id = format!("coordinator-{}-{}", selected.id, dispatch_now);
-        let tasks = registry
-            .get_mut("tasks")
-            .and_then(serde_json::Value::as_array_mut)
-            .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
-        for task in tasks.iter_mut() {
-            if task
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                == selected.id
-            {
-                let update = coordinator_engine::DispatchClaimUpdate {
-                    task_id: selected.id.clone(),
-                    tool: selected.tool.clone(),
-                    worktree_path: worktree_path.to_string_lossy().to_string(),
-                    branch: branch.clone(),
-                    base_branch: selected.base_branch.clone(),
-                    last_commit: last_commit.clone(),
-                    session_id: dispatch_session_id.clone(),
-                    pid: None,
-                    phase: "dev".to_string(),
-                    now: dispatch_now.clone(),
-                };
-                coordinator_engine::apply_dispatch_claim(task, &update);
-                break;
-            }
-        }
+        let update = coordinator_engine::DispatchClaimUpdate {
+            task_id: selected.id.clone(),
+            tool: selected.tool.clone(),
+            worktree_path: worktree_path.to_string_lossy().to_string(),
+            branch: branch.clone(),
+            base_branch: selected.base_branch.clone(),
+            last_commit: last_commit.clone(),
+            session_id: dispatch_session_id.clone(),
+            pid: None,
+            phase: "dev".to_string(),
+            now: dispatch_now.clone(),
+        };
+        coordinator_engine::apply_dispatch_claim_in_registry(&mut registry, &update)?;
         recompute_resource_locks_from_tasks(&mut registry);
         set_registry_updated_at(&mut registry);
         coordinator::state::coordinator_state_registry_save(
@@ -5443,21 +5379,7 @@ async fn dispatch_ready_tasks_native(
         )?;
         let mut registry =
             coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
-        let tasks = registry
-            .get_mut("tasks")
-            .and_then(serde_json::Value::as_array_mut)
-            .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
-        for task in tasks.iter_mut() {
-            if task
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                == selected.id
-            {
-                coordinator_engine::apply_dispatch_pid(task, pid);
-                break;
-            }
-        }
+        coordinator_engine::apply_dispatch_pid_in_registry(&mut registry, &selected.id, pid)?;
         set_registry_updated_at(&mut registry);
         coordinator::state::coordinator_state_registry_save(
             repo_root,
