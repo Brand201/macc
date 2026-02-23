@@ -1,5 +1,6 @@
 use super::{RuntimeStatus, WorkflowState};
 use crate::{MaccError, Result};
+use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
@@ -105,6 +106,23 @@ pub struct CoordinatorRunController {
     started: Instant,
     no_progress_cycles: usize,
     previous_counts: Option<CoordinatorCounts>,
+}
+
+#[async_trait]
+pub trait ControlPlaneBackend {
+    async fn on_cycle_start(&mut self, cycle: usize) -> Result<()>;
+    async fn monitor_active_jobs(&mut self) -> Result<()>;
+    async fn monitor_merge_jobs(&mut self) -> Result<Option<(String, String)>>;
+    async fn on_blocked_merge(&mut self, task_id: &str, reason: &str) -> Result<()>;
+    async fn advance_tasks(&mut self) -> Result<AdvanceResult>;
+    async fn dispatch_ready_tasks(&mut self) -> Result<usize>;
+    async fn on_cycle_end(
+        &mut self,
+        cycle: usize,
+        advance: &AdvanceResult,
+        dispatched: usize,
+    ) -> Result<CoordinatorCounts>;
+    async fn sleep_between_cycles(&mut self) -> Result<()>;
 }
 
 pub fn plan_advance(state: WorkflowState) -> AdvancePlan {
@@ -501,6 +519,49 @@ impl CoordinatorRunController {
         }
 
         Ok(ControlPlaneDecision::Continue)
+    }
+}
+
+pub async fn run_control_plane<B: ControlPlaneBackend>(
+    backend: &mut B,
+    cfg: ControlPlaneLoopConfig,
+) -> Result<()> {
+    let mut controller = CoordinatorRunController::new(cfg);
+    let mut cycle: usize = 0;
+    loop {
+        cycle += 1;
+        backend.on_cycle_start(cycle).await?;
+
+        backend.monitor_active_jobs().await?;
+        if let Some((task_id, reason)) = backend.monitor_merge_jobs().await? {
+            backend.on_blocked_merge(&task_id, &reason).await?;
+        }
+
+        let advance = backend.advance_tasks().await?;
+
+        backend.monitor_active_jobs().await?;
+        if let Some((task_id, reason)) = backend
+            .monitor_merge_jobs()
+            .await?
+            .or_else(|| advance.blocked_merge.clone())
+        {
+            backend.on_blocked_merge(&task_id, &reason).await?;
+        }
+
+        let dispatched = backend.dispatch_ready_tasks().await?;
+
+        if let Some((task_id, reason)) = backend.monitor_merge_jobs().await? {
+            backend.on_blocked_merge(&task_id, &reason).await?;
+        }
+
+        let counts = backend.on_cycle_end(cycle, &advance, dispatched).await?;
+        match controller.on_cycle_counts(counts) {
+            Ok(ControlPlaneDecision::Continue) => {}
+            Ok(ControlPlaneDecision::Complete) => return Ok(()),
+            Err(err) => return Err(err),
+        }
+
+        backend.sleep_between_cycles().await?;
     }
 }
 

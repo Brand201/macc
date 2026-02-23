@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::str::FromStr;
 
 pub mod engine;
+pub mod session_manager;
 pub mod task_selector;
 
 pub const COORDINATOR_EVENT_SCHEMA_VERSION: &str = "1";

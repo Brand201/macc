@@ -16,3 +16,4 @@ regex = "1.10"
 sha2 = "0.10"
 toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
+async-trait = "0.1"

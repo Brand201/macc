@@ -1,4 +1,4 @@
-use macc_core::{MaccError, Result};
+use crate::{MaccError, Result};
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,9 +52,7 @@ pub fn seal_worktree_scoped_session(
         let tools = root
             .get_mut("tools")
             .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                MaccError::Validation("sessions file missing root .tools object".into())
-            })?;
+            .ok_or_else(|| MaccError::Validation("sessions file missing root .tools object".into()))?;
         let Some(tool) = tools.get_mut(tool_id).and_then(Value::as_object_mut) else {
             return Ok(SessionSealOutcome::default());
         };
@@ -107,10 +105,7 @@ pub fn seal_worktree_scoped_session(
         );
 
         if let Some(leases_obj) = tool.get_mut("leases").and_then(Value::as_object_mut) {
-            if let Some(lease) = leases_obj
-                .get_mut(&session_id)
-                .and_then(Value::as_object_mut)
-            {
+            if let Some(lease) = leases_obj.get_mut(&session_id).and_then(Value::as_object_mut) {
                 lease.insert("status".to_string(), Value::String("sealed".to_string()));
                 lease.insert("updated_at".to_string(), Value::String(now_iso.to_string()));
             }
@@ -293,3 +288,4 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 }
+
