@@ -1,5 +1,5 @@
-use clap::{Parser, Subcommand};
 use async_trait::async_trait;
+use clap::{Parser, Subcommand};
 use macc_adapter_shared::catalog::{remote_search, SearchKind as RemoteSearchKind};
 use macc_core::catalog::{
     load_effective_mcp_catalog, load_effective_skills_catalog, McpCatalog, McpEntry, Selector,
@@ -10,8 +10,7 @@ use macc_core::coordinator::{
     runtime_status_from_event, RuntimeStatus, WorkflowState,
 };
 use macc_core::coordinator_storage::{
-    sync_coordinator_storage, CoordinatorSnapshot, CoordinatorStorage, CoordinatorStorageMode,
-    CoordinatorStoragePaths, CoordinatorStoragePhase, JsonStorage, SqliteStorage,
+    sync_coordinator_storage, CoordinatorStorageMode, CoordinatorStoragePhase,
 };
 use macc_core::engine::{Engine, MaccEngine};
 use macc_core::plan::builders::{plan_mcp_install, plan_skill_install};
@@ -3239,83 +3238,6 @@ fn is_pid_running(pid: i64) -> bool {
         .unwrap_or(false)
 }
 
-fn load_registry_json(repo_root: &std::path::Path) -> Result<serde_json::Value> {
-    if coordinator_storage_mode_from_env() == CoordinatorStorageMode::Sqlite {
-        let project_paths = macc_core::ProjectPaths::from_root(repo_root);
-        let storage_paths = CoordinatorStoragePaths::from_project_paths(&project_paths);
-        let sqlite_store = SqliteStorage::new(storage_paths.clone());
-        if sqlite_store.has_snapshot_data()? {
-            let snapshot = sqlite_store.load_snapshot()?;
-            let json_store = JsonStorage::new(storage_paths);
-            let _ = json_store.save_snapshot(&snapshot);
-            return Ok(snapshot.registry);
-        }
-    }
-    let path = coordinator_registry_path(repo_root);
-    if !path.exists() {
-        return Ok(serde_json::json!({
-            "schema_version": 1,
-            "tasks": [],
-            "processed_event_ids": {},
-            "resource_locks": {},
-            "state_mapping": {},
-            "updated_at": now_iso_coordinator(),
-        }));
-    }
-    let raw = std::fs::read_to_string(&path).map_err(|e| MaccError::Io {
-        path: path.to_string_lossy().into(),
-        action: "read coordinator registry".into(),
-        source: e,
-    })?;
-    serde_json::from_str(&raw).map_err(|e| {
-        MaccError::Validation(format!(
-            "Failed to parse coordinator registry {}: {}",
-            path.display(),
-            e
-        ))
-    })
-}
-
-fn save_registry_json(repo_root: &std::path::Path, value: &serde_json::Value) -> Result<()> {
-    if coordinator_storage_mode_from_env() == CoordinatorStorageMode::Sqlite {
-        let project_paths = macc_core::ProjectPaths::from_root(repo_root);
-        let storage_paths = CoordinatorStoragePaths::from_project_paths(&project_paths);
-        let sqlite_store = SqliteStorage::new(storage_paths.clone());
-        let mut snapshot = if sqlite_store.has_snapshot_data()? {
-            sqlite_store.load_snapshot()?
-        } else {
-            CoordinatorSnapshot::empty()
-        };
-        snapshot.registry = value.clone();
-        sqlite_store.save_snapshot(&snapshot)?;
-        let json_store = JsonStorage::new(storage_paths);
-        let _ = json_store.save_snapshot(&snapshot);
-        return Ok(());
-    }
-    let path = coordinator_registry_path(repo_root);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
-            path: parent.to_string_lossy().into(),
-            action: "create coordinator registry parent".into(),
-            source: e,
-        })?;
-    }
-    let content = serde_json::to_string_pretty(value)
-        .map_err(|e| MaccError::Validation(format!("Failed to serialize registry json: {}", e)))?;
-    std::fs::write(&path, content).map_err(|e| MaccError::Io {
-        path: path.to_string_lossy().into(),
-        action: "write coordinator registry".into(),
-        source: e,
-    })
-}
-
-fn coordinator_storage_mode_from_env() -> CoordinatorStorageMode {
-    std::env::var("COORDINATOR_STORAGE_MODE")
-        .ok()
-        .and_then(|v| v.parse::<CoordinatorStorageMode>().ok())
-        .unwrap_or(CoordinatorStorageMode::Json)
-}
-
 fn set_registry_updated_at(registry: &mut serde_json::Value) {
     registry["updated_at"] = serde_json::Value::String(now_iso_coordinator());
 }
@@ -3423,26 +3345,33 @@ fn cleanup_dead_runtime_tasks(
     reason: &str,
     logger: Option<&NativeCoordinatorLogger>,
 ) -> Result<usize> {
-    let mut registry = load_registry_json(repo_root)?;
+    let mut registry =
+        coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
     let fixed =
         cleanup_dead_runtime_tasks_in_registry(&mut registry, reason, logger, Some(repo_root))?;
     if fixed > 0 {
-        save_registry_json(repo_root, &registry)?;
+        coordinator::state::coordinator_state_registry_save(
+            repo_root,
+            &BTreeMap::new(),
+            &registry,
+        )?;
     }
     Ok(fixed)
 }
 
 fn reconcile_registry_native(repo_root: &std::path::Path) -> Result<()> {
-    let mut registry = load_registry_json(repo_root)?;
+    let mut registry =
+        coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
     let _ =
         cleanup_dead_runtime_tasks_in_registry(&mut registry, "reconcile", None, Some(repo_root))?;
     recompute_resource_locks_from_tasks(&mut registry);
     set_registry_updated_at(&mut registry);
-    save_registry_json(repo_root, &registry)
+    coordinator::state::coordinator_state_registry_save(repo_root, &BTreeMap::new(), &registry)
 }
 
 fn cleanup_registry_native(repo_root: &std::path::Path) -> Result<()> {
-    let mut registry = load_registry_json(repo_root)?;
+    let mut registry =
+        coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
     let mut changed = false;
     if let Some(tasks) = registry
         .get_mut("tasks")
@@ -3483,7 +3412,11 @@ fn cleanup_registry_native(repo_root: &std::path::Path) -> Result<()> {
     if changed {
         recompute_resource_locks_from_tasks(&mut registry);
         set_registry_updated_at(&mut registry);
-        save_registry_json(repo_root, &registry)?;
+        coordinator::state::coordinator_state_registry_save(
+            repo_root,
+            &BTreeMap::new(),
+            &registry,
+        )?;
     }
     Ok(())
 }
@@ -3876,7 +3809,8 @@ fn sync_registry_from_prd_native(
     prd_file: &std::path::Path,
     logger: Option<&NativeCoordinatorLogger>,
 ) -> Result<()> {
-    let mut registry = load_registry_json(repo_root)?;
+    let mut registry =
+        coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
     let raw_prd = std::fs::read_to_string(prd_file).map_err(|e| MaccError::Io {
         path: prd_file.to_string_lossy().into(),
         action: "read coordinator prd".into(),
@@ -3965,7 +3899,7 @@ fn sync_registry_from_prd_native(
     registry["tasks"] = serde_json::Value::Array(merged);
     recompute_resource_locks_from_tasks(&mut registry);
     set_registry_updated_at(&mut registry);
-    save_registry_json(repo_root, &registry)?;
+    coordinator::state::coordinator_state_registry_save(repo_root, &BTreeMap::new(), &registry)?;
     if let Some(log) = logger {
         let count = registry
             .get("tasks")
@@ -4738,7 +4672,8 @@ async fn advance_tasks_native(
     state: &mut CoordinatorRunState,
     logger: Option<&NativeCoordinatorLogger>,
 ) -> Result<coordinator_engine::AdvanceResult> {
-    let mut registry = load_registry_json(repo_root)?;
+    let mut registry =
+        coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
     let mut progressed = false;
     let blocked_merge: Option<(String, String)> = None;
     let now = now_iso_coordinator();
@@ -4890,7 +4825,7 @@ async fn advance_tasks_native(
 
     recompute_resource_locks_from_tasks(&mut registry);
     set_registry_updated_at(&mut registry);
-    save_registry_json(repo_root, &registry)?;
+    coordinator::state::coordinator_state_registry_save(repo_root, &BTreeMap::new(), &registry)?;
     Ok(coordinator_engine::AdvanceResult {
         progressed,
         blocked_merge,
@@ -4911,7 +4846,10 @@ async fn monitor_active_jobs_native(
                 let Some(job) = maybe_job else {
                     continue;
                 };
-                let mut registry = load_registry_json(repo_root)?;
+                let mut registry = coordinator::state::coordinator_state_registry_load(
+                    repo_root,
+                    &BTreeMap::new(),
+                )?;
                 let tasks = registry
                     .get_mut("tasks")
                     .and_then(serde_json::Value::as_array_mut)
@@ -4948,16 +4886,21 @@ async fn monitor_active_jobs_native(
 
                 recompute_resource_locks_from_tasks(&mut registry);
                 set_registry_updated_at(&mut registry);
-                save_registry_json(repo_root, &registry)?;
+                coordinator::state::coordinator_state_registry_save(
+                    repo_root,
+                    &BTreeMap::new(),
+                    &registry,
+                )?;
 
                 if !should_retry && completion_status == Some("phase_done") {
-                    let sealed = macc_core::coordinator::session_manager::seal_worktree_scoped_session(
-                        repo_root,
-                        &job.tool,
-                        &job.worktree_path,
-                        &evt.task_id,
-                        &now_iso_coordinator(),
-                    )?;
+                    let sealed =
+                        macc_core::coordinator::session_manager::seal_worktree_scoped_session(
+                            repo_root,
+                            &job.tool,
+                            &job.worktree_path,
+                            &evt.task_id,
+                            &now_iso_coordinator(),
+                        )?;
                     if sealed.sealed {
                         if let Some(log) = logger {
                             let sid = sealed.session_id.as_deref().unwrap_or("unknown");
@@ -5081,7 +5024,10 @@ async fn monitor_merge_jobs_native(
                     .as_ref()
                     .map(|j| j.started_at.elapsed().as_secs())
                     .unwrap_or(0);
-                let mut registry = load_registry_json(repo_root)?;
+                let mut registry = coordinator::state::coordinator_state_registry_load(
+                    repo_root,
+                    &BTreeMap::new(),
+                )?;
                 let tasks = registry
                     .get_mut("tasks")
                     .and_then(serde_json::Value::as_array_mut)
@@ -5118,7 +5064,11 @@ async fn monitor_merge_jobs_native(
                 }
                 recompute_resource_locks_from_tasks(&mut registry);
                 set_registry_updated_at(&mut registry);
-                save_registry_json(repo_root, &registry)?;
+                coordinator::state::coordinator_state_registry_save(
+                    repo_root,
+                    &BTreeMap::new(),
+                    &registry,
+                )?;
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
@@ -5273,7 +5223,8 @@ async fn dispatch_ready_tasks_native(
             break;
         }
 
-        let mut registry = load_registry_json(repo_root)?;
+        let mut registry =
+            coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
         let config = macc_core::coordinator::task_selector::TaskSelectorConfig {
             enabled_tools: canonical.tools.enabled.clone(),
             tool_priority: env_cfg
@@ -5472,7 +5423,11 @@ async fn dispatch_ready_tasks_native(
         }
         recompute_resource_locks_from_tasks(&mut registry);
         set_registry_updated_at(&mut registry);
-        save_registry_json(repo_root, &registry)?;
+        coordinator::state::coordinator_state_registry_save(
+            repo_root,
+            &BTreeMap::new(),
+            &registry,
+        )?;
 
         let phase_timeout_seconds = env_cfg
             .stale_in_progress_seconds
@@ -5486,7 +5441,8 @@ async fn dispatch_ready_tasks_native(
             &mut state.join_set,
             phase_timeout_seconds,
         )?;
-        let mut registry = load_registry_json(repo_root)?;
+        let mut registry =
+            coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
         let tasks = registry
             .get_mut("tasks")
             .and_then(serde_json::Value::as_array_mut)
@@ -5503,7 +5459,11 @@ async fn dispatch_ready_tasks_native(
             }
         }
         set_registry_updated_at(&mut registry);
-        save_registry_json(repo_root, &registry)?;
+        coordinator::state::coordinator_state_registry_save(
+            repo_root,
+            &BTreeMap::new(),
+            &registry,
+        )?;
 
         state.active_jobs.insert(
             selected.id.clone(),
@@ -5729,9 +5689,10 @@ impl coordinator_engine::ControlPlaneBackend for NativeControlPlaneBackend<'_> {
                             "- Storage post-sync mismatch on cycle {} ({}); rebuilding sqlite (single attempt)",
                             cycle, err
                         ));
-                        if let Err(rebuild_err) =
-                            rebuild_sqlite_storage_from_json(&self.storage_paths, Some(&self.logger))
-                        {
+                        if let Err(rebuild_err) = rebuild_sqlite_storage_from_json(
+                            &self.storage_paths,
+                            Some(&self.logger),
+                        ) {
                             if is_storage_mismatch_error(&rebuild_err) {
                                 self.storage_degraded_json_mode = true;
                                 let _ = self.logger.note(format!(

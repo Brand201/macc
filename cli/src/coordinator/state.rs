@@ -518,6 +518,46 @@ pub fn coordinator_state_slo_metric(
     Ok(())
 }
 
+pub fn coordinator_state_registry_load(
+    repo_root: &Path,
+    args: &BTreeMap<String, String>,
+) -> Result<Value> {
+    Ok(load_snapshot_view(repo_root, args)?.registry)
+}
+
+pub fn coordinator_state_registry_save(
+    repo_root: &Path,
+    args: &BTreeMap<String, String>,
+    registry: &Value,
+) -> Result<()> {
+    let mode = resolve_storage_mode(args)?;
+    let project_paths = ProjectPaths::from_root(repo_root);
+    let store_paths = CoordinatorStoragePaths::from_project_paths(&project_paths);
+    let mut snapshot = match mode {
+        CoordinatorStorageMode::Json => JsonStorage::new(store_paths.clone()).load_snapshot()?,
+        CoordinatorStorageMode::DualWrite | CoordinatorStorageMode::Sqlite => {
+            if SqliteStorage::new(store_paths.clone()).has_snapshot_data()? {
+                SqliteStorage::new(store_paths.clone()).load_snapshot()?
+            } else if store_paths.registry_json_path.exists() {
+                JsonStorage::new(store_paths.clone()).load_snapshot()?
+            } else {
+                CoordinatorSnapshot::empty()
+            }
+        }
+    };
+    snapshot.registry = registry.clone();
+    match mode {
+        CoordinatorStorageMode::Json => {
+            JsonStorage::new(store_paths).save_snapshot(&snapshot)?;
+        }
+        CoordinatorStorageMode::DualWrite | CoordinatorStorageMode::Sqlite => {
+            SqliteStorage::new(store_paths.clone()).save_snapshot(&snapshot)?;
+            let _ = JsonStorage::new(store_paths).save_snapshot(&snapshot);
+        }
+    }
+    Ok(())
+}
+
 fn required_arg(args: &BTreeMap<String, String>, key: &str) -> Result<String> {
     let value = args
         .get(key)
