@@ -4853,6 +4853,7 @@ async fn monitor_active_jobs_native(
                     .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
 
                 let mut should_retry = false;
+                let mut completion_status: Option<&'static str> = None;
                 for task in tasks.iter_mut() {
                     if task
                         .get("id")
@@ -4876,12 +4877,32 @@ async fn monitor_active_jobs_native(
                         &now_iso_coordinator(),
                     );
                     should_retry = completion.should_retry;
+                    completion_status = Some(completion.status_label);
                     break;
                 }
 
                 recompute_resource_locks_from_tasks(&mut registry);
                 set_registry_updated_at(&mut registry);
                 save_registry_json(repo_root, &registry)?;
+
+                if !should_retry && completion_status == Some("phase_done") {
+                    let sealed = coordinator::sessions::seal_worktree_scoped_session(
+                        repo_root,
+                        &job.tool,
+                        &job.worktree_path,
+                        &evt.task_id,
+                        &now_iso_coordinator(),
+                    )?;
+                    if sealed.sealed {
+                        if let Some(log) = logger {
+                            let sid = sealed.session_id.as_deref().unwrap_or("unknown");
+                            let _ = log.note(format!(
+                                "- Session sealed task={} tool={} session_id={}",
+                                evt.task_id, job.tool, sid
+                            ));
+                        }
+                    }
+                }
 
                 if should_retry {
                     let task_id = evt.task_id.clone();
