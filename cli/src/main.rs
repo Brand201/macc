@@ -3204,59 +3204,28 @@ fn set_task_paused_for_integrate(
     task_id: &str,
     reason: &str,
 ) -> Result<()> {
-    let mut registry = load_registry_json(repo_root)?;
-    let tasks = registry
-        .get_mut("tasks")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
-    for task in tasks.iter_mut() {
-        if task
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            != task_id
-        {
-            continue;
-        }
-        ensure_runtime_object(task);
-        task["task_runtime"]["status"] = serde_json::Value::String("paused".to_string());
-        task["task_runtime"]["current_phase"] = serde_json::Value::String("integrate".to_string());
-        task["task_runtime"]["last_error"] = serde_json::Value::String(reason.to_string());
-        task["task_runtime"]["pid"] = serde_json::Value::Null;
-        task["updated_at"] = serde_json::Value::String(now_iso_coordinator());
-        task["state_changed_at"] = serde_json::Value::String(now_iso_coordinator());
-        break;
-    }
-    set_registry_updated_at(&mut registry);
-    save_registry_json(repo_root, &registry)
+    let mut args = BTreeMap::new();
+    args.insert("task-id".to_string(), task_id.to_string());
+    args.insert("runtime-status".to_string(), "paused".to_string());
+    args.insert("phase".to_string(), "integrate".to_string());
+    args.insert("last-error".to_string(), reason.to_string());
+    args.insert("pid".to_string(), "".to_string());
+    coordinator::state::coordinator_state_set_runtime(repo_root, &args)
 }
 
 fn resume_paused_task_integrate(repo_root: &std::path::Path, task_id: &str) -> Result<()> {
-    let mut registry = load_registry_json(repo_root)?;
-    let tasks = registry
-        .get_mut("tasks")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
-    for task in tasks.iter_mut() {
-        if task
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            != task_id
-        {
-            continue;
-        }
-        task["state"] = serde_json::Value::String("queued".to_string());
-        ensure_runtime_object(task);
-        task["task_runtime"]["status"] = serde_json::Value::String("phase_done".to_string());
-        task["task_runtime"]["current_phase"] = serde_json::Value::String("integrate".to_string());
-        task["task_runtime"]["pid"] = serde_json::Value::Null;
-        task["updated_at"] = serde_json::Value::String(now_iso_coordinator());
-        task["state_changed_at"] = serde_json::Value::String(now_iso_coordinator());
-        break;
-    }
-    set_registry_updated_at(&mut registry);
-    save_registry_json(repo_root, &registry)
+    let mut transition_args = BTreeMap::new();
+    transition_args.insert("task-id".to_string(), task_id.to_string());
+    transition_args.insert("state".to_string(), "queued".to_string());
+    transition_args.insert("reason".to_string(), "resume:integrate_pause".to_string());
+    coordinator::state::coordinator_state_apply_transition(repo_root, &transition_args)?;
+
+    let mut runtime_args = BTreeMap::new();
+    runtime_args.insert("task-id".to_string(), task_id.to_string());
+    runtime_args.insert("runtime-status".to_string(), "phase_done".to_string());
+    runtime_args.insert("phase".to_string(), "integrate".to_string());
+    runtime_args.insert("pid".to_string(), "".to_string());
+    coordinator::state::coordinator_state_set_runtime(repo_root, &runtime_args)
 }
 
 fn now_iso_coordinator() -> String {
