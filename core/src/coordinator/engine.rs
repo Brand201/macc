@@ -18,9 +18,16 @@ pub enum AdvancePlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewVerdict {
+    Ok,
+    ChangesRequested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowEvent {
     PhaseSucceeded(&'static str),
     PhaseFailed(&'static str),
+    ReviewChangesRequested,
     MergeSucceeded,
     MergeFailed,
 }
@@ -127,6 +134,9 @@ fn transition_workflow_state(from: WorkflowState, event: WorkflowEvent) -> Resul
         (WorkflowState::InProgress, WorkflowEvent::PhaseSucceeded("review")) => {
             WorkflowState::PrOpen
         }
+        (WorkflowState::InProgress, WorkflowEvent::ReviewChangesRequested) => {
+            WorkflowState::ChangesRequested
+        }
         (WorkflowState::PrOpen, WorkflowEvent::PhaseSucceeded("integrate")) => {
             WorkflowState::Queued
         }
@@ -217,6 +227,29 @@ pub fn apply_phase_success(task: &mut Value, transition: PhaseTransition, now: &
     task["task_runtime"]["pid"] = Value::Null;
     task["state_changed_at"] = Value::String(now.to_string());
     Ok(())
+}
+
+pub fn apply_review_phase_success(
+    task: &mut Value,
+    verdict: ReviewVerdict,
+    now: &str,
+) -> Result<WorkflowState> {
+    let from = task_workflow_state(task)?;
+    let to = match verdict {
+        ReviewVerdict::Ok => {
+            transition_workflow_state(from, WorkflowEvent::PhaseSucceeded("review"))?
+        }
+        ReviewVerdict::ChangesRequested => {
+            transition_workflow_state(from, WorkflowEvent::ReviewChangesRequested)?
+        }
+    };
+    task["state"] = Value::String(to.as_str().to_string());
+    ensure_runtime_object(task);
+    task["task_runtime"]["status"] = Value::String(RuntimeStatus::PhaseDone.as_str().to_string());
+    task["task_runtime"]["current_phase"] = Value::String("review".to_string());
+    task["task_runtime"]["pid"] = Value::Null;
+    task["state_changed_at"] = Value::String(now.to_string());
+    Ok(to)
 }
 
 pub fn apply_phase_failure(

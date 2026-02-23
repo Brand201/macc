@@ -148,6 +148,7 @@ pub fn is_valid_workflow_transition(from: WorkflowState, to: WorkflowState) -> b
             | (WorkflowState::Claimed, WorkflowState::Blocked)
             | (WorkflowState::Claimed, WorkflowState::Abandoned)
             | (WorkflowState::InProgress, WorkflowState::PrOpen)
+            | (WorkflowState::InProgress, WorkflowState::ChangesRequested)
             | (WorkflowState::InProgress, WorkflowState::Blocked)
             | (WorkflowState::InProgress, WorkflowState::Abandoned)
             | (WorkflowState::PrOpen, WorkflowState::ChangesRequested)

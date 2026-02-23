@@ -4028,6 +4028,132 @@ fn summarize_output(text: &str) -> String {
     }
 }
 
+fn git_status_clean(worktree: &std::path::Path) -> Result<bool> {
+    let output = std::process::Command::new("git")
+        .current_dir(worktree)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|e| MaccError::Io {
+            path: worktree.to_string_lossy().into(),
+            action: "check git status --porcelain".into(),
+            source: e,
+        })?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+fn git_head_commit(worktree: &std::path::Path) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .current_dir(worktree)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| MaccError::Io {
+            path: worktree.to_string_lossy().into(),
+            action: "resolve HEAD commit".into(),
+            source: e,
+        })?;
+    if !output.status.success() {
+        return Err(MaccError::Validation(format!(
+            "Failed to resolve HEAD in {}",
+            worktree.display()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_ahead_count(worktree: &std::path::Path, base: &str) -> Result<usize> {
+    let range = format!("{}..HEAD", base);
+    let output = std::process::Command::new("git")
+        .current_dir(worktree)
+        .args(["rev-list", "--count", &range])
+        .output()
+        .map_err(|e| MaccError::Io {
+            path: worktree.to_string_lossy().into(),
+            action: "compute ahead commit count".into(),
+            source: e,
+        })?;
+    if !output.status.success() {
+        return Ok(0);
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(raw.parse::<usize>().unwrap_or(0))
+}
+
+fn parse_review_verdict(output: &str) -> Option<coordinator_engine::ReviewVerdict> {
+    let mut verdict: Option<coordinator_engine::ReviewVerdict> = None;
+    for line in output.lines() {
+        let normalized = line.trim().to_ascii_uppercase();
+        if normalized.ends_with("REVIEW_VERDICT: OK") {
+            verdict = Some(coordinator_engine::ReviewVerdict::Ok);
+        } else if normalized.ends_with("REVIEW_VERDICT: CHANGES_REQUESTED") {
+            verdict = Some(coordinator_engine::ReviewVerdict::ChangesRequested);
+        }
+    }
+    verdict
+}
+
+fn append_coordinator_event(
+    repo_root: &std::path::Path,
+    event_type: &str,
+    task_id: &str,
+    phase: &str,
+    status: &str,
+    message: &str,
+) -> Result<()> {
+    let events_path = repo_root
+        .join(".macc")
+        .join("log")
+        .join("coordinator")
+        .join("events.jsonl");
+    if let Some(parent) = events_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
+            path: parent.to_string_lossy().into(),
+            action: "create coordinator events directory".into(),
+            source: e,
+        })?;
+    }
+    let now = now_iso_coordinator();
+    let seq = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default() as u64;
+    let payload = serde_json::json!({
+        "schema_version":"1",
+        "event_id": format!("evt-{}-{}-{}", event_type, task_id, seq),
+        "seq": seq,
+        "ts": now,
+        "source": "coordinator:native",
+        "task_id": task_id,
+        "type": event_type,
+        "phase": phase,
+        "status": status,
+        "payload": {"message": message}
+    });
+    let line = serde_json::to_string(&payload).map_err(|e| {
+        MaccError::Validation(format!("Failed to serialize coordinator event: {}", e))
+    })?;
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&events_path)
+        .map_err(|e| MaccError::Io {
+            path: events_path.to_string_lossy().into(),
+            action: "open coordinator events file".into(),
+            source: e,
+        })?;
+    file.write_all(line.as_bytes()).map_err(|e| MaccError::Io {
+        path: events_path.to_string_lossy().into(),
+        action: "write coordinator event".into(),
+        source: e,
+    })?;
+    file.write_all(b"\n").map_err(|e| MaccError::Io {
+        path: events_path.to_string_lossy().into(),
+        action: "terminate coordinator event line".into(),
+        source: e,
+    })?;
+    Ok(())
+}
+
 fn merge_task_with_policy_native(
     repo_root: &std::path::Path,
     task_id: &str,
@@ -4265,6 +4391,12 @@ fn build_phase_prompt_native(
             mode, task_id, e
         ))
     })?;
+    if mode == "review" {
+        return Ok(format!(
+            "You are the assigned {} performer running inside a MACC worktree.\n\nMode: {}\nTask ID: {}\n\nTask registry entry (JSON):\n{}\n\nInstructions:\n1) Execute the review phase only.\n2) Review the already committed task changes and produce a verdict.\n3) Do not modify files, do not create commits, and do not modify task registry state.\n4) Return exactly one final verdict line at the end of your response:\n   - REVIEW_VERDICT: OK\n   - REVIEW_VERDICT: CHANGES_REQUESTED\n",
+            tool, mode, task_id, task_payload
+        ));
+    }
     Ok(format!(
         "You are the assigned {} performer running inside a MACC worktree.\n\nMode: {}\nTask ID: {}\n\nTask registry entry (JSON):\n{}\n\nInstructions:\n1) Execute the {} phase only.\n2) Keep changes minimal and focused on this task.\n3) Update code/tests/docs as needed for this phase.\n4) Do not modify task registry state directly.\n",
         tool, mode, task_id, task_payload, mode
@@ -4278,7 +4410,7 @@ fn run_coordinator_phase_native(
     coordinator_tool_override: Option<&str>,
     max_attempts: usize,
     logger: Option<&NativeCoordinatorLogger>,
-) -> Result<std::result::Result<(), String>> {
+) -> Result<std::result::Result<String, String>> {
     let task_id = task
         .get("id")
         .and_then(serde_json::Value::as_str)
@@ -4409,6 +4541,11 @@ fn run_coordinator_phase_native(
             );
             continue;
         };
+        let combined_output = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
         if out.status.success() {
             let _ = std::fs::remove_file(&prompt_path);
             if let Some(log) = logger {
@@ -4417,7 +4554,7 @@ fn run_coordinator_phase_native(
                     mode, task_id, attempt
                 ));
             }
-            return Ok(Ok(()));
+            return Ok(Ok(combined_output));
         }
         last_reason = format!(
             "phase '{}' failed for task {} on attempt {}/{}: status={} stdout=\"{}\" stderr=\"{}\"",
@@ -4438,6 +4575,95 @@ fn run_coordinator_phase_native(
         ));
     }
     Ok(Err(last_reason))
+}
+
+fn run_coordinator_review_phase_native(
+    repo_root: &std::path::Path,
+    task: &serde_json::Value,
+    coordinator_tool_override: Option<&str>,
+    max_attempts: usize,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<std::result::Result<coordinator_engine::ReviewVerdict, String>> {
+    let task_id = task
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let worktree_path = task
+        .get("worktree")
+        .and_then(|w| w.get("worktree_path"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let base_branch = task
+        .get("worktree")
+        .and_then(|w| w.get("base_branch"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("master");
+    if task_id.is_empty() || worktree_path.is_empty() {
+        return Ok(Err(
+            "review cannot run: missing task id or worktree path".to_string()
+        ));
+    }
+    let worktree = std::path::PathBuf::from(worktree_path);
+    let clean_before = git_status_clean(&worktree)?;
+    if !clean_before {
+        return Ok(Err(format!(
+            "review precheck failed for task {}: worktree not clean before review",
+            task_id
+        )));
+    }
+    let ahead = git_ahead_count(&worktree, base_branch)?;
+    if ahead == 0 {
+        return Ok(Err(format!(
+            "review precheck failed for task {}: no committed diff to review against base '{}'",
+            task_id, base_branch
+        )));
+    }
+    let head_before = git_head_commit(&worktree)?;
+    let phase = run_coordinator_phase_native(
+        repo_root,
+        task,
+        "review",
+        coordinator_tool_override,
+        max_attempts,
+        logger,
+    )?;
+    let output = match phase {
+        Ok(out) => out,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let clean_after = git_status_clean(&worktree)?;
+    if !clean_after {
+        return Ok(Err(format!(
+            "review postcheck failed for task {}: worktree not clean after review",
+            task_id
+        )));
+    }
+    let head_after = git_head_commit(&worktree)?;
+    if head_after != head_before {
+        return Ok(Err(format!(
+            "review postcheck failed for task {}: review changed commit {} -> {}",
+            task_id, head_before, head_after
+        )));
+    }
+    let Some(verdict) = parse_review_verdict(&output) else {
+        return Ok(Err(format!(
+            "review verdict parse failed for task {}: missing final REVIEW_VERDICT line",
+            task_id
+        )));
+    };
+    let verdict_status = match verdict {
+        coordinator_engine::ReviewVerdict::Ok => "ok",
+        coordinator_engine::ReviewVerdict::ChangesRequested => "changes_requested",
+    };
+    append_coordinator_event(
+        repo_root,
+        "review_done",
+        task_id,
+        "review",
+        verdict_status,
+        &format!("Review verdict for task {}: {}", task_id, verdict_status),
+    )?;
+    Ok(Ok(verdict))
 }
 
 async fn advance_tasks_native(
@@ -4468,39 +4694,78 @@ async fn advance_tasks_native(
             .unwrap_or(coordinator_engine::AdvancePlan::Noop)
         {
             coordinator_engine::AdvancePlan::RunPhase(transition) => {
-                match run_coordinator_phase_native(
-                    repo_root,
-                    task,
-                    transition.mode,
-                    coordinator_tool_override,
-                    phase_runner_max_attempts,
-                    logger,
-                )? {
-                    Ok(()) => {
-                        coordinator_engine::apply_phase_success(task, transition, &now)?;
-                        if transition.next_state == WorkflowState::PrOpen
-                            && task
-                                .get("pr_url")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default()
-                                .is_empty()
-                        {
-                            let branch = task
-                                .get("worktree")
-                                .and_then(|w| w.get("branch"))
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("unknown");
-                            task["pr_url"] =
-                                serde_json::Value::String(format!("local://{}", branch));
+                if transition.mode == "review" {
+                    match run_coordinator_review_phase_native(
+                        repo_root,
+                        task,
+                        coordinator_tool_override,
+                        phase_runner_max_attempts,
+                        logger,
+                    )? {
+                        Ok(verdict) => {
+                            let next = coordinator_engine::apply_review_phase_success(
+                                task, verdict, &now,
+                            )?;
+                            if next == WorkflowState::PrOpen
+                                && task
+                                    .get("pr_url")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .is_empty()
+                            {
+                                let branch = task
+                                    .get("worktree")
+                                    .and_then(|w| w.get("branch"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("unknown");
+                                task["pr_url"] =
+                                    serde_json::Value::String(format!("local://{}", branch));
+                            }
+                        }
+                        Err(reason) => {
+                            coordinator_engine::apply_phase_failure(
+                                task,
+                                transition.mode,
+                                &reason,
+                                &now,
+                            )?;
                         }
                     }
-                    Err(reason) => {
-                        coordinator_engine::apply_phase_failure(
-                            task,
-                            transition.mode,
-                            &reason,
-                            &now,
-                        )?;
+                } else {
+                    match run_coordinator_phase_native(
+                        repo_root,
+                        task,
+                        transition.mode,
+                        coordinator_tool_override,
+                        phase_runner_max_attempts,
+                        logger,
+                    )? {
+                        Ok(_) => {
+                            coordinator_engine::apply_phase_success(task, transition, &now)?;
+                            if transition.next_state == WorkflowState::PrOpen
+                                && task
+                                    .get("pr_url")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .is_empty()
+                            {
+                                let branch = task
+                                    .get("worktree")
+                                    .and_then(|w| w.get("branch"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("unknown");
+                                task["pr_url"] =
+                                    serde_json::Value::String(format!("local://{}", branch));
+                            }
+                        }
+                        Err(reason) => {
+                            coordinator_engine::apply_phase_failure(
+                                task,
+                                transition.mode,
+                                &reason,
+                                &now,
+                            )?;
+                        }
                     }
                 }
                 progressed = true;
