@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::str::FromStr;
 
 pub mod engine;
+pub mod runtime;
 pub mod session_manager;
 pub mod task_selector;
 
