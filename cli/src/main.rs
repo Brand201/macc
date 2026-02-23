@@ -3062,19 +3062,7 @@ fn run_coordinator_action_with_options(
     env_cfg: &CoordinatorEnvConfig,
     skip_storage_sync: bool,
 ) -> Result<()> {
-    let use_legacy = matches!(
-        action,
-        "run"
-            | "dispatch"
-            | "advance"
-            | "sync"
-            | "status"
-            | "reconcile"
-            | "unlock"
-            | "cleanup"
-            | "retry-phase"
-            | "cutover-gate"
-    );
+    let use_legacy = should_use_legacy_coordinator_action(action, None);
     let legacy_path = coordinator_path.with_file_name("coordinator_legacy.sh");
     let selected = if use_legacy && legacy_path.exists() {
         legacy_path.as_path()
@@ -3106,6 +3094,33 @@ fn run_coordinator_action_with_options(
         eprintln!("warning: failed to aggregate performer logs: {}", err);
     }
     Ok(())
+}
+
+fn is_native_coordinator_action(action: &str) -> bool {
+    matches!(
+        action,
+        "run" | "dispatch" | "advance" | "sync" | "reconcile" | "cleanup"
+    )
+}
+
+fn parse_action_list(raw: &str) -> HashSet<String> {
+    raw.split(',')
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+fn should_use_legacy_coordinator_action(action: &str, forced_legacy_actions: Option<&str>) -> bool {
+    let action_norm = action.trim().to_ascii_lowercase();
+    let forced_raw = forced_legacy_actions
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("MACC_COORDINATOR_FORCE_LEGACY_ACTIONS").ok())
+        .unwrap_or_default();
+    let forced = parse_action_list(&forced_raw);
+    if forced.contains("all") || forced.contains(&action_norm) {
+        return true;
+    }
+    !is_native_coordinator_action(&action_norm)
 }
 
 fn coordinator_registry_path(repo_root: &std::path::Path) -> std::path::PathBuf {
@@ -9606,6 +9621,42 @@ mod tests {
         let (from, to) = parse_coordinator_validate_transition_args(&args).unwrap();
         assert_eq!(from, WorkflowState::Todo);
         assert_eq!(to, WorkflowState::Claimed);
+    }
+
+    #[test]
+    fn test_should_use_legacy_coordinator_action_default_matrix() {
+        assert!(!should_use_legacy_coordinator_action("dispatch", Some("")));
+        assert!(!should_use_legacy_coordinator_action("advance", Some("")));
+        assert!(should_use_legacy_coordinator_action("unlock", Some("")));
+        assert!(should_use_legacy_coordinator_action(
+            "retry-phase",
+            Some("")
+        ));
+    }
+
+    #[test]
+    fn test_should_use_legacy_coordinator_action_force_override() {
+        assert!(should_use_legacy_coordinator_action(
+            "dispatch",
+            Some("dispatch,sync")
+        ));
+        assert!(should_use_legacy_coordinator_action(
+            "sync",
+            Some("dispatch,sync")
+        ));
+        assert!(!should_use_legacy_coordinator_action(
+            "advance",
+            Some("dispatch,sync")
+        ));
+    }
+
+    #[test]
+    fn test_should_use_legacy_coordinator_action_force_all() {
+        assert!(should_use_legacy_coordinator_action(
+            "dispatch",
+            Some("all")
+        ));
+        assert!(should_use_legacy_coordinator_action("unlock", Some("all")));
     }
 
     #[test]
