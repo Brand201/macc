@@ -3784,14 +3784,15 @@ fn find_reusable_worktree_native(
         }
         if let Some(prev) = previous_branch {
             if !prev.is_empty() && prev != base_branch && prev != branch {
-                if let Err(err) = cleanup_merged_local_branch(repo_root, &prev, base_branch) {
-                    eprintln!(
-                        "warning: failed to cleanup previous local branch '{}' for reused worktree '{}': {}",
-                        prev,
-                        entry.path.display(),
-                        err
-                    );
-                }
+                report_branch_cleanup_outcome(
+                    repo_root,
+                    None,
+                    "dispatch",
+                    &prev,
+                    base_branch,
+                    "reused_worktree_switch",
+                    cleanup_merged_local_branch(repo_root, &prev, base_branch),
+                );
             }
         }
         let last_commit = std::process::Command::new("git")
@@ -4241,12 +4242,15 @@ fn merge_task_with_policy_native(
             source: e,
         })?;
     if merge.status.success() {
-        if let Err(err) = cleanup_merged_local_branch(repo_root, branch, base) {
-            eprintln!(
-                "warning: merged task '{}' but failed to cleanup local branch '{}' (base='{}'): {}",
-                task_id, branch, base, err
-            );
-        }
+        report_branch_cleanup_outcome(
+            repo_root,
+            Some(task_id),
+            "integrate",
+            branch,
+            base,
+            "merge_success",
+            cleanup_merged_local_branch(repo_root, branch, base),
+        );
         return Ok(Ok(()));
     }
 
@@ -4305,12 +4309,15 @@ fn merge_task_with_policy_native(
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !unresolved && !in_merge {
-                if let Err(err) = cleanup_merged_local_branch(repo_root, branch, base) {
-                    eprintln!(
-                        "warning: merged task '{}' via AI merge-fix but failed to cleanup local branch '{}' (base='{}'): {}",
-                        task_id, branch, base, err
-                    );
-                }
+                report_branch_cleanup_outcome(
+                    repo_root,
+                    Some(task_id),
+                    "integrate",
+                    branch,
+                    base,
+                    "merge_ai_fix_success",
+                    cleanup_merged_local_branch(repo_root, branch, base),
+                );
                 return Ok(Ok(()));
             }
         }
@@ -4368,6 +4375,49 @@ fn cleanup_merged_local_branch(
         return Ok(());
     }
     delete_branch(repo_root, Some(branch), false)
+}
+
+fn report_branch_cleanup_outcome(
+    repo_root: &std::path::Path,
+    task_id: Option<&str>,
+    phase: &str,
+    branch: &str,
+    base: &str,
+    context: &str,
+    cleanup_result: std::result::Result<(), MaccError>,
+) {
+    let task_ref = task_id.unwrap_or("unknown");
+    match cleanup_result {
+        Ok(()) => {
+            let msg = format!(
+                "branch cleanup success context={} task={} branch={} base={}",
+                context, task_ref, branch, base
+            );
+            let _ = append_coordinator_event(
+                repo_root,
+                "branch_cleanup",
+                task_ref,
+                phase,
+                "success",
+                &msg,
+            );
+        }
+        Err(err) => {
+            let msg = format!(
+                "branch cleanup failed context={} task={} branch={} base={} error={}",
+                context, task_ref, branch, base, err
+            );
+            eprintln!("warning: {}", msg);
+            let _ = append_coordinator_event(
+                repo_root,
+                "branch_cleanup",
+                task_ref,
+                phase,
+                "failed",
+                &msg,
+            );
+        }
+    }
 }
 
 fn resolve_phase_runner_native(
