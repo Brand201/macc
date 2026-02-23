@@ -1723,12 +1723,24 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                     })
                     .unwrap_or(1)
                     .max(1);
-                let advance = advance_tasks_native(
-                    &paths.root,
-                    coordinator_tool_override.as_deref(),
-                    phase_runner_max_attempts,
-                    Some(&logger),
-                )?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .enable_io()
+                    .build()
+                    .map_err(|e| {
+                        MaccError::Validation(format!("Failed to initialize tokio runtime: {}", e))
+                    })?;
+                let advance = runtime.block_on(async {
+                    let mut state = CoordinatorRunState::new();
+                    advance_tasks_native(
+                        &paths.root,
+                        coordinator_tool_override.as_deref(),
+                        phase_runner_max_attempts,
+                        &mut state,
+                        Some(&logger),
+                    )
+                    .await
+                })?;
                 if let Some((task_id, reason)) = advance.blocked_merge {
                     set_task_paused_for_integrate(&paths.root, &task_id, &reason)?;
                     write_coordinator_pause_file(&paths.root, &task_id, "integrate", &reason)?;
@@ -2324,11 +2336,21 @@ struct CoordinatorJob {
     pid: Option<i64>,
 }
 
+struct CoordinatorMergeJob {
+    started_at: std::time::Instant,
+}
+
 struct CoordinatorJobEvent {
     task_id: String,
     success: bool,
     status_text: String,
     timed_out: bool,
+}
+
+struct CoordinatorMergeEvent {
+    task_id: String,
+    success: bool,
+    reason: String,
 }
 
 struct NativeCoordinatorLogger {
@@ -2383,16 +2405,25 @@ struct CoordinatorRunState {
     join_set: tokio::task::JoinSet<()>,
     event_tx: tokio::sync::mpsc::UnboundedSender<CoordinatorJobEvent>,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<CoordinatorJobEvent>,
+    active_merge_jobs: HashMap<String, CoordinatorMergeJob>,
+    merge_join_set: tokio::task::JoinSet<()>,
+    merge_event_tx: tokio::sync::mpsc::UnboundedSender<CoordinatorMergeEvent>,
+    merge_event_rx: tokio::sync::mpsc::UnboundedReceiver<CoordinatorMergeEvent>,
 }
 
 impl CoordinatorRunState {
     fn new() -> Self {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (merge_event_tx, merge_event_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             active_jobs: HashMap::new(),
             join_set: tokio::task::JoinSet::new(),
             event_tx,
             event_rx,
+            active_merge_jobs: HashMap::new(),
+            merge_join_set: tokio::task::JoinSet::new(),
+            merge_event_tx,
+            merge_event_rx,
         }
     }
 }
@@ -4409,15 +4440,16 @@ fn run_coordinator_phase_native(
     Ok(Err(last_reason))
 }
 
-fn advance_tasks_native(
+async fn advance_tasks_native(
     repo_root: &std::path::Path,
     coordinator_tool_override: Option<&str>,
     phase_runner_max_attempts: usize,
+    state: &mut CoordinatorRunState,
     logger: Option<&NativeCoordinatorLogger>,
 ) -> Result<coordinator_engine::AdvanceResult> {
     let mut registry = load_registry_json(repo_root)?;
     let mut progressed = false;
-    let mut blocked_merge: Option<(String, String)> = None;
+    let blocked_merge: Option<(String, String)> = None;
     let now = now_iso_coordinator();
     let tasks = registry
         .get_mut("tasks")
@@ -4425,12 +4457,12 @@ fn advance_tasks_native(
         .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
 
     for task in tasks.iter_mut() {
-        let state = task
+        let workflow_raw = task
             .get("state")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("todo")
             .to_string();
-        let workflow_state = state.parse::<WorkflowState>().ok();
+        let workflow_state = workflow_raw.parse::<WorkflowState>().ok();
         match workflow_state
             .map(coordinator_engine::plan_advance)
             .unwrap_or(coordinator_engine::AdvancePlan::Noop)
@@ -4492,41 +4524,34 @@ fn advance_tasks_native(
                     .unwrap_or("master")
                     .to_string();
                 if !branch.is_empty() {
+                    if state.active_merge_jobs.contains_key(&task_id) {
+                        continue;
+                    }
                     if let Some(log) = logger {
                         let _ = log.note(format!(
                             "- Merge start task={} branch={} base={}",
                             task_id, branch, base
                         ));
                     }
-                    match merge_task_with_policy_native(repo_root, &task_id, &branch, &base)? {
-                        Ok(()) => {
-                            coordinator_engine::apply_merge_success(task, &now)?;
-                            if let Some(log) = logger {
-                                let _ = log.note(format!("- Merge done task={}", task_id));
-                            }
-                            progressed = true;
-                        }
-                        Err(reason) => {
-                            coordinator_engine::apply_merge_failure(task, &reason, &now)?;
-                            blocked_merge = Some((
-                                task_id.clone(),
-                                task["task_runtime"]["last_error"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string(),
-                            ));
-                            if let Some(log) = logger {
-                                let _ = log.note(format!(
-                                    "- Merge failed task={} reason={}",
-                                    task_id,
-                                    task["task_runtime"]["last_error"]
-                                        .as_str()
-                                        .unwrap_or_default()
-                                ));
-                            }
-                            progressed = true;
-                        }
+                    spawn_merge_job_native(
+                        repo_root,
+                        &task_id,
+                        &branch,
+                        &base,
+                        &state.merge_event_tx,
+                        &mut state.merge_join_set,
+                    )
+                    .await?;
+                    state.active_merge_jobs.insert(
+                        task_id.clone(),
+                        CoordinatorMergeJob {
+                            started_at: std::time::Instant::now(),
+                        },
+                    );
+                    if let Some(log) = logger {
+                        let _ = log.note(format!("- Merge queued task={}", task_id));
                     }
+                    progressed = true;
                 }
             }
             coordinator_engine::AdvancePlan::Noop => {}
@@ -4636,6 +4661,122 @@ async fn monitor_active_jobs_native(
         let _ = joined;
     }
     Ok(())
+}
+
+async fn spawn_merge_job_native(
+    repo_root: &std::path::Path,
+    task_id: &str,
+    branch: &str,
+    base: &str,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<CoordinatorMergeEvent>,
+    join_set: &mut tokio::task::JoinSet<()>,
+) -> Result<()> {
+    let repo = repo_root.to_path_buf();
+    let task_id_owned = task_id.to_string();
+    let branch_owned = branch.to_string();
+    let base_owned = base.to_string();
+    let tx = event_tx.clone();
+    join_set.spawn(async move {
+        let task_for_worker = task_id_owned.clone();
+        let branch_for_worker = branch_owned.clone();
+        let base_for_worker = base_owned.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            merge_task_with_policy_native(
+                &repo,
+                &task_for_worker,
+                &branch_for_worker,
+                &base_for_worker,
+            )
+        })
+        .await;
+        let evt = match outcome {
+            Ok(Ok(Ok(()))) => CoordinatorMergeEvent {
+                task_id: task_id_owned,
+                success: true,
+                reason: "merge completed".to_string(),
+            },
+            Ok(Ok(Err(reason))) => CoordinatorMergeEvent {
+                task_id: task_id_owned,
+                success: false,
+                reason,
+            },
+            Ok(Err(err)) => CoordinatorMergeEvent {
+                task_id: task_id_owned,
+                success: false,
+                reason: err.to_string(),
+            },
+            Err(join_err) => CoordinatorMergeEvent {
+                task_id: task_id_owned,
+                success: false,
+                reason: format!("merge worker join error: {}", join_err),
+            },
+        };
+        let _ = tx.send(evt);
+    });
+    Ok(())
+}
+
+async fn monitor_merge_jobs_native(
+    repo_root: &std::path::Path,
+    state: &mut CoordinatorRunState,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<Option<(String, String)>> {
+    let mut blocked_merge: Option<(String, String)> = None;
+    loop {
+        match state.merge_event_rx.try_recv() {
+            Ok(evt) => {
+                let maybe_job = state.active_merge_jobs.remove(&evt.task_id);
+                let elapsed = maybe_job
+                    .as_ref()
+                    .map(|j| j.started_at.elapsed().as_secs())
+                    .unwrap_or(0);
+                let mut registry = load_registry_json(repo_root)?;
+                let tasks = registry
+                    .get_mut("tasks")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
+                for task in tasks.iter_mut() {
+                    if task
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        != evt.task_id
+                    {
+                        continue;
+                    }
+                    let now = now_iso_coordinator();
+                    if evt.success {
+                        coordinator_engine::apply_merge_success(task, &now)?;
+                        if let Some(log) = logger {
+                            let _ = log.note(format!(
+                                "- Merge done task={} elapsed={}s",
+                                evt.task_id, elapsed
+                            ));
+                        }
+                    } else {
+                        coordinator_engine::apply_merge_failure(task, &evt.reason, &now)?;
+                        blocked_merge = Some((evt.task_id.clone(), evt.reason.clone()));
+                        if let Some(log) = logger {
+                            let _ = log.note(format!(
+                                "- Merge failed task={} elapsed={}s reason={}",
+                                evt.task_id, elapsed, evt.reason
+                            ));
+                        }
+                    }
+                    break;
+                }
+                recompute_resource_locks_from_tasks(&mut registry);
+                set_registry_updated_at(&mut registry);
+                save_registry_json(repo_root, &registry)?;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+    while let Some(joined) = state.merge_join_set.try_join_next() {
+        let _ = joined;
+    }
+    Ok(blocked_merge)
 }
 
 fn spawn_performer_job_native(
@@ -5196,12 +5337,33 @@ async fn run_coordinator_control_plane_rust_async(
             Some(&logger),
         )
         .await?;
+        let blocked_merge =
+            monitor_merge_jobs_native(repo_root, &mut run_state, Some(&logger)).await?;
+        if let Some((task_id, reason)) = blocked_merge {
+            terminate_active_jobs(&run_state, Some(&logger));
+            run_state.merge_join_set.abort_all();
+            run_state.active_merge_jobs.clear();
+            set_task_paused_for_integrate(repo_root, &task_id, &reason)?;
+            write_coordinator_pause_file(repo_root, &task_id, "integrate", &reason)?;
+            println!(
+                "Coordinator paused on task {} (integrate). Resolve the merge issue, then run `macc coordinator resume`.",
+                task_id
+            );
+            let _ = logger.note(format!(
+                "- Run paused task={} phase=integrate reason={}",
+                task_id, reason
+            ));
+            wait_for_resume_signal(repo_root, Some(&logger)).await?;
+            resume_paused_task_integrate(repo_root, &task_id)?;
+        }
         let advance = advance_tasks_native(
             repo_root,
             coordinator_tool_override.as_deref(),
             phase_runner_max_attempts,
+            &mut run_state,
             Some(&logger),
-        )?;
+        )
+        .await?;
         monitor_active_jobs_native(
             repo_root,
             &mut run_state,
@@ -5210,8 +5372,12 @@ async fn run_coordinator_control_plane_rust_async(
             Some(&logger),
         )
         .await?;
-        if let Some((task_id, reason)) = advance.blocked_merge {
+        let blocked_merge =
+            monitor_merge_jobs_native(repo_root, &mut run_state, Some(&logger)).await?;
+        if let Some((task_id, reason)) = blocked_merge.or(advance.blocked_merge) {
             terminate_active_jobs(&run_state, Some(&logger));
+            run_state.merge_join_set.abort_all();
+            run_state.active_merge_jobs.clear();
             set_task_paused_for_integrate(repo_root, &task_id, &reason)?;
             write_coordinator_pause_file(repo_root, &task_id, "integrate", &reason)?;
             println!(
@@ -5235,6 +5401,25 @@ async fn run_coordinator_control_plane_rust_async(
             Some(&logger),
         )
         .await?;
+        let blocked_merge =
+            monitor_merge_jobs_native(repo_root, &mut run_state, Some(&logger)).await?;
+        if let Some((task_id, reason)) = blocked_merge {
+            terminate_active_jobs(&run_state, Some(&logger));
+            run_state.merge_join_set.abort_all();
+            run_state.active_merge_jobs.clear();
+            set_task_paused_for_integrate(repo_root, &task_id, &reason)?;
+            write_coordinator_pause_file(repo_root, &task_id, "integrate", &reason)?;
+            println!(
+                "Coordinator paused on task {} (integrate). Resolve the merge issue, then run `macc coordinator resume`.",
+                task_id
+            );
+            let _ = logger.note(format!(
+                "- Run paused task={} phase=integrate reason={}",
+                task_id, reason
+            ));
+            wait_for_resume_signal(repo_root, Some(&logger)).await?;
+            resume_paused_task_integrate(repo_root, &task_id)?;
+        }
         let _ = logger.note(format!(
             "- Cycle {} transition summary progressed={} dispatched={}",
             cycle, advance.progressed, dispatched
@@ -5303,6 +5488,8 @@ async fn run_coordinator_control_plane_rust_async(
                 terminate_active_jobs(&run_state, Some(&logger));
                 run_state.active_jobs.clear();
                 run_state.join_set.abort_all();
+                run_state.active_merge_jobs.clear();
+                run_state.merge_join_set.abort_all();
                 return Err(err);
             }
         }
