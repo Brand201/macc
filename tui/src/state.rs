@@ -1663,6 +1663,15 @@ impl AppState {
         );
     }
 
+    pub fn resume_signal_after_coordinator_pause(&mut self) {
+        self.coordinator_pause_error = None;
+        self.coordinator_pause_action = None;
+        self.coordinator_pause_task_id = None;
+        self.coordinator_pause_phase = None;
+        self.coordinator_pause_next_action = None;
+        self.start_coordinator_action("resume");
+    }
+
     pub fn resume_after_coordinator_pause(&mut self) {
         let action = self
             .coordinator_pause_action

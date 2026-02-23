@@ -104,6 +104,7 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             KeyCode::Char('r') | KeyCode::Enter => state.retry_after_coordinator_pause(),
             KeyCode::Char('s') => state.skip_after_coordinator_pause(),
             KeyCode::Char('o') => state.open_logs_after_coordinator_pause(),
+            KeyCode::Char('u') => state.resume_signal_after_coordinator_pause(),
             KeyCode::Char('k') | KeyCode::Esc => state.stop_after_coordinator_pause(),
             KeyCode::Char('c') => state.resume_after_coordinator_pause(),
             _ => {}
@@ -1583,7 +1584,7 @@ fn render_coordinator_pause_overlay(f: &mut Frame, state: &AppState) {
         _ => "global/blocking (no task context)".to_string(),
     };
     let text = format!(
-        "Coordinator Paused (blocking error)\n\n{}\n\nTarget:\n- {}\n\nFix the issue in your repo/worktree, then choose:\n\n- Press 'r' or Enter: retry failed phase, then resume run\n- Press 's': skip failed phase (move task to todo), then resume run\n- Press 'o': open Logs screen\n- Press 'k' or Esc: stop and keep paused state\n- Press 'c': resume run without retry\n\nAction: {}\n",
+        "Coordinator Paused (blocking error)\n\n{}\n\nTarget:\n- {}\n\nFix the issue in your repo/worktree, then choose:\n\n- Press 'r' or Enter: retry failed phase, then resume run\n- Press 's': skip failed phase (move task to todo), then resume run\n- Press 'u': send manual resume signal (same as `macc coordinator resume`)\n- Press 'o': open Logs screen\n- Press 'k' or Esc: stop and keep paused state\n- Press 'c': resume run without retry\n\nAction: {}\n",
         message, retry_target, action
     );
     let popup = Paragraph::new(text)
