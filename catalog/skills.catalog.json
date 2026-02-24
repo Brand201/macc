@@ -144,7 +144,7 @@
         "test"
       ],
       "selector": {
-        "subpath": ".cursor/skills/python-testing"
+        "subpath": "skills/python-testing"
       },
       "source": {
         "kind": "git",
