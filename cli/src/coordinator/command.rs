@@ -267,6 +267,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
             while !state.active_jobs.is_empty() {
                 coordinator::control_plane::monitor_active_jobs_native(
                     &paths.root,
+                    &input.env_cfg,
                     &mut state,
                     max_attempts,
                     phase_timeout,

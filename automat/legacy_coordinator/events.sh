@@ -221,8 +221,14 @@ apply_runtime_event() {
          {}
        end;
 
-     def payload_error:
-       (payload_obj.error // payload_obj.reason // payload_obj.message // payload_obj.matched_output // "");
+     def payload_error_message:
+       (payload_obj.message // payload_obj.reason // payload_obj.error // payload_obj.matched_output // "");
+
+     def payload_error_code:
+       (payload_obj.error_code // payload_obj.code // "");
+
+     def payload_error_origin:
+       (payload_obj.origin // "");
 
      def payload_attempt:
        (payload_obj.attempt // null);
@@ -278,8 +284,23 @@ apply_runtime_event() {
                          .
                        end)
                     | .task_runtime.retries = (.task_runtime.metrics.retries // 0)
-                    | (if ($runtime_status == "failed" and (payload_error|length) > 0) then
-                         .task_runtime.last_error = payload_error
+                    | (if ($runtime_status == "failed" and (payload_error_message|length) > 0) then
+                         .task_runtime.last_error = payload_error_message
+                       else
+                         .
+                       end)
+                    | (if ($runtime_status == "failed" and (payload_error_code|length) > 0) then
+                         .task_runtime.last_error_code = payload_error_code
+                       else
+                         .
+                       end)
+                    | (if ($runtime_status == "failed" and (payload_error_origin|length) > 0) then
+                         .task_runtime.last_error_origin = payload_error_origin
+                       else
+                         .
+                       end)
+                    | (if ($runtime_status == "failed" and (payload_error_message|length) > 0) then
+                         .task_runtime.last_error_message = payload_error_message
                        else
                          .
                        end)

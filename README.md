@@ -199,6 +199,41 @@ macc coordinator sync
 macc coordinator reconcile
 ```
 
+## Error codes and auto-retry
+
+MACC emits structured error codes when a performer or coordinator step fails. These codes are written into coordinator events and task runtime metadata.
+
+### Error code schema (v1)
+
+- `E100` Runner/Tool
+  - `E101` Runner exited non-zero
+  - `E102` Tool runner not found / not executable
+  - `E103` Tool output malformed / parsing failed
+- `E200` Capability/Contract
+  - `E201` Requested unavailable tool
+  - `E202` Capability guard triggered
+- `E300` Worktree/FS
+  - `E301` Worktree missing
+  - `E302` PRD missing
+  - `E303` tool.json missing
+- `E400` Coordinator/Registry
+  - `E401` Task registry read/write failure
+  - `E402` Task state transition invalid
+- `E500` Merge
+  - `E501` Merge conflict
+  - `E502` Merge worker failed
+- `E900` Unknown/Unexpected
+  - `E901` Unknown fatal error
+
+### Auto-retry policy (coordinator)
+
+Coordinator can auto-retry failed tasks based on error code:
+
+- `ERROR_CODE_RETRY_LIST` default: `E101,E102,E103,E301,E302,E303`
+- `ERROR_CODE_RETRY_MAX` default: `2`
+
+When a failed task has an error code in the allow-list and retries are below the max, the task is requeued to `todo` with an `auto_retry:<code>` reason.
+
 Logs:
 - coordinator: `.macc/log/coordinator/`
 - performer: `.macc/log/performer/`

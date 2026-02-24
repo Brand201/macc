@@ -918,6 +918,36 @@ set_task_merge_result_processed() {
   mv "$tmp" "$TASK_REGISTRY_FILE"
 }
 
+set_task_runtime_error_details() {
+  local task_id="$1"
+  local error_code="$2"
+  local error_origin="$3"
+  local error_message="$4"
+  task_exists "$task_id" || return 0
+  local now tmp
+  now="$(now_iso)"
+  tmp="$(mktemp)"
+  jq --arg id "$task_id" \
+     --arg code "$error_code" \
+     --arg origin "$error_origin" \
+     --arg message "$error_message" \
+     --arg now "$now" \
+     '
+     .tasks |= map(
+       if .id == $id then
+         .task_runtime = (.task_runtime // {})
+         | (if ($code|length) > 0 then .task_runtime.last_error_code = $code else . end)
+         | (if ($origin|length) > 0 then .task_runtime.last_error_origin = $origin else . end)
+         | (if ($message|length) > 0 then .task_runtime.last_error_message = $message else . end)
+       else
+         .
+       end
+     )
+     | .updated_at = $now
+     ' "$TASK_REGISTRY_FILE" >"$tmp"
+  mv "$tmp" "$TASK_REGISTRY_FILE"
+}
+
 increment_task_retries() {
   local task_id="$1"
   local reason="${2:-retry}"

@@ -1,5 +1,6 @@
 use crate::coordinator::engine::ReviewVerdict;
 use crate::{MaccError, Result};
+use chrono::Utc;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +24,9 @@ pub struct CoordinatorJobEvent {
     pub success: bool,
     pub status_text: String,
     pub timed_out: bool,
+    pub error_code: Option<String>,
+    pub error_origin: Option<String>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -232,8 +236,23 @@ pub fn spawn_performer_job(
     phase_timeout_seconds: usize,
 ) -> Result<Option<i64>> {
     let mut run_cmd = tokio::process::Command::new(executable_path);
+    let events_file = repo_root
+        .join(".macc")
+        .join("log")
+        .join("coordinator")
+        .join("events.jsonl");
     run_cmd
         .current_dir(repo_root)
+        .env("COORD_EVENTS_FILE", events_file.to_string_lossy().to_string())
+        .env(
+            "MACC_EVENT_SOURCE",
+            format!(
+                "coordinator-worktree:{}:{}",
+                task_id,
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ),
+        )
+        .env("MACC_EVENT_TASK_ID", task_id)
         .arg("--cwd")
         .arg(repo_root)
         .arg("worktree")
@@ -268,14 +287,105 @@ pub fn spawn_performer_job(
                 Err(err) => (false, err.to_string(), false),
             }
         };
+        let mut error_code = None;
+        let mut error_origin = None;
+        let mut error_message = None;
+        if !success {
+            if let Some(details) = read_last_error_details(&events_file, &task_id_owned) {
+                error_code = details.error_code;
+                error_origin = details.error_origin;
+                error_message = details.error_message;
+            }
+        }
         let _ = tx.send(CoordinatorJobEvent {
             task_id: task_id_owned,
             success,
             status_text,
             timed_out,
+            error_code,
+            error_origin,
+            error_message,
         });
     });
     Ok(pid)
+}
+
+#[derive(Debug, Clone)]
+struct ErrorDetails {
+    error_code: Option<String>,
+    error_origin: Option<String>,
+    error_message: Option<String>,
+}
+
+fn read_last_error_details(events_file: &Path, task_id: &str) -> Option<ErrorDetails> {
+    let content = std::fs::read_to_string(events_file).ok()?;
+    for line in content.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(event_task_id) = event.get("task_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if event_task_id != task_id {
+            continue;
+        }
+        let event_type = event
+            .get("type")
+            .or_else(|| event.get("event"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let status = event
+            .get("status")
+            .or_else(|| event.get("state"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if event_type != "failed" && !(event_type == "phase_result" && status == "failed") {
+            continue;
+        }
+        let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+        let payload = normalize_payload_object(payload);
+        let error_code = payload
+            .get("error_code")
+            .or_else(|| payload.get("code"))
+            .and_then(serde_json::Value::as_str)
+            .map(|v| v.to_string());
+        let error_origin = payload
+            .get("origin")
+            .and_then(serde_json::Value::as_str)
+            .map(|v| v.to_string());
+        let error_message = payload
+            .get("message")
+            .or_else(|| payload.get("reason"))
+            .or_else(|| payload.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .map(|v| v.to_string());
+        if error_code.is_some() || error_origin.is_some() || error_message.is_some() {
+            return Some(ErrorDetails {
+                error_code,
+                error_origin,
+                error_message,
+            });
+        }
+    }
+    None
+}
+
+fn normalize_payload_object(payload: &serde_json::Value) -> serde_json::Value {
+    if payload.is_object() {
+        return payload.clone();
+    }
+    if let Some(raw) = payload.as_str() {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+            if parsed.is_object() {
+                return parsed;
+            }
+        }
+    }
+    serde_json::json!({})
 }
 
 pub async fn spawn_merge_job<F>(

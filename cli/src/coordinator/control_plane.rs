@@ -469,11 +469,14 @@ pub async fn advance_tasks_native(
 
 pub async fn monitor_active_jobs_native(
     repo_root: &Path,
+    env_cfg: &CoordinatorEnvConfig,
     state: &mut CoordinatorRunState,
     max_attempts: usize,
     phase_timeout_seconds: usize,
     logger: Option<&NativeCoordinatorLogger>,
 ) -> Result<()> {
+    let retry_codes = resolve_error_code_retry_list(env_cfg);
+    let retry_max = resolve_error_code_retry_max(env_cfg);
     loop {
         match state.event_rx.try_recv() {
             Ok(evt) => {
@@ -496,6 +499,11 @@ pub async fn monitor_active_jobs_native(
                         phase_timeout_seconds,
                         elapsed_seconds: job.started_at.elapsed().as_secs(),
                         status_text: evt.status_text.clone(),
+                        error_code: evt.error_code.clone(),
+                        error_origin: evt.error_origin.clone(),
+                        error_message: evt.error_message.clone(),
+                        auto_retry_error_codes: retry_codes.clone(),
+                        auto_retry_max: retry_max,
                     },
                     &now_iso_coordinator(),
                 )?;
@@ -525,7 +533,14 @@ pub async fn monitor_active_jobs_native(
                         }
                     }
                 }
-                if completion.should_retry {
+                if completion.status_label == "auto_retry" {
+                    if let Some(log) = logger {
+                        let _ = log.note(format!(
+                            "- Task {} auto-retry queued detail={}",
+                            evt.task_id, completion.detail
+                        ));
+                    }
+                } else if completion.should_retry {
                     let task_id = evt.task_id.clone();
                     let retry_pid = spawn_performer_job_native(
                         repo_root,
@@ -568,6 +583,21 @@ pub async fn monitor_active_jobs_native(
         let _ = joined;
     }
     Ok(())
+}
+
+fn resolve_error_code_retry_list(env_cfg: &CoordinatorEnvConfig) -> Vec<String> {
+    let raw = env_cfg
+        .error_code_retry_list
+        .clone()
+        .unwrap_or_else(|| "E101,E102,E103,E301,E302,E303".to_string());
+    raw.split(',')
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+fn resolve_error_code_retry_max(env_cfg: &CoordinatorEnvConfig) -> usize {
+    env_cfg.error_code_retry_max.unwrap_or(2)
 }
 
 pub async fn monitor_merge_jobs_native(

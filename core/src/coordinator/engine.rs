@@ -72,6 +72,11 @@ pub struct JobCompletionInput {
     pub phase_timeout_seconds: usize,
     pub elapsed_seconds: u64,
     pub status_text: String,
+    pub error_code: Option<String>,
+    pub error_origin: Option<String>,
+    pub error_message: Option<String>,
+    pub auto_retry_error_codes: Vec<String>,
+    pub auto_retry_max: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -514,11 +519,26 @@ pub fn apply_job_completion(
     now: &str,
 ) -> JobCompletionResult {
     ensure_runtime_object(task);
+    let error_code = input
+        .error_code
+        .clone()
+        .unwrap_or_else(|| "E101".to_string());
+    let error_origin = input
+        .error_origin
+        .clone()
+        .unwrap_or_else(|| "runner".to_string());
+    let error_message = input
+        .error_message
+        .clone()
+        .unwrap_or_else(|| input.status_text.clone());
     if input.attempt == 0 || input.max_attempts == 0 {
         task["state"] = Value::String(WorkflowState::Blocked.as_str().to_string());
         task["task_runtime"]["status"] = Value::String(RuntimeStatus::Failed.as_str().to_string());
         task["task_runtime"]["pid"] = Value::Null;
         let detail = "performer completion received with invalid attempt counters".to_string();
+        task["task_runtime"]["last_error_code"] = Value::String("E901".to_string());
+        task["task_runtime"]["last_error_origin"] = Value::String("coordinator".to_string());
+        task["task_runtime"]["last_error_message"] = Value::String(detail.clone());
         task["task_runtime"]["last_error"] = Value::String(detail.clone());
         task["state_changed_at"] = Value::String(now.to_string());
         return JobCompletionResult {
@@ -533,6 +553,9 @@ pub fn apply_job_completion(
         task["task_runtime"]["status"] = Value::String(RuntimeStatus::Failed.as_str().to_string());
         task["task_runtime"]["pid"] = Value::Null;
         let detail = "performer completion received without status detail".to_string();
+        task["task_runtime"]["last_error_code"] = Value::String("E901".to_string());
+        task["task_runtime"]["last_error_origin"] = Value::String("coordinator".to_string());
+        task["task_runtime"]["last_error_message"] = Value::String(detail.clone());
         task["task_runtime"]["last_error"] = Value::String(detail.clone());
         task["state_changed_at"] = Value::String(now.to_string());
         return JobCompletionResult {
@@ -572,6 +595,9 @@ pub fn apply_job_completion(
                 input.attempt, input.status_text
             )
         };
+        task["task_runtime"]["last_error_code"] = Value::String(error_code.clone());
+        task["task_runtime"]["last_error_origin"] = Value::String(error_origin.clone());
+        task["task_runtime"]["last_error_message"] = Value::String(error_message.clone());
         task["task_runtime"]["last_error"] = Value::String(reason.clone());
         task["state_changed_at"] = Value::String(now.to_string());
         return JobCompletionResult {
@@ -581,9 +607,6 @@ pub fn apply_job_completion(
         };
     }
 
-    task["state"] = Value::String(WorkflowState::Blocked.as_str().to_string());
-    task["task_runtime"]["status"] = Value::String(RuntimeStatus::Failed.as_str().to_string());
-    task["task_runtime"]["pid"] = Value::Null;
     let reason = if input.timed_out {
         format!(
             "performer timed out after {}s (max attempts reached: {}, elapsed={}s)",
@@ -595,6 +618,36 @@ pub fn apply_job_completion(
             input.attempt, input.status_text
         )
     };
+    let retries_total = task_retry_count(task);
+    if should_auto_retry_error_code(
+        &error_code,
+        &input.auto_retry_error_codes,
+        input.auto_retry_max,
+        retries_total,
+    ) {
+        increment_task_retries(task);
+        task["state"] = Value::String(WorkflowState::Todo.as_str().to_string());
+        task["task_runtime"]["status"] = Value::String(RuntimeStatus::Idle.as_str().to_string());
+        task["task_runtime"]["pid"] = Value::Null;
+        task["task_runtime"]["current_phase"] = Value::String("dev".to_string());
+        task["task_runtime"]["last_error_code"] = Value::String(error_code.clone());
+        task["task_runtime"]["last_error_origin"] = Value::String(error_origin.clone());
+        task["task_runtime"]["last_error_message"] = Value::String(error_message.clone());
+        task["task_runtime"]["last_error"] = Value::String(reason.clone());
+        task["state_changed_at"] = Value::String(now.to_string());
+        return JobCompletionResult {
+            should_retry: false,
+            status_label: "auto_retry",
+            detail: format!("auto-retry scheduled for error code {}", error_code),
+        };
+    }
+
+    task["state"] = Value::String(WorkflowState::Blocked.as_str().to_string());
+    task["task_runtime"]["status"] = Value::String(RuntimeStatus::Failed.as_str().to_string());
+    task["task_runtime"]["pid"] = Value::Null;
+    task["task_runtime"]["last_error_code"] = Value::String(error_code);
+    task["task_runtime"]["last_error_origin"] = Value::String(error_origin);
+    task["task_runtime"]["last_error_message"] = Value::String(error_message);
     task["task_runtime"]["last_error"] = Value::String(reason.clone());
     task["state_changed_at"] = Value::String(now.to_string());
     JobCompletionResult {
@@ -602,6 +655,51 @@ pub fn apply_job_completion(
         status_label: "failed",
         detail: reason,
     }
+}
+
+fn task_retry_count(task: &Value) -> usize {
+    task.get("task_runtime")
+        .and_then(|v| v.get("retries"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            task.get("task_runtime")
+                .and_then(|v| v.get("metrics"))
+                .and_then(|v| v.get("retries"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0) as usize
+}
+
+fn increment_task_retries(task: &mut Value) -> usize {
+    ensure_runtime_object(task);
+    if !task
+        .get("task_runtime")
+        .and_then(|v| v.get("metrics"))
+        .map(Value::is_object)
+        .unwrap_or(false)
+    {
+        task["task_runtime"]["metrics"] = json!({});
+    }
+    let current = task_retry_count(task);
+    let next = current.saturating_add(1);
+    task["task_runtime"]["metrics"]["retries"] = Value::from(next as i64);
+    task["task_runtime"]["retries"] = Value::from(next as i64);
+    next
+}
+
+fn should_auto_retry_error_code(
+    code: &str,
+    list: &[String],
+    max_retries: usize,
+    current_retries: usize,
+) -> bool {
+    if code.is_empty() || max_retries == 0 {
+        return false;
+    }
+    if current_retries >= max_retries {
+        return false;
+    }
+    list.iter().any(|entry| entry.trim() == code)
 }
 
 pub fn cleanup_dead_runtime_tasks_in_registry_with<F>(
@@ -836,6 +934,11 @@ mod tests {
                 phase_timeout_seconds: 0,
                 elapsed_seconds: 2,
                 status_text: "exit status: 0".to_string(),
+                error_code: None,
+                error_origin: None,
+                error_message: None,
+                auto_retry_error_codes: Vec::new(),
+                auto_retry_max: 0,
             },
             "2026-02-21T00:00:00Z",
         );

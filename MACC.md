@@ -145,6 +145,38 @@ Stop flow:
 Project reset:
 - `macc clear` (confirmation required, worktree cleanup executed first, only MACC-managed paths removed).
 
+##### 3.4.5.1 Error codes + auto-retry (v1)
+MACC records structured error codes for failures to distinguish origin and apply consistent remediation.
+
+Error code schema (v1):
+- `E100` Runner/Tool
+  - `E101` Runner exited non-zero
+  - `E102` Tool runner not found / not executable
+  - `E103` Tool output malformed / parsing failed
+- `E200` Capability/Contract
+  - `E201` Requested unavailable tool
+  - `E202` Capability guard triggered
+- `E300` Worktree/FS
+  - `E301` Worktree missing
+  - `E302` PRD missing
+  - `E303` tool.json missing
+- `E400` Coordinator/Registry
+  - `E401` Task registry read/write failure
+  - `E402` Task state transition invalid
+- `E500` Merge
+  - `E501` Merge conflict
+  - `E502` Merge worker failed
+- `E900` Unknown/Unexpected
+  - `E901` Unknown fatal error
+
+Auto-retry controls (coordinator):
+- `ERROR_CODE_RETRY_LIST`: comma-separated list of error codes eligible for auto-retry.
+- `ERROR_CODE_RETRY_MAX`: max retries per task for eligible codes.
+
+Default policy:
+- `ERROR_CODE_RETRY_LIST=E101,E102,E103,E301,E302,E303`
+- `ERROR_CODE_RETRY_MAX=2`
+
 ---
 
 ## 4. Coding standards (source of truth)

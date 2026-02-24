@@ -1260,9 +1260,37 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                     resolve_worktree_task_context(&paths.root, &worktree_path, &metadata.id)?;
                 let performer_path = ensure_performer(&paths.root, &worktree_path)?;
                 let registry_path = paths.root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
+                let events_file = paths
+                    .root
+                    .join(".macc")
+                    .join("log")
+                    .join("coordinator")
+                    .join("events.jsonl");
+                if let Some(parent) = events_file.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
+                        path: parent.to_string_lossy().into(),
+                        action: "create coordinator log dir for events".into(),
+                        source: e,
+                    })?;
+                }
 
                 let status = std::process::Command::new(&performer_path)
                     .current_dir(&worktree_path)
+                    .env(
+                        "COORD_EVENTS_FILE",
+                        events_file.to_string_lossy().to_string(),
+                    )
+                    .env(
+                        "MACC_EVENT_SOURCE",
+                        format!(
+                            "worktree-run:{}:{}",
+                            task_id,
+                            chrono::Utc::now()
+                                .timestamp_nanos_opt()
+                                .unwrap_or_default()
+                        ),
+                    )
+                    .env("MACC_EVENT_TASK_ID", &task_id)
                     .arg("--repo")
                     .arg(&paths.root)
                     .arg("--worktree")
@@ -1459,6 +1487,10 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                     stale_changes_requested_seconds: *stale_changes_requested_seconds,
                     stale_action: stale_action.clone(),
                     storage_mode: storage_mode.clone(),
+                    error_code_retry_list: std::env::var("ERROR_CODE_RETRY_LIST").ok(),
+                    error_code_retry_max: std::env::var("ERROR_CODE_RETRY_MAX")
+                        .ok()
+                        .and_then(|v| v.parse().ok()),
                 },
                 extra_args: extra_args.clone(),
             },
@@ -1945,6 +1977,8 @@ pub(crate) struct CoordinatorEnvConfig {
     stale_changes_requested_seconds: Option<usize>,
     stale_action: Option<String>,
     storage_mode: Option<String>,
+    error_code_retry_list: Option<String>,
+    error_code_retry_max: Option<usize>,
 }
 
 const COORDINATOR_TASK_REGISTRY_REL_PATH: &str = ".macc/automation/task/task_registry.json";
@@ -3829,6 +3863,7 @@ async fn advance_tasks_native(
 }
 async fn monitor_active_jobs_native(
     repo_root: &std::path::Path,
+    env_cfg: &CoordinatorEnvConfig,
     state: &mut CoordinatorRunState,
     max_attempts: usize,
     phase_timeout_seconds: usize,
@@ -3836,6 +3871,7 @@ async fn monitor_active_jobs_native(
 ) -> Result<()> {
     coordinator::control_plane::monitor_active_jobs_native(
         repo_root,
+        env_cfg,
         state,
         max_attempts,
         phase_timeout_seconds,
@@ -4088,6 +4124,7 @@ impl coordinator_engine::ControlPlaneBackend for NativeControlPlaneBackend<'_> {
     async fn monitor_active_jobs(&mut self) -> Result<()> {
         monitor_active_jobs_native(
             self.repo_root,
+            self.env_cfg,
             &mut self.run_state,
             self.phase_runner_max_attempts,
             self.phase_timeout_seconds,
@@ -8417,6 +8454,8 @@ esac
             stale_changes_requested_seconds: None,
             stale_action: None,
             storage_mode: None,
+            error_code_retry_list: None,
+            error_code_retry_max: None,
         };
 
         run_coordinator_full_cycle(&root, &script, &canonical, Some(&coordinator_cfg), &env_cfg)?;
@@ -8486,6 +8525,8 @@ exit 0
             stale_changes_requested_seconds: None,
             stale_action: None,
             storage_mode: None,
+            error_code_retry_list: None,
+            error_code_retry_max: None,
         };
 
         let err = run_coordinator_full_cycle(
@@ -8549,6 +8590,8 @@ exit 0
                 stale_changes_requested_seconds: None,
                 stale_action: None,
                 storage_mode: None,
+                error_code_retry_list: None,
+                error_code_retry_max: None,
             };
 
             run_coordinator_control_plane_rust(
@@ -8669,6 +8712,8 @@ fi
             stale_changes_requested_seconds: None,
             stale_action: None,
             storage_mode: None,
+            error_code_retry_list: None,
+            error_code_retry_max: None,
         };
 
         run_coordinator_action(&root, &script, "dispatch", &[], &canonical, None, &env_cfg)?;
@@ -8756,6 +8801,8 @@ fi
             stale_changes_requested_seconds: None,
             stale_action: None,
             storage_mode: None,
+            error_code_retry_list: None,
+            error_code_retry_max: None,
         };
 
         run_coordinator_action(

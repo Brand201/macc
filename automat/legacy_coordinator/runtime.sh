@@ -288,6 +288,8 @@ Env vars:
   SLO_INTEGRATE_SECONDS         Warn when integrate_s exceeds this threshold (0 disables)
   SLO_WAIT_SECONDS              Warn when wait_s exceeds this threshold (0 disables)
   SLO_RETRIES_MAX               Warn when retries exceeds this threshold (0 disables)
+  ERROR_CODE_RETRY_LIST         Comma-separated error codes eligible for auto-retry (default: E101,E102,E103,E301,E302,E303)
+  ERROR_CODE_RETRY_MAX          Max auto-retries per task for eligible error codes (default: 2)
 
 Unlock:
   ./coordinator.sh unlock --task <task_id> [--unlock-state blocked|todo]
@@ -658,6 +660,10 @@ main() {
   }
   [[ "$SLO_RETRIES_MAX" =~ ^[0-9]+$ ]] || {
     echo "Error: SLO_RETRIES_MAX must be a non-negative integer: $SLO_RETRIES_MAX" >&2
+    exit 1
+  }
+  [[ "$ERROR_CODE_RETRY_MAX" =~ ^[0-9]+$ ]] || {
+    echo "Error: ERROR_CODE_RETRY_MAX must be a non-negative integer: $ERROR_CODE_RETRY_MAX" >&2
     exit 1
   }
   case "$STALE_HEARTBEAT_ACTION" in

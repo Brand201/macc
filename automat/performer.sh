@@ -29,14 +29,14 @@ EVENT_SEQ=0
 EVENT_SEQ_FILE=""
 HEARTBEAT_PID=""
 CURRENT_PHASE="dev"
-CAPABILITY_VIOLATION_REASON=""
-CAPABILITY_VIOLATION_LINE=""
+LAST_ERROR_CODE=""
+LAST_ERROR_ORIGIN=""
+LAST_ERROR_MESSAGE=""
 
 PERFORMER_MAX_ITERATIONS="${PERFORMER_MAX_ITERATIONS:-50}"
 PERFORMER_TOOL_MAX_ATTEMPTS="${PERFORMER_TOOL_MAX_ATTEMPTS:-2}"
 PERFORMER_SLEEP_SECONDS="${PERFORMER_SLEEP_SECONDS:-2}"
 PERFORMER_SPINNER="${PERFORMER_SPINNER:-true}"
-PERFORMER_FAIL_FAST_EXIT_CODE=42
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,23 +51,42 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "$EVENT_SOURCE" ]]; then
+  EVENT_SOURCE="performer:${tool:-unknown}:${EVENT_RUN_ID}"
+fi
+if [[ -z "$EVENT_TASK_ID" ]]; then
+  EVENT_TASK_ID="${task_id:-unknown}"
+fi
+
 if [[ -z "$repo" || -z "$worktree" || -z "$task_id" || -z "$tool" || -z "$registry" || -z "$prd" ]]; then
+  LAST_ERROR_CODE="E901"
+  LAST_ERROR_ORIGIN="performer"
+  LAST_ERROR_MESSAGE="missing required args"
   echo "Error: missing required args" >&2
   usage
   exit 1
 fi
 
 if [[ ! -d "$worktree" ]]; then
+  LAST_ERROR_CODE="E301"
+  LAST_ERROR_ORIGIN="performer"
+  LAST_ERROR_MESSAGE="worktree path does not exist"
   echo "Error: worktree path does not exist: $worktree" >&2
   exit 1
 fi
 
 if [[ ! -f "$prd" ]]; then
+  LAST_ERROR_CODE="E302"
+  LAST_ERROR_ORIGIN="performer"
+  LAST_ERROR_MESSAGE="PRD file not found"
   echo "Error: PRD file not found: $prd" >&2
   exit 1
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
+  LAST_ERROR_CODE="E901"
+  LAST_ERROR_ORIGIN="performer"
+  LAST_ERROR_MESSAGE="jq is required"
   echo "Error: jq is required" >&2
   exit 1
 fi
@@ -77,16 +96,13 @@ cd "$worktree"
 tool_json="${worktree}/.macc/tool.json"
 
 if [[ ! -f "$tool_json" ]]; then
+  LAST_ERROR_CODE="E303"
+  LAST_ERROR_ORIGIN="performer"
+  LAST_ERROR_MESSAGE="tool.json not found"
   echo "Error: tool.json not found in worktree: $tool_json" >&2
   exit 1
 fi
 
-if [[ -z "$EVENT_SOURCE" ]]; then
-  EVENT_SOURCE="performer:${tool}:${EVENT_RUN_ID}"
-fi
-if [[ -z "$EVENT_TASK_ID" ]]; then
-  EVENT_TASK_ID="$task_id"
-fi
 if [[ -n "$EVENT_FILE" ]]; then
   EVENT_SEQ_FILE="${worktree}/.macc/tmp/event-seq-${EVENT_RUN_ID}.txt"
   mkdir -p "$(dirname "$EVENT_SEQ_FILE")"
@@ -97,7 +113,7 @@ on_exit() {
   local rc=$?
   heartbeat_stop
   if [[ "$rc" -ne 0 ]]; then
-    emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(jq -nc --arg code "$rc" '{exit_code:($code|tonumber?)}')"
+    emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(build_error_payload "$rc")"
   fi
   if [[ -n "${EVENT_SEQ_FILE:-}" ]]; then
     rm -f "$EVENT_SEQ_FILE" "${EVENT_SEQ_FILE}.lock" >/dev/null 2>&1 || true
@@ -201,6 +217,34 @@ emit_performer_event() {
       event:$type,
       state:$status
     }' >>"$EVENT_FILE" 2>/dev/null || true
+}
+
+set_last_error() {
+  local code="$1"
+  local origin="$2"
+  local message="$3"
+  LAST_ERROR_CODE="$code"
+  LAST_ERROR_ORIGIN="$origin"
+  LAST_ERROR_MESSAGE="$message"
+}
+
+build_error_payload() {
+  local exit_code="$1"
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '{"exit_code":%s}' "${exit_code:-0}"
+    return 0
+  fi
+  jq -nc \
+    --arg code "$LAST_ERROR_CODE" \
+    --arg origin "$LAST_ERROR_ORIGIN" \
+    --arg msg "$LAST_ERROR_MESSAGE" \
+    --arg exit "$exit_code" \
+    '{
+      exit_code:($exit|tonumber?),
+      error_code:($code|select(length>0)),
+      origin:($origin|select(length>0)),
+      message:($msg|select(length>0))
+    }'
 }
 
 heartbeat_start() {
@@ -330,61 +374,6 @@ pending_task_count() {
   jq -r "${JQ_ITEMS} | map(select(.passes != true)) | length" "$prd"
 }
 
-extract_first_match() {
-  local pattern="$1"
-  local file="$2"
-  grep -Eim1 "$pattern" "$file" | head -n1
-}
-
-detect_capability_violation() {
-  local output_file="$1"
-  CAPABILITY_VIOLATION_REASON=""
-  CAPABILITY_VIOLATION_LINE=""
-  local scan_file
-  scan_file="$(mktemp)"
-  if awk '
-      BEGIN { emit = 0 }
-      /^Now implement the task\.$/ { emit = 1; next }
-      emit { print }
-    ' "$output_file" >"$scan_file" && [[ -s "$scan_file" ]]; then
-    :
-  else
-    cp "$output_file" "$scan_file"
-  fi
-
-  local line
-  while IFS= read -r line; do
-    [[ "$line" == *"MACC_CAPABILITY_ERROR:"* ]] || continue
-    # Ignore prompt templates; only accept concrete assistant-emitted errors.
-    if [[ "$line" == *"requested_tool=<tool_name>"* || "$line" == *"reason=<why>"* ]]; then
-      continue
-    fi
-    CAPABILITY_VIOLATION_REASON="explicit capability error marker"
-    CAPABILITY_VIOLATION_LINE="$line"
-    rm -f "$scan_file"
-    return 0
-  done <"$scan_file"
-
-  # Generic fallback to stop retries when a model keeps requesting unavailable tools.
-  line="$(extract_first_match '(unknown|invalid|unsupported|unavailable)[^\\n]*(tool|function)' "$scan_file" || true)"
-  if [[ -n "$line" ]]; then
-    CAPABILITY_VIOLATION_REASON="generic unavailable tool/function error"
-    CAPABILITY_VIOLATION_LINE="$line"
-    rm -f "$scan_file"
-    return 0
-  fi
-  line="$(extract_first_match '(tool|function)[^\\n]*(not found|unknown|unsupported|unavailable|invalid)' "$scan_file" || true)"
-  if [[ -n "$line" ]]; then
-    CAPABILITY_VIOLATION_REASON="generic unavailable tool/function error"
-    CAPABILITY_VIOLATION_LINE="$line"
-    rm -f "$scan_file"
-    return 0
-  fi
-
-  rm -f "$scan_file"
-  return 1
-}
-
 build_prompt() {
   local task_json="$1"
   local task_id="$2"
@@ -416,10 +405,10 @@ run_tool() {
   local attempt="$2"
   local max_attempts="$3"
   local output_capture
-  local fail_fast=false
   local script
   script="$(tool_runner_path)"
   if [[ -z "$script" || ! -x "$script" ]]; then
+    set_last_error "E102" "performer" "tool runner not found or not executable"
     echo "Error: tool performer not found or not executable: ${script}" >&2
     return 1
   fi
@@ -446,19 +435,11 @@ run_tool() {
   spinner_stop "Runner finished (${tool})"
   set -e
 
-  if detect_capability_violation "$output_capture"; then
-    fail_fast=true
-    status="$PERFORMER_FAIL_FAST_EXIT_CODE"
-    log_task_line "- Fail-fast capability guard: ${CAPABILITY_VIOLATION_REASON}"
-    if [[ -n "${CAPABILITY_VIOLATION_LINE:-}" ]]; then
-      log_task_line "- Matched output: ${CAPABILITY_VIOLATION_LINE}"
-    fi
-  fi
-
   if [[ "$status" -eq 0 ]]; then
     emit_performer_event "phase_result" "$CURRENT_PHASE" "done" "$(jq -nc --arg attempt "$attempt" '{attempt:($attempt|tonumber?)}')"
   else
-    emit_performer_event "phase_result" "$CURRENT_PHASE" "failed" "$(jq -nc --arg attempt "$attempt" --arg status "$status" --arg fail_fast "$fail_fast" --arg reason "${CAPABILITY_VIOLATION_REASON:-}" --arg line "${CAPABILITY_VIOLATION_LINE:-}" '{attempt:($attempt|tonumber?), exit_status:($status|tonumber?), fail_fast:($fail_fast=="true"), reason:($reason|select(length>0)), matched_output:($line|select(length>0))}')"
+    set_last_error "E101" "runner" "runner exited non-zero"
+    emit_performer_event "phase_result" "$CURRENT_PHASE" "failed" "$(jq -nc --arg attempt "$attempt" --arg status "$status" --arg code "$LAST_ERROR_CODE" --arg origin "$LAST_ERROR_ORIGIN" --arg message "$LAST_ERROR_MESSAGE" '{attempt:($attempt|tonumber?), exit_status:($status|tonumber?), error_code:($code|select(length>0)), origin:($origin|select(length>0)), message:($message|select(length>0))}')"
   fi
   log_task_line '```'
   log_task_line ""
@@ -533,30 +514,22 @@ for ((i=1; i<=PERFORMER_MAX_ITERATIONS; i++)); do
   log_task_line ""
 
   tool_success=false
-  fail_fast_abort=false
   for ((attempt=1; attempt<=PERFORMER_TOOL_MAX_ATTEMPTS; attempt++)); do
     if run_tool "$prompt_file" "$attempt" "$PERFORMER_TOOL_MAX_ATTEMPTS"; then
       tool_success=true
       break
     else
       attempt_rc=$?
-      if [[ "$attempt_rc" -eq "$PERFORMER_FAIL_FAST_EXIT_CODE" ]]; then
-        fail_fast_abort=true
-        echo "Fail-fast: unavailable/unauthorized tool detected for task ${next_id}" >&2
-        break
-      fi
       echo "Tool failed for task ${next_id} (attempt ${attempt}/${PERFORMER_TOOL_MAX_ATTEMPTS})" >&2
     fi
   done
   if [[ "$tool_success" != "true" ]]; then
     rm -f "$prompt_file"
-    if [[ "$fail_fast_abort" == "true" ]]; then
-      emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(jq -nc --arg task "$next_id" --arg reason "${CAPABILITY_VIOLATION_REASON:-capability contract violation}" --arg line "${CAPABILITY_VIOLATION_LINE:-}" '{task_id:$task, reason:$reason, fail_fast:true, matched_output:($line|select(length>0))}')"
-      echo "Error: fail-fast capability guard triggered for task ${next_id}" >&2
-    else
-      emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(jq -nc --arg task "$next_id" '{task_id:$task, reason:"tool execution failed"}')"
-      echo "Error: tool execution failed for task ${next_id}" >&2
+    if [[ -z "$LAST_ERROR_CODE" ]]; then
+      set_last_error "E101" "runner" "tool execution failed"
     fi
+    emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(jq -nc --arg task "$next_id" --arg code "$LAST_ERROR_CODE" --arg origin "$LAST_ERROR_ORIGIN" --arg message "$LAST_ERROR_MESSAGE" '{task_id:$task, reason:"tool execution failed", error_code:($code|select(length>0)), origin:($origin|select(length>0)), message:($message|select(length>0))}')"
+    echo "Error: tool execution failed for task ${next_id}" >&2
     exit 1
   fi
   rm -f "$prompt_file"

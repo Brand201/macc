@@ -712,6 +712,7 @@ handle_performer_completion() {
   local rc="$3"
   if [[ "$rc" -ne 0 ]]; then
     local structured_error existing_error runtime_error
+    local structured_error_code structured_error_origin structured_error_message
     structured_error="$(jq -r --arg id "$task_id" '
       def payload_obj:
         if (.payload | type) == "object" then
@@ -742,6 +743,69 @@ handle_performer_completion() {
           empty
         end
     ' "$COORD_EVENTS_FILE" 2>/dev/null | tail -n1 || true)"
+    structured_error_code="$(jq -r --arg id "$task_id" '
+      def payload_obj:
+        if (.payload | type) == "object" then
+          if ((.payload.value? // null) | type) == "string" then
+            ((.payload.value | fromjson?) // .payload)
+          else
+            .payload
+          end
+        elif (.payload | type) == "string" then
+          ((.payload | fromjson?) // {})
+        else
+          {}
+        end;
+
+      select(.task_id == $id)
+      | (.type // .event // "") as $event
+      | select($event == "failed" or ($event == "phase_result" and ((.status // .state // "") == "failed")))
+      | payload_obj as $p
+      | ($p.error_code // $p.code // "") as $code
+      | if ($code | length) > 0 then $code else empty end
+    ' "$COORD_EVENTS_FILE" 2>/dev/null | tail -n1 || true)"
+    structured_error_origin="$(jq -r --arg id "$task_id" '
+      def payload_obj:
+        if (.payload | type) == "object" then
+          if ((.payload.value? // null) | type) == "string" then
+            ((.payload.value | fromjson?) // .payload)
+          else
+            .payload
+          end
+        elif (.payload | type) == "string" then
+          ((.payload | fromjson?) // {})
+        else
+          {}
+        end;
+
+      select(.task_id == $id)
+      | (.type // .event // "") as $event
+      | select($event == "failed" or ($event == "phase_result" and ((.status // .state // "") == "failed")))
+      | payload_obj as $p
+      | ($p.origin // "") as $origin
+      | if ($origin | length) > 0 then $origin else empty end
+    ' "$COORD_EVENTS_FILE" 2>/dev/null | tail -n1 || true)"
+    structured_error_message="$(jq -r --arg id "$task_id" '
+      def payload_obj:
+        if (.payload | type) == "object" then
+          if ((.payload.value? // null) | type) == "string" then
+            ((.payload.value | fromjson?) // .payload)
+          else
+            .payload
+          end
+        elif (.payload | type) == "string" then
+          ((.payload | fromjson?) // {})
+        else
+          {}
+        end;
+
+      select(.task_id == $id)
+      | (.type // .event // "") as $event
+      | select($event == "failed" or ($event == "phase_result" and ((.status // .state // "") == "failed")))
+      | payload_obj as $p
+      | ($p.message // $p.reason // $p.error // "") as $msg
+      | if ($msg | length) > 0 then $msg else empty end
+    ' "$COORD_EVENTS_FILE" 2>/dev/null | tail -n1 || true)"
     existing_error="$(jq -r --arg id "$task_id" '
       (.tasks // [])
       | map(select(.id == $id))
@@ -758,6 +822,20 @@ handle_performer_completion() {
     else
       runtime_error="performer exited with status ${rc}"
     fi
+    if [[ -n "$structured_error_message" ]]; then
+      runtime_error="$structured_error_message"
+    fi
+    if [[ -n "$structured_error_code" || -n "$structured_error_origin" || -n "$structured_error_message" ]]; then
+      set_task_runtime_error_details "$task_id" "$structured_error_code" "$structured_error_origin" "$structured_error_message"
+    fi
+    if should_auto_retry_error_code "$structured_error_code" "$task_id"; then
+      increment_task_retries "$task_id" "auto_retry:${structured_error_code}"
+      set_task_runtime "$task_id" "idle" "dev" "" "$runtime_error" "$(now_iso)"
+      apply_transition "$task_id" "todo" "" "" "auto_retry:${structured_error_code}"
+      emit_event "task_auto_retry" "Auto-retry scheduled" "$task_id" "todo" "error_code=${structured_error_code}"
+      note "Auto-retry scheduled for ${task_id} (error_code=${structured_error_code})."
+      return 0
+    fi
     set_task_runtime "$task_id" "failed" "dev" "" "$runtime_error" "$(now_iso)"
     apply_transition "$task_id" "blocked" "" "" "failure:performer"
     note "Blocked task due to performer failure: ${task_id}"
@@ -771,6 +849,40 @@ handle_performer_completion() {
     note "Performer complete: ${task_id} (${tool})"
     emit_event "performer_complete" "Performer completed task phase" "$task_id" "in_progress"
   fi
+}
+
+error_code_in_retry_list() {
+  local code="$1"
+  local list="${ERROR_CODE_RETRY_LIST:-}"
+  [[ -n "$code" && -n "$list" ]] || return 1
+  local item
+  IFS=',' read -ra items <<<"$list"
+  for item in "${items[@]}"; do
+    item="$(echo "$item" | tr -d '[:space:]')"
+    if [[ "$item" == "$code" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+should_auto_retry_error_code() {
+  local code="$1"
+  local task_id="$2"
+  [[ -n "$code" ]] || return 1
+  local max_retries="${ERROR_CODE_RETRY_MAX:-0}"
+  [[ "$max_retries" =~ ^[0-9]+$ ]] || max_retries=0
+  if [[ "$max_retries" -le 0 ]]; then
+    return 1
+  fi
+  error_code_in_retry_list "$code" || return 1
+  local retries_total
+  retries_total="$(task_field "$task_id" '.task_runtime.retries // .task_runtime.metrics.retries // 0' 2>/dev/null || true)"
+  [[ "$retries_total" =~ ^[0-9]+$ ]] || retries_total=0
+  if [[ "$retries_total" -ge "$max_retries" ]]; then
+    return 1
+  fi
+  return 0
 }
 
 merge_job_is_running_for_task() {
