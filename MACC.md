@@ -459,7 +459,7 @@ MCP servers may be provided via remote packages (Git/HTTP) using §8.5. The pack
 
 MACC automation is split into:
 1) Native Rust coordinator control-plane (primary path): reads PRD, maintains `.macc/automation/task/task_registry.json`, dispatches READY tasks by constraints (`priority`, `dependencies`, `exclusive_resources`, `category`, `id`), supervises performers asynchronously, and tracks transitions.
-2) `coordinator.sh` (legacy compatibility wrapper): kept for backward compatibility/non-migrated actions.
+2) `coordinator.sh` (thin wrapper): forwards to native Rust coordinator actions.
 3) `performer.sh` (worktree-level executor): runs in a single worktree and delegates to the tool-specific runner from `.macc/tool.json`.
 4) `runners/<tool>.performer.sh`: tool-specific execution strategy.
 
@@ -511,7 +511,7 @@ Important behavior:
 - Worktrees are reused as worker slots (not task-coupled names): once a task is merged, the slot is reset to reference, moved to a fresh branch, refreshed for the new task, then relaunched.
 - New worker worktrees are created only when no reusable slot is available; pool size is bounded by `max_parallel`.
 - CLI options can override YAML settings (`--max-dispatch`, `--max-parallel`, `--timeout-seconds`, etc.).
-- Extra raw args with `--` are for legacy compatibility paths only.
+- Extra raw args with `--` are for coordinator subcommands that require raw passthrough args.
 - Optional VCS automation hook:
   - `COORDINATOR_VCS_HOOK=/path/to/hook.sh`
   - Hook modes called by `advance`: `pr_create`, `review_status`, `ci_status`, `queue_status`, `merge_status`

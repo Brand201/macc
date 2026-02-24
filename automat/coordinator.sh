@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Thin compatibility wrapper (PR7): coordinator logic runs through Rust CLI.
-# Legacy shell coordinator remains available via .macc/automation/coordinator_legacy.sh.
+# Thin compatibility wrapper: coordinator logic runs through Rust CLI.
 
 REPO_DIR="${REPO_DIR:-.}"
 if [[ "${REPO_DIR}" != /* ]]; then

@@ -305,6 +305,29 @@ impl coordinator_runtime::PhaseExecutor for NativePhaseExecutor<'_> {
     }
 }
 
+pub fn run_phase_for_task_native(
+    repo_root: &Path,
+    task: &serde_json::Value,
+    mode: &str,
+    coordinator_tool_override: Option<&str>,
+    max_attempts: usize,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<std::result::Result<String, String>> {
+    let executor = NativePhaseExecutor { repo_root, logger };
+    coordinator_runtime::run_phase(&executor, task, mode, coordinator_tool_override, max_attempts)
+}
+
+pub fn run_review_phase_for_task_native(
+    repo_root: &Path,
+    task: &serde_json::Value,
+    coordinator_tool_override: Option<&str>,
+    max_attempts: usize,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<std::result::Result<coordinator_runtime::ReviewVerdict, String>> {
+    let executor = NativePhaseExecutor { repo_root, logger };
+    coordinator_runtime::run_review_phase(&executor, task, coordinator_tool_override, max_attempts)
+}
+
 pub async fn advance_tasks_native(
     repo_root: &Path,
     coordinator_tool_override: Option<&str>,

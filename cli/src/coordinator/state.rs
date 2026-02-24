@@ -362,6 +362,58 @@ pub fn coordinator_state_locks(repo_root: &Path, args: &BTreeMap<String, String>
     Ok(())
 }
 
+pub fn coordinator_state_snapshot(
+    repo_root: &Path,
+    args: &BTreeMap<String, String>,
+) -> Result<CoordinatorSnapshot> {
+    load_snapshot_view(repo_root, args)
+}
+
+pub fn coordinator_state_save_snapshot(
+    repo_root: &Path,
+    args: &BTreeMap<String, String>,
+    snapshot: &CoordinatorSnapshot,
+) -> Result<()> {
+    let mode = resolve_storage_mode(args)?;
+    let project_paths = ProjectPaths::from_root(repo_root);
+    let store_paths = CoordinatorStoragePaths::from_project_paths(&project_paths);
+    match mode {
+        CoordinatorStorageMode::Json => JsonStorage::new(store_paths).save_snapshot(snapshot)?,
+        CoordinatorStorageMode::DualWrite | CoordinatorStorageMode::Sqlite => {
+            SqliteStorage::new(store_paths.clone()).save_snapshot(snapshot)?;
+            if should_mirror_json(args) {
+                sync_coordinator_storage(&project_paths, CoordinatorStorageMode::Sqlite, CoordinatorStoragePhase::Pre)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn coordinator_state_unlock_resource(
+    repo_root: &Path,
+    args: &BTreeMap<String, String>,
+    resource: Option<&str>,
+    clear_all: bool,
+) -> Result<usize> {
+    let mut snapshot = load_snapshot_view(repo_root, args)?;
+    let locks = snapshot
+        .registry
+        .get_mut("resource_locks")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| MaccError::Validation("Registry missing resource_locks".into()))?;
+    let removed = if clear_all {
+        let count = locks.len();
+        locks.clear();
+        count
+    } else if let Some(name) = resource {
+        if locks.remove(name).is_some() { 1 } else { 0 }
+    } else {
+        0
+    };
+    coordinator_state_save_snapshot(repo_root, args, &snapshot)?;
+    Ok(removed)
+}
+
 pub fn coordinator_state_set_merge_pending(
     repo_root: &Path,
     args: &BTreeMap<String, String>,
@@ -622,7 +674,7 @@ fn ensure_object(node: &mut Value, key: &str) {
     }
 }
 
-fn reset_runtime_to_idle(task: &mut Value) {
+pub fn reset_runtime_to_idle(task: &mut Value) {
     task["task_runtime"]["status"] = Value::String("idle".to_string());
     task["task_runtime"]["pid"] = Value::Null;
     task["task_runtime"]["started_at"] = Value::Null;

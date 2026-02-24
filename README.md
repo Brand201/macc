@@ -362,11 +362,11 @@ Coordinator orchestrates the end-to-end automation cycle: it reads the task regi
 - Task registry path is fixed to `.macc/automation/task/task_registry.json`.
 - Coordinator emits event bus lines to `.macc/log/coordinator/events.jsonl` (used by TUI live screen).
 - `run`, `dispatch`, `advance`, `reconcile`, and `cleanup` are executed by native Rust handlers (async supervision + retries/timeouts per phase).
-- Legacy shell coordinator remains only as a compatibility path for non-migrated actions.
+- Legacy shell coordinator removed; all coordinator actions run natively in Rust.
 - Worktrees are managed as a reusable worker pool (not task-named): a merged/clean slot is reset to the reference branch, switched to a fresh branch, updated (`worktree.prd.json` + apply), then reused for the next task.
 - If no reusable slot is available, coordinator creates a new worker worktree; total pool size is bounded by `--max-parallel` / `automation.coordinator.max_parallel`.
 - Realtime orchestrator target design (state model + event contract + rollout): `docs/COORDINATOR_REALTIME.md`.
-- Use `--` only for legacy compatibility actions that still forward to the shell path.
+- Use `--` only for coordinator subcommands that require raw passthrough args.
 
 ## TUI overview
 
@@ -435,7 +435,7 @@ Important paths:
 MACC installs embedded automation assets into `.macc/automation/`:
 
 - Native Rust coordinator control-plane (primary runtime path for `run` + core actions).
-- `coordinator.sh`: legacy compatibility wrapper for non-migrated flows.
+- `coordinator.sh`: thin wrapper for native Rust coordinator actions.
 - `performer.sh`: worktree executor.
 - `runners/<tool>.performer.sh`: tool-specific execution scripts.
 - All automation logs are written under `.macc/log/` (coordinator + performer).

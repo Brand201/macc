@@ -212,9 +212,6 @@ impl ProjectPaths {
         self.automation_dir().join("coordinator.sh")
     }
 
-    pub fn automation_coordinator_legacy_path(&self) -> PathBuf {
-        self.automation_dir().join("coordinator_legacy.sh")
-    }
 
     pub fn automation_merge_worker_path(&self) -> PathBuf {
         self.automation_dir().join("merge_worker.sh")

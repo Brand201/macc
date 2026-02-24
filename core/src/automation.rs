@@ -3,15 +3,6 @@ use std::path::{Component, Path, PathBuf};
 
 const EMBEDDED_PERFORMER_SH: &str = include_str!("../../automat/performer.sh");
 const EMBEDDED_COORDINATOR_SH: &str = include_str!("../../automat/coordinator.sh");
-const EMBEDDED_COORDINATOR_LEGACY_SH: &str = include_str!("../../automat/coordinator_legacy.sh");
-const EMBEDDED_COORDINATOR_RUNTIME_SH: &str =
-    include_str!("../../automat/legacy_coordinator/runtime.sh");
-const EMBEDDED_COORDINATOR_STATE_SH: &str =
-    include_str!("../../automat/legacy_coordinator/state.sh");
-const EMBEDDED_COORDINATOR_EVENTS_SH: &str =
-    include_str!("../../automat/legacy_coordinator/events.sh");
-const EMBEDDED_COORDINATOR_JOBS_SH: &str = include_str!("../../automat/legacy_coordinator/jobs.sh");
-const EMBEDDED_COORDINATOR_VCS_SH: &str = include_str!("../../automat/legacy_coordinator/vcs.sh");
 const EMBEDDED_MERGE_WORKER_SH: &str = include_str!("../../automat/merge_worker.sh");
 const EMBEDDED_MERGE_FIX_HOOK_SH: &str = include_str!("../../automat/hooks/ai-merge-fix.sh");
 include!(concat!(env!("OUT_DIR"), "/embedded_automation_runners.rs"));
@@ -35,13 +26,6 @@ pub fn ensure_embedded_automation_scripts(paths: &ProjectPaths) -> Result<Vec<Pa
             source: e,
         })?;
     }
-    let coordinator_module_dir = paths.automation_dir().join("legacy_coordinator");
-    std::fs::create_dir_all(&coordinator_module_dir).map_err(|e| MaccError::Io {
-        path: coordinator_module_dir.to_string_lossy().into(),
-        action: "create automation coordinator module directory".into(),
-        source: e,
-    })?;
-
     if write_executable_if_changed(&paths.automation_performer_path(), EMBEDDED_PERFORMER_SH)? {
         created.push(paths.automation_performer_path());
     }
@@ -50,32 +34,6 @@ pub fn ensure_embedded_automation_scripts(paths: &ProjectPaths) -> Result<Vec<Pa
         EMBEDDED_COORDINATOR_SH,
     )? {
         created.push(paths.automation_coordinator_path());
-    }
-    if write_executable_if_changed(
-        &paths.automation_coordinator_legacy_path(),
-        EMBEDDED_COORDINATOR_LEGACY_SH,
-    )? {
-        created.push(paths.automation_coordinator_legacy_path());
-    }
-    let coordinator_runtime_path = coordinator_module_dir.join("runtime.sh");
-    if write_executable_if_changed(&coordinator_runtime_path, EMBEDDED_COORDINATOR_RUNTIME_SH)? {
-        created.push(coordinator_runtime_path);
-    }
-    let coordinator_state_path = coordinator_module_dir.join("state.sh");
-    if write_executable_if_changed(&coordinator_state_path, EMBEDDED_COORDINATOR_STATE_SH)? {
-        created.push(coordinator_state_path);
-    }
-    let coordinator_events_path = coordinator_module_dir.join("events.sh");
-    if write_executable_if_changed(&coordinator_events_path, EMBEDDED_COORDINATOR_EVENTS_SH)? {
-        created.push(coordinator_events_path);
-    }
-    let coordinator_jobs_path = coordinator_module_dir.join("jobs.sh");
-    if write_executable_if_changed(&coordinator_jobs_path, EMBEDDED_COORDINATOR_JOBS_SH)? {
-        created.push(coordinator_jobs_path);
-    }
-    let coordinator_vcs_path = coordinator_module_dir.join("vcs.sh");
-    if write_executable_if_changed(&coordinator_vcs_path, EMBEDDED_COORDINATOR_VCS_SH)? {
-        created.push(coordinator_vcs_path);
     }
     if write_executable_if_changed(
         &paths.automation_merge_worker_path(),

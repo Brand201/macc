@@ -2671,18 +2671,7 @@ fn run_coordinator_action_with_options(
     env_cfg: &CoordinatorEnvConfig,
     skip_storage_sync: bool,
 ) -> Result<()> {
-    let use_legacy = should_use_legacy_coordinator_action(action, None);
-    let legacy_path = coordinator_path.with_file_name("coordinator_legacy.sh");
-    let selected = if use_legacy && legacy_path.exists() {
-        eprintln!(
-            "warning: using legacy coordinator backend for action '{}' (forced override)",
-            action
-        );
-        legacy_path.as_path()
-    } else {
-        coordinator_path
-    };
-    let mut command = std::process::Command::new(selected);
+    let mut command = std::process::Command::new(coordinator_path);
     command.current_dir(repo_root);
     command.arg(action);
     command.args(extra_args);
@@ -2692,7 +2681,7 @@ fn run_coordinator_action_with_options(
     }
 
     let status = command.status().map_err(|e| MaccError::Io {
-        path: selected.to_string_lossy().into(),
+        path: coordinator_path.to_string_lossy().into(),
         action: format!("run coordinator action '{}'", action),
         source: e,
     })?;
@@ -2707,23 +2696,6 @@ fn run_coordinator_action_with_options(
         eprintln!("warning: failed to aggregate performer logs: {}", err);
     }
     Ok(())
-}
-
-fn parse_action_list(raw: &str) -> HashSet<String> {
-    raw.split(',')
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty())
-        .collect()
-}
-
-fn should_use_legacy_coordinator_action(action: &str, forced_legacy_actions: Option<&str>) -> bool {
-    let action_norm = action.trim().to_ascii_lowercase();
-    let forced_raw = forced_legacy_actions
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("MACC_COORDINATOR_FORCE_LEGACY_ACTIONS").ok())
-        .unwrap_or_default();
-    let forced = parse_action_list(&forced_raw);
-    forced.contains("all") || forced.contains(&action_norm)
 }
 
 fn coordinator_registry_path(repo_root: &std::path::Path) -> std::path::PathBuf {
@@ -4259,7 +4231,6 @@ impl coordinator_engine::ControlPlaneBackend for NativeControlPlaneBackend<'_> {
 
 fn run_coordinator_control_plane_rust(
     repo_root: &std::path::Path,
-    coordinator_path: &std::path::Path,
     canonical: &macc_core::config::CanonicalConfig,
     coordinator: Option<&macc_core::config::CoordinatorConfig>,
     env_cfg: &CoordinatorEnvConfig,
@@ -4271,7 +4242,6 @@ fn run_coordinator_control_plane_rust(
         .map_err(|e| MaccError::Validation(format!("Failed to initialize tokio runtime: {}", e)))?;
     runtime.block_on(run_coordinator_control_plane_rust_async(
         repo_root,
-        coordinator_path,
         canonical,
         coordinator,
         env_cfg,
@@ -4280,14 +4250,10 @@ fn run_coordinator_control_plane_rust(
 
 async fn run_coordinator_control_plane_rust_async(
     repo_root: &std::path::Path,
-    coordinator_path: &std::path::Path,
     canonical: &macc_core::config::CanonicalConfig,
     coordinator: Option<&macc_core::config::CoordinatorConfig>,
     env_cfg: &CoordinatorEnvConfig,
 ) -> Result<()> {
-    #[cfg(not(test))]
-    let _ = coordinator_path;
-
     let prd_file = env_cfg
         .prd
         .as_ref()
@@ -4301,13 +4267,7 @@ async fn run_coordinator_control_plane_rust_async(
     if !prd_file.exists() {
         #[cfg(test)]
         {
-            return run_coordinator_full_cycle(
-                repo_root,
-                coordinator_path,
-                canonical,
-                coordinator,
-                env_cfg,
-            );
+            return run_coordinator_full_cycle(repo_root, canonical, coordinator, env_cfg);
         }
         #[cfg(not(test))]
         {
@@ -4551,12 +4511,21 @@ fn read_registry_counts(path: &std::path::Path) -> Result<RegistryCounts> {
 #[cfg(test)]
 fn run_coordinator_full_cycle(
     repo_root: &std::path::Path,
-    coordinator_path: &std::path::Path,
     canonical: &macc_core::config::CanonicalConfig,
     coordinator: Option<&macc_core::config::CoordinatorConfig>,
     env_cfg: &CoordinatorEnvConfig,
 ) -> Result<()> {
     let registry_path = repo_root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
+    let prd_file = env_cfg
+        .prd
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            coordinator
+                .and_then(|c| c.prd_file.clone())
+                .map(std::path::PathBuf::from)
+        })
+        .unwrap_or_else(|| repo_root.join("prd.json"));
 
     let timeout_seconds = env_cfg
         .timeout_seconds
@@ -4567,62 +4536,76 @@ fn run_coordinator_full_cycle(
     let started = std::time::Instant::now();
 
     for cycle in 1..=max_cycles {
-        run_coordinator_action(
-            repo_root,
-            coordinator_path,
-            "sync",
-            &[],
-            canonical,
-            coordinator,
-            env_cfg,
-        )?;
+        coordinator::control_plane::sync_registry_from_prd_native(repo_root, &prd_file, None)?;
 
         let before = read_registry_counts(&registry_path)?;
-        run_coordinator_action(
-            repo_root,
-            coordinator_path,
-            "dispatch",
-            &[],
-            canonical,
-            coordinator,
-            env_cfg,
-        )?;
-        run_coordinator_action(
-            repo_root,
-            coordinator_path,
-            "advance",
-            &[],
-            canonical,
-            coordinator,
-            env_cfg,
-        )?;
-        run_coordinator_action(
-            repo_root,
-            coordinator_path,
-            "reconcile",
-            &[],
-            canonical,
-            coordinator,
-            env_cfg,
-        )?;
-        run_coordinator_action(
-            repo_root,
-            coordinator_path,
-            "cleanup",
-            &[],
-            canonical,
-            coordinator,
-            env_cfg,
-        )?;
-        run_coordinator_action(
-            repo_root,
-            coordinator_path,
-            "sync",
-            &[],
-            canonical,
-            coordinator,
-            env_cfg,
-        )?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .map_err(|e| MaccError::Validation(format!("Failed to init tokio runtime: {}", e)))?;
+        runtime.block_on(async {
+            let mut state = CoordinatorRunState::new();
+            let _ = coordinator::control_plane::dispatch_ready_tasks_native(
+                repo_root,
+                canonical,
+                coordinator,
+                env_cfg,
+                &prd_file,
+                &mut state,
+                None,
+            )
+            .await?;
+            let max_attempts = env_cfg
+                .phase_runner_max_attempts
+                .or_else(|| coordinator.and_then(|c| c.phase_runner_max_attempts))
+                .unwrap_or(1)
+                .max(1);
+            let phase_timeout = env_cfg
+                .stale_in_progress_seconds
+                .or_else(|| coordinator.and_then(|c| c.stale_in_progress_seconds))
+                .unwrap_or(0);
+            while !state.active_jobs.is_empty() {
+                coordinator::control_plane::monitor_active_jobs_native(
+                    repo_root,
+                    env_cfg,
+                    &mut state,
+                    max_attempts,
+                    phase_timeout,
+                    None,
+                )
+                .await?;
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            }
+            let advance = coordinator::control_plane::advance_tasks_native(
+                repo_root,
+                env_cfg.coordinator_tool.as_deref(),
+                max_attempts,
+                &mut state,
+                None,
+            )
+            .await?;
+            if let Some((task_id, reason)) = advance.blocked_merge {
+                return Err(MaccError::Validation(format!(
+                    "Coordinator paused on task {} (integrate). Reason: {}",
+                    task_id, reason
+                )));
+            }
+            while !state.active_merge_jobs.is_empty() {
+                let _ = coordinator::control_plane::monitor_merge_jobs_native(
+                    repo_root,
+                    &mut state,
+                    None,
+                )
+                .await?;
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            }
+            Result::<()>::Ok(())
+        })?;
+
+        reconcile_registry_native(repo_root)?;
+        cleanup_registry_native(repo_root)?;
+        coordinator::control_plane::sync_registry_from_prd_native(repo_root, &prd_file, None)?;
         let after = read_registry_counts(&registry_path)?;
 
         println!(
@@ -8096,42 +8079,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_use_legacy_coordinator_action_default_matrix() {
-        assert!(!should_use_legacy_coordinator_action("dispatch", Some("")));
-        assert!(!should_use_legacy_coordinator_action("advance", Some("")));
-        assert!(!should_use_legacy_coordinator_action("unlock", Some("")));
-        assert!(should_use_legacy_coordinator_action(
-            "retry-phase",
-            Some("retry-phase")
-        ));
-    }
-
-    #[test]
-    fn test_should_use_legacy_coordinator_action_force_override() {
-        assert!(should_use_legacy_coordinator_action(
-            "dispatch",
-            Some("dispatch,sync")
-        ));
-        assert!(should_use_legacy_coordinator_action(
-            "sync",
-            Some("dispatch,sync")
-        ));
-        assert!(!should_use_legacy_coordinator_action(
-            "advance",
-            Some("dispatch,sync")
-        ));
-    }
-
-    #[test]
-    fn test_should_use_legacy_coordinator_action_force_all() {
-        assert!(should_use_legacy_coordinator_action(
-            "dispatch",
-            Some("all")
-        ));
-        assert!(should_use_legacy_coordinator_action("unlock", Some("all")));
-    }
-
-    #[test]
     fn test_validate_coordinator_transition_action_rejects_invalid() {
         let args = vec![
             "--from".to_string(),
@@ -8401,37 +8348,22 @@ mod tests {
 }"#,
         )
         .unwrap();
-
-        let script = root.join("fake-coordinator.sh");
-        write_executable_script(
-            &script,
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-action="${1:-dispatch}"
-case "$action" in
-  dispatch)
-    cat >"$TASK_REGISTRY_FILE" <<'JSON'
-{
-  "schema_version": 1,
+        let prd_path = root.join("prd.json");
+        fs::write(
+            &prd_path,
+            r#"{
+  "lot": "Test",
   "tasks": [
     {
       "id": "TASK-1",
-      "state": "merged",
+      "title": "Test task",
       "dependencies": [],
-      "exclusive_resources": [],
-      "worktree": null
+      "exclusive_resources": []
     }
-  ],
-  "resource_locks": {},
-  "state_mapping": {}
-}
-JSON
-    ;;
-  sync|reconcile|cleanup) ;;
-  *) ;;
-esac
-"#,
-        );
+  ]
+}"#,
+        )
+        .unwrap();
 
         let canonical = macc_core::config::CanonicalConfig::default();
         let coordinator_cfg = macc_core::config::CoordinatorConfig {
@@ -8458,7 +8390,7 @@ esac
             error_code_retry_max: None,
         };
 
-        run_coordinator_full_cycle(&root, &script, &canonical, Some(&coordinator_cfg), &env_cfg)?;
+        run_coordinator_full_cycle(&root, &canonical, Some(&coordinator_cfg), &env_cfg)?;
 
         let final_state: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&registry).unwrap()).unwrap();
@@ -8494,15 +8426,22 @@ esac
 }"#,
         )
         .unwrap();
-
-        let script = root.join("fake-stall-coordinator.sh");
-        write_executable_script(
-            &script,
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-exit 0
-"#,
-        );
+        let prd_path = root.join("prd.json");
+        fs::write(
+            &prd_path,
+            r#"{
+  "lot": "Test",
+  "tasks": [
+    {
+      "id": "TASK-STALL",
+      "title": "Stall task",
+      "dependencies": [],
+      "exclusive_resources": []
+    }
+  ]
+}"#,
+        )
+        .unwrap();
 
         let canonical = macc_core::config::CanonicalConfig::default();
         let coordinator_cfg = macc_core::config::CoordinatorConfig {
@@ -8529,13 +8468,7 @@ exit 0
             error_code_retry_max: None,
         };
 
-        let err = run_coordinator_full_cycle(
-            &root,
-            &script,
-            &canonical,
-            Some(&coordinator_cfg),
-            &env_cfg,
-        )
+        let err = run_coordinator_full_cycle(&root, &canonical, Some(&coordinator_cfg), &env_cfg)
         .expect_err("stalling coordinator should fail");
         let msg = err.to_string();
         assert!(
@@ -8594,13 +8527,7 @@ exit 0
                 error_code_retry_max: None,
             };
 
-            run_coordinator_control_plane_rust(
-                root,
-                script,
-                &canonical,
-                Some(&coordinator_cfg),
-                &env_cfg,
-            )?;
+            run_coordinator_control_plane_rust(root, &canonical, Some(&coordinator_cfg), &env_cfg)?;
 
             let final_state: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&registry).unwrap()).unwrap();
