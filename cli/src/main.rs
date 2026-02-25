@@ -180,7 +180,7 @@ enum Commands {
     },
     /// Run the project coordinator automation script
     Coordinator {
-        /// Coordinator action (run, control-plane-run, dispatch, advance, resume, sync, status, reconcile, unlock, cleanup, retry-phase, cutover-gate, stop, validate-transition, validate-runtime-transition, runtime-status-from-event, storage-import, storage-export, storage-verify, storage-sync, select-ready-task, state-apply-transition, state-set-runtime, state-task-field, state-task-exists, state-counts, state-locks, state-set-merge-pending, state-set-merge-processed, state-increment-retries, state-upsert-slo-warning, state-slo-metric)
+        /// Coordinator action (run, control-plane-run, dispatch, advance, resume, sync, status, reconcile, unlock, cleanup, retry-phase, cutover-gate, stop, validate-transition, validate-runtime-transition, runtime-status-from-event, storage-import, storage-export, events-export, storage-verify, storage-sync, select-ready-task, state-apply-transition, state-set-runtime, state-task-field, state-task-exists, state-counts, state-locks, state-set-merge-pending, state-set-merge-processed, state-increment-retries, state-upsert-slo-warning, state-slo-metric)
         #[arg(default_value = "run")]
         action: String,
         /// Disable TUI live view for `macc coordinator run`
@@ -3747,18 +3747,6 @@ pub(crate) fn append_coordinator_event_with_severity(
     severity: &str,
 ) -> Result<()> {
     let run_id = ensure_coordinator_run_id();
-    let events_path = repo_root
-        .join(".macc")
-        .join("log")
-        .join("coordinator")
-        .join("events.jsonl");
-    if let Some(parent) = events_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
-            path: parent.to_string_lossy().into(),
-            action: "create coordinator events directory".into(),
-            source: e,
-        })?;
-    }
     let now = now_iso_coordinator();
     let seq = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default() as u64;
     let payload = serde_json::json!({
@@ -3775,32 +3763,9 @@ pub(crate) fn append_coordinator_event_with_severity(
         "severity": severity,
         "payload": {"message": message}
     });
-    let line = serde_json::to_string(&payload).map_err(|e| {
-        MaccError::Validation(format!("Failed to serialize coordinator event: {}", e))
-    })?;
     let project_paths = macc_core::ProjectPaths::from_root(repo_root);
-    // SQLite is source-of-truth for coordinator state/events.
+    // SQLite is source-of-truth for coordinator events.
     let _ = append_event_sqlite(&project_paths, &payload)?;
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&events_path)
-        .map_err(|e| MaccError::Io {
-            path: events_path.to_string_lossy().into(),
-            action: "open coordinator events file".into(),
-            source: e,
-        })?;
-    file.write_all(line.as_bytes()).map_err(|e| MaccError::Io {
-        path: events_path.to_string_lossy().into(),
-        action: "write coordinator event".into(),
-        source: e,
-    })?;
-    file.write_all(b"\n").map_err(|e| MaccError::Io {
-        path: events_path.to_string_lossy().into(),
-        action: "terminate coordinator event line".into(),
-        source: e,
-    })?;
     Ok(())
 }
 

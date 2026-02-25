@@ -54,10 +54,19 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         println!("Coordinator storage import complete (json -> sqlite).");
         return Ok(());
     }
-    if action_name == "storage-export" {
+    if action_name == "storage-export" || action_name == "events-export" {
         let paths = macc_core::ProjectPaths::from_root(absolute_cwd);
         coordinator_storage_export_sqlite_to_json(&paths)?;
-        println!("Coordinator storage export complete (sqlite -> json).");
+        println!(
+            "Coordinator storage export complete (sqlite -> json): {}",
+            paths
+                .root
+                .join(".macc")
+                .join("log")
+                .join("coordinator")
+                .join("events.jsonl")
+                .display()
+        );
         return Ok(());
     }
     if action_name == "storage-verify" {
