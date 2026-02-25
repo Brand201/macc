@@ -1390,7 +1390,7 @@ pub async fn dispatch_ready_tasks_native(
     state
         .dispatch_retry_not_before
         .retain(|_, until| *until > Instant::now());
-    let max_dispatch = env_cfg
+    let max_dispatch_total = env_cfg
         .max_dispatch
         .or_else(|| coordinator.and_then(|c| c.max_dispatch))
         .unwrap_or(10);
@@ -1399,7 +1399,35 @@ pub async fn dispatch_ready_tasks_native(
         .or_else(|| coordinator.and_then(|c| c.max_parallel))
         .unwrap_or(3);
 
-    while max_dispatch == 0 || dispatched < max_dispatch {
+    if max_dispatch_total > 0 && state.dispatched_total_run >= max_dispatch_total {
+        if !state.dispatch_limit_event_emitted {
+            let msg = format!(
+                "dispatch limit reached run_total={} max_dispatch={}",
+                state.dispatched_total_run, max_dispatch_total
+            );
+            let _ = append_coordinator_event_with_severity(
+                repo_root,
+                "dispatch_limit_reached",
+                "-",
+                "dev",
+                "done",
+                &msg,
+                "info",
+            );
+            if let Some(log) = logger {
+                let _ = log.note(format!("- {}", msg));
+            }
+            state.dispatch_limit_event_emitted = true;
+        }
+        return Ok(0);
+    }
+    let remaining_budget = if max_dispatch_total == 0 {
+        usize::MAX
+    } else {
+        max_dispatch_total.saturating_sub(state.dispatched_total_run)
+    };
+
+    while dispatched < remaining_budget {
         if max_parallel > 0 && state.active_jobs.len() >= max_parallel {
             break;
         }
@@ -2051,6 +2079,29 @@ pub async fn dispatch_ready_tasks_native(
             ));
         }
         dispatched += 1;
+        state.dispatched_total_run += 1;
+        if max_dispatch_total > 0 && state.dispatched_total_run >= max_dispatch_total {
+            if !state.dispatch_limit_event_emitted {
+                let msg = format!(
+                    "dispatch limit reached run_total={} max_dispatch={}",
+                    state.dispatched_total_run, max_dispatch_total
+                );
+                let _ = append_coordinator_event_with_severity(
+                    repo_root,
+                    "dispatch_limit_reached",
+                    "-",
+                    "dev",
+                    "done",
+                    &msg,
+                    "info",
+                );
+                if let Some(log) = logger {
+                    let _ = log.note(format!("- {}", msg));
+                }
+                state.dispatch_limit_event_emitted = true;
+            }
+            break;
+        }
     }
     Ok(dispatched)
 }

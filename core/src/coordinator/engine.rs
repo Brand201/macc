@@ -143,6 +143,9 @@ pub trait ControlPlaneBackend {
         dispatched: usize,
     ) -> Result<CoordinatorCounts>;
     async fn sleep_between_cycles(&mut self) -> Result<()>;
+    fn should_terminate_run(&self, _counts: &CoordinatorCounts) -> bool {
+        false
+    }
 }
 
 pub fn plan_advance(state: WorkflowState) -> AdvancePlan {
@@ -864,6 +867,9 @@ pub async fn run_control_plane<B: ControlPlaneBackend>(
         }
 
         let counts = backend.on_cycle_end(cycle, &advance, dispatched).await?;
+        if backend.should_terminate_run(&counts) {
+            return Ok(());
+        }
         match controller.on_cycle_counts(counts) {
             Ok(ControlPlaneDecision::Continue) => {}
             Ok(ControlPlaneDecision::Complete) => return Ok(()),

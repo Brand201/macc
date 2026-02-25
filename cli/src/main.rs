@@ -4839,12 +4839,41 @@ impl coordinator_engine::ControlPlaneBackend for NativeControlPlaneBackend<'_> {
             ));
             self.last_logged_counts = Some(counts);
         }
+        let max_dispatch_total = self
+            .env_cfg
+            .max_dispatch
+            .or_else(|| self.coordinator.and_then(|c| c.max_dispatch))
+            .unwrap_or(10);
+        if max_dispatch_total > 0
+            && self.run_state.dispatched_total_run >= max_dispatch_total
+            && counts.active == 0
+        {
+            let _ = self.logger.note(format!(
+                "- Run stop condition reached: dispatched_total={} max_dispatch={}",
+                self.run_state.dispatched_total_run, max_dispatch_total
+            ));
+        }
         Ok(counts)
     }
 
     async fn sleep_between_cycles(&mut self) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         Ok(())
+    }
+
+    fn should_terminate_run(&self, counts: &coordinator_engine::CoordinatorCounts) -> bool {
+        let max_dispatch_total = self
+            .env_cfg
+            .max_dispatch
+            .or_else(|| self.coordinator.and_then(|c| c.max_dispatch))
+            .unwrap_or(10);
+        if max_dispatch_total == 0 {
+            return false;
+        }
+        self.run_state.dispatched_total_run >= max_dispatch_total
+            && counts.active == 0
+            && self.run_state.active_jobs.is_empty()
+            && self.run_state.active_merge_jobs.is_empty()
     }
 }
 

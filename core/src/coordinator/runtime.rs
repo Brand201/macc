@@ -48,6 +48,8 @@ pub struct CoordinatorRunState {
     pub last_heartbeat_log_at: Option<std::time::Instant>,
     pub heartbeat_updates_since_log: usize,
     pub dispatch_retry_not_before: HashMap<String, std::time::Instant>,
+    pub dispatched_total_run: usize,
+    pub dispatch_limit_event_emitted: bool,
 }
 
 pub trait PhaseExecutor {
@@ -77,6 +79,8 @@ impl CoordinatorRunState {
             last_heartbeat_log_at: None,
             heartbeat_updates_since_log: 0,
             dispatch_retry_not_before: HashMap::new(),
+            dispatched_total_run: 0,
+            dispatch_limit_event_emitted: false,
         }
     }
 }
