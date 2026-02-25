@@ -29,6 +29,65 @@ fn resolve_merge_timeout_seconds() -> usize {
         .unwrap_or(0)
 }
 
+fn sanitize_worktree_to_base(
+    worktree_path: &Path,
+    base_branch: &str,
+) -> Result<bool> {
+    let run_ok = |action: &str, args: &[&str]| -> Result<bool> {
+        let status = std::process::Command::new("git")
+            .current_dir(worktree_path)
+            .args(args)
+            .status()
+            .map_err(|e| MaccError::Io {
+                path: worktree_path.to_string_lossy().into(),
+                action: action.to_string(),
+                source: e,
+            })?;
+        Ok(status.success())
+    };
+
+    if !run_ok(
+        "reset newly created worktree tracked changes",
+        &["reset", "--hard", "HEAD"],
+    )? {
+        return Ok(false);
+    }
+    if !run_ok("clean newly created worktree artifacts", &["clean", "-fd"])? {
+        return Ok(false);
+    }
+    if !run_ok(
+        "checkout base branch in newly created worktree",
+        &["checkout", base_branch],
+    )? && !run_ok(
+        "checkout reset base branch in newly created worktree",
+        &["checkout", "-B", base_branch, base_branch],
+    )? {
+        return Ok(false);
+    }
+    if !run_ok(
+        "fetch origin refs in newly created worktree",
+        &["fetch", "origin"],
+    )? {
+        return Ok(false);
+    }
+    if !run_ok(
+        "force reset newly created worktree to base branch",
+        &["reset", "--hard", base_branch],
+    )? {
+        return Ok(false);
+    }
+    if !run_ok(
+        "final reset newly created worktree state",
+        &["reset", "--hard", "HEAD"],
+    )? {
+        return Ok(false);
+    }
+    if !run_ok("final clean newly created worktree artifacts", &["clean", "-fd"])? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn emit_dispatch_skipped(
     repo_root: &Path,
     logger: Option<&NativeCoordinatorLogger>,
@@ -136,8 +195,8 @@ fn switch_worktree_to_base_after_merge(
         &["reset", "--hard", "HEAD"],
     )?;
     let _ = run("clean merged worktree artifacts", &["clean", "-fd"])?;
-    // Stateless policy: fetch refs then hard reset to base.
-    let fetch = run("fetch merged worktree refs", &["fetch"])?;
+    // Stateless policy: fetch origin refs then hard reset to base.
+    let fetch = run("fetch merged worktree refs", &["fetch", "origin"])?;
     if !fetch.status.success() {
         let msg = format!(
             "worktree switch warning task={} path={} base={} reason=fetch_failed",
@@ -1525,6 +1584,40 @@ pub async fn dispatch_ready_tasks_native(
             let created = created
                 .pop()
                 .ok_or_else(|| MaccError::Validation("No worktree created".into()))?;
+            if !sanitize_worktree_to_base(&created.path, &selected.base_branch)? {
+                let msg = format!(
+                    "dispatch failed for task {}: sanitize new worktree failed ({})",
+                    selected.id,
+                    created.path.display()
+                );
+                let _ = append_coordinator_event_with_severity(
+                    repo_root,
+                    "dispatch_failed",
+                    &selected.id,
+                    "dev",
+                    "failed",
+                    &msg,
+                    "warning",
+                );
+                if let Some(log) = logger {
+                    let _ = log.note(format!("- {}", msg));
+                }
+                emit_dispatch_skipped(
+                    repo_root,
+                    logger,
+                    &selected.id,
+                    "sanitize_new_worktree_failed",
+                    &created.path.to_string_lossy(),
+                );
+                if cooldown_seconds > 0 {
+                    state.dispatch_retry_not_before.insert(
+                        selected.id.clone(),
+                        Instant::now() + Duration::from_secs(cooldown_seconds),
+                    );
+                }
+                dispatch_failed_this_cycle.insert(selected.id.clone());
+                break;
+            }
             let last_commit = std::process::Command::new("git")
                 .current_dir(&created.path)
                 .args(["rev-parse", "HEAD"])
@@ -1534,7 +1627,7 @@ pub async fn dispatch_ready_tasks_native(
                 .unwrap_or_default();
             if let Some(log) = logger {
                 let _ = log.note(format!(
-                    "- Lifecycle task={} stage=sanitize path={} dirty_before=false skipped_reset=true",
+                    "- Lifecycle task={} stage=sanitize path={} dirty_before=false skipped_reset=false",
                     selected.id,
                     created.path.display()
                 ));

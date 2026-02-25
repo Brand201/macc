@@ -3379,8 +3379,8 @@ fn prepare_reused_worktree_base(
     // Stateless reuse policy: sync refs then force-reset to base.
     if !run_git_status_ok(
         worktree_path,
-        "fetch refs in reused worktree",
-        &["fetch"],
+        "fetch origin refs in reused worktree",
+        &["fetch", "origin"],
     )? {
         return Ok((false, false));
     }
