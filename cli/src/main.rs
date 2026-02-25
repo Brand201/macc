@@ -3914,29 +3914,64 @@ fn merge_task_with_policy_native(
     let allow_ai_fix = is_truthy_env("COORDINATOR_MERGE_AI_FIX", false);
     if allow_ai_fix {
         if let Some(hook) = coordinator_merge_fix_hook(repo_root) {
-            let output = std::process::Command::new(hook)
-                .current_dir(repo_root)
-                .arg("--repo")
-                .arg(repo_root)
-                .arg("--task-id")
-                .arg(task_id)
-                .arg("--branch")
-                .arg(branch)
-                .arg("--base-branch")
-                .arg(base)
-                .arg("--failure-step")
-                .arg("merge")
-                .arg("--failure-reason")
-                .arg("git merge reported conflicts")
-                .arg("--conflicts")
-                .arg(&conflicts)
-                .output();
-            if let Ok(out) = output {
-                hook_output = format!(
-                    "{}\n{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                );
+            let hook_timeout_seconds = std::env::var("COORDINATOR_MERGE_HOOK_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .unwrap_or(90);
+            let hook_started = std::time::Instant::now();
+            let _ = append_coordinator_event_with_severity(
+                repo_root,
+                "merge_hook",
+                task_id,
+                "integrate",
+                "started",
+                &format!(
+                    "merge-fix hook started task={} timeout_s={}",
+                    task_id, hook_timeout_seconds
+                ),
+                "info",
+            );
+            let hook_result = run_merge_hook_with_timeout(
+                repo_root,
+                &hook,
+                task_id,
+                branch,
+                base,
+                &conflicts,
+                hook_timeout_seconds,
+            );
+            let hook_elapsed = hook_started.elapsed().as_secs();
+            match hook_result {
+                Ok(HookRunResult::Completed { output, timed_out }) => {
+                    hook_output = output;
+                    let _ = append_coordinator_event_with_severity(
+                        repo_root,
+                        "merge_hook",
+                        task_id,
+                        "integrate",
+                        if timed_out { "timeout" } else { "done" },
+                        &format!(
+                            "merge-fix hook completed task={} elapsed={}s timeout={}",
+                            task_id, hook_elapsed, timed_out
+                        ),
+                        if timed_out { "warning" } else { "info" },
+                    );
+                }
+                Err(err) => {
+                    hook_output = format!("merge-fix hook execution error: {}", err);
+                    let _ = append_coordinator_event_with_severity(
+                        repo_root,
+                        "merge_hook",
+                        task_id,
+                        "integrate",
+                        "failed",
+                        &format!(
+                            "merge-fix hook failed task={} elapsed={}s error={}",
+                            task_id, hook_elapsed, err
+                        ),
+                        "warning",
+                    );
+                }
             }
             let unresolved = std::process::Command::new("git")
                 .current_dir(repo_root)
@@ -3998,6 +4033,82 @@ fn merge_task_with_policy_native(
         report_file.display()
     );
     Ok(Err(err))
+}
+
+enum HookRunResult {
+    Completed { output: String, timed_out: bool },
+}
+
+fn run_merge_hook_with_timeout(
+    repo_root: &std::path::Path,
+    hook: &std::path::Path,
+    task_id: &str,
+    branch: &str,
+    base: &str,
+    conflicts: &str,
+    timeout_seconds: u64,
+) -> Result<HookRunResult> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(hook)
+        .current_dir(repo_root)
+        .arg("--repo")
+        .arg(repo_root)
+        .arg("--task-id")
+        .arg(task_id)
+        .arg("--branch")
+        .arg(branch)
+        .arg("--base-branch")
+        .arg(base)
+        .arg("--failure-step")
+        .arg("merge")
+        .arg("--failure-reason")
+        .arg("git merge reported conflicts")
+        .arg("--conflicts")
+        .arg(conflicts)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| MaccError::Io {
+            path: hook.to_string_lossy().into(),
+            action: "spawn merge-fix hook".into(),
+            source: e,
+        })?;
+    let started = std::time::Instant::now();
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if timeout_seconds > 0 && started.elapsed().as_secs() >= timeout_seconds {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(MaccError::Validation(format!(
+                    "merge-fix hook wait error: {}",
+                    e
+                )));
+            }
+        }
+    }
+
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut out);
+    }
+    let mut err = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut err);
+    }
+    Ok(HookRunResult::Completed {
+        output: format!("{}\n{}", out, err),
+        timed_out,
+    })
 }
 
 pub(crate) fn cleanup_merged_local_branch(
@@ -4433,19 +4544,26 @@ pub(crate) async fn spawn_merge_job_native(
     base: &str,
     event_tx: &tokio::sync::mpsc::UnboundedSender<CoordinatorMergeEvent>,
     join_set: &mut tokio::task::JoinSet<()>,
+    merge_timeout_seconds: usize,
 ) -> Result<()> {
     let repo = repo_root.to_path_buf();
     let task_for_worker = task_id.to_string();
     let branch_for_worker = branch.to_string();
     let base_for_worker = base.to_string();
-    coordinator_runtime::spawn_merge_job(task_id, event_tx, join_set, move || {
+    coordinator_runtime::spawn_merge_job(
+        task_id,
+        event_tx,
+        join_set,
+        merge_timeout_seconds,
+        move || {
         merge_task_with_policy_native(
             &repo,
             &task_for_worker,
             &branch_for_worker,
             &base_for_worker,
         )
-    })
+    },
+    )
     .await
 }
 

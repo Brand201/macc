@@ -439,15 +439,47 @@ pub async fn spawn_merge_job<F>(
     task_id: &str,
     event_tx: &tokio::sync::mpsc::UnboundedSender<CoordinatorMergeEvent>,
     join_set: &mut tokio::task::JoinSet<()>,
+    merge_timeout_seconds: usize,
     merge_runner: F,
 ) -> Result<()>
 where
     F: FnOnce() -> Result<std::result::Result<(), String>> + Send + 'static,
 {
+    let merge_timeout_seconds = if merge_timeout_seconds > 0 {
+        merge_timeout_seconds as u64
+    } else {
+        std::env::var("COORDINATOR_MERGE_JOB_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
     let task_id_owned = task_id.to_string();
     let tx = event_tx.clone();
     join_set.spawn(async move {
-        let outcome = tokio::task::spawn_blocking(merge_runner).await;
+        let worker = tokio::task::spawn_blocking(merge_runner);
+        let outcome = if merge_timeout_seconds > 0 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(merge_timeout_seconds),
+                worker,
+            )
+            .await
+            {
+                Ok(joined) => joined,
+                Err(_) => {
+                    let _ = tx.send(CoordinatorMergeEvent {
+                        task_id: task_id_owned,
+                        success: false,
+                        reason: format!(
+                            "failure:local_merge step=timeout timeout_s={}",
+                            merge_timeout_seconds
+                        ),
+                    });
+                    return;
+                }
+            }
+        } else {
+            worker.await
+        };
         let evt = match outcome {
             Ok(Ok(Ok(()))) => CoordinatorMergeEvent {
                 task_id: task_id_owned,

@@ -22,6 +22,13 @@ fn resolve_dispatch_cooldown_seconds() -> u64 {
         .unwrap_or(10)
 }
 
+fn resolve_merge_timeout_seconds() -> usize {
+    std::env::var("COORDINATOR_MERGE_JOB_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 fn emit_dispatch_skipped(
     repo_root: &Path,
     logger: Option<&NativeCoordinatorLogger>,
@@ -643,6 +650,7 @@ pub async fn advance_tasks_native(
                     &base,
                     &state.merge_event_tx,
                     &mut state.merge_join_set,
+                    resolve_merge_timeout_seconds(),
                 )
                 .await?;
                 state.active_merge_jobs.insert(
