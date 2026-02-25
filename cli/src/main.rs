@@ -3424,6 +3424,26 @@ pub(crate) fn append_coordinator_event(
     status: &str,
     message: &str,
 ) -> Result<()> {
+    let severity = if status.eq_ignore_ascii_case("failed") || status.eq_ignore_ascii_case("error")
+    {
+        "blocking"
+    } else {
+        "info"
+    };
+    append_coordinator_event_with_severity(
+        repo_root, event_type, task_id, phase, status, message, severity,
+    )
+}
+
+pub(crate) fn append_coordinator_event_with_severity(
+    repo_root: &std::path::Path,
+    event_type: &str,
+    task_id: &str,
+    phase: &str,
+    status: &str,
+    message: &str,
+    severity: &str,
+) -> Result<()> {
     let events_path = repo_root
         .join(".macc")
         .join("log")
@@ -3448,6 +3468,7 @@ pub(crate) fn append_coordinator_event(
         "type": event_type,
         "phase": phase,
         "status": status,
+        "severity": severity,
         "payload": {"message": message}
     });
     let line = serde_json::to_string(&payload).map_err(|e| {
@@ -3681,11 +3702,250 @@ fn cleanup_merged_local_branch(
     repo_root: &std::path::Path,
     branch: &str,
     base: &str,
-) -> Result<()> {
+) -> Result<BranchCleanupResult> {
     if branch.is_empty() || branch == base {
+        return Ok(BranchCleanupResult::Skipped {
+            reason: "empty_or_base_branch".to_string(),
+        });
+    }
+    if let Some(in_use_path) = find_worktree_using_branch(repo_root, branch)? {
+        return Ok(BranchCleanupResult::Skipped {
+            reason: format!("branch_in_use_by_worktree:{}", in_use_path.display()),
+        });
+    }
+    delete_branch(repo_root, Some(branch), false)?;
+    Ok(BranchCleanupResult::Deleted)
+}
+
+#[derive(Debug, Clone)]
+enum BranchCleanupResult {
+    Deleted,
+    Skipped { reason: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BranchCleanupQueueEntry {
+    task_id: String,
+    phase: String,
+    branch: String,
+    base: String,
+    context: String,
+    reason: String,
+    attempts: usize,
+}
+
+fn branch_cleanup_queue_path(repo_root: &std::path::Path) -> std::path::PathBuf {
+    repo_root
+        .join(".macc")
+        .join("tmp")
+        .join("branch-cleanup-queue.jsonl")
+}
+
+fn append_branch_cleanup_queue_entry(
+    repo_root: &std::path::Path,
+    entry: &BranchCleanupQueueEntry,
+) -> Result<()> {
+    let path = branch_cleanup_queue_path(repo_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
+            path: parent.to_string_lossy().into(),
+            action: "create branch cleanup queue dir".into(),
+            source: e,
+        })?;
+    }
+    let line = serde_json::to_string(entry).map_err(|e| {
+        MaccError::Validation(format!("Failed to serialize branch cleanup queue entry: {}", e))
+    })?;
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| MaccError::Io {
+            path: path.to_string_lossy().into(),
+            action: "open branch cleanup queue".into(),
+            source: e,
+        })?;
+    file.write_all(line.as_bytes()).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "append branch cleanup queue entry".into(),
+        source: e,
+    })?;
+    file.write_all(b"\n").map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "write branch cleanup queue newline".into(),
+        source: e,
+    })?;
+    Ok(())
+}
+
+fn load_branch_cleanup_queue(repo_root: &std::path::Path) -> Result<Vec<BranchCleanupQueueEntry>> {
+    let path = branch_cleanup_queue_path(repo_root);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "read branch cleanup queue".into(),
+        source: e,
+    })?;
+    let mut entries = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<BranchCleanupQueueEntry>(trimmed) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn save_branch_cleanup_queue(
+    repo_root: &std::path::Path,
+    entries: &[BranchCleanupQueueEntry],
+) -> Result<()> {
+    let path = branch_cleanup_queue_path(repo_root);
+    if entries.is_empty() {
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
         return Ok(());
     }
-    delete_branch(repo_root, Some(branch), false)
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
+            path: parent.to_string_lossy().into(),
+            action: "create branch cleanup queue dir".into(),
+            source: e,
+        })?;
+    }
+    let mut out = String::new();
+    for entry in entries {
+        let line = serde_json::to_string(entry).map_err(|e| {
+            MaccError::Validation(format!("Failed to serialize branch cleanup queue entry: {}", e))
+        })?;
+        out.push_str(&line);
+        out.push('\n');
+    }
+    std::fs::write(&path, out).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "write branch cleanup queue".into(),
+        source: e,
+    })?;
+    Ok(())
+}
+
+fn process_branch_cleanup_queue(
+    repo_root: &std::path::Path,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<usize> {
+    let mut queue = load_branch_cleanup_queue(repo_root)?;
+    if queue.is_empty() {
+        return Ok(0);
+    }
+    let mut remaining = Vec::new();
+    let mut processed = 0usize;
+    for mut item in queue.drain(..) {
+        match cleanup_merged_local_branch(repo_root, &item.branch, &item.base) {
+            Ok(BranchCleanupResult::Deleted) => {
+                processed += 1;
+                let msg = format!(
+                    "branch cleanup success context={} task={} branch={} base={} mode=maintenance",
+                    item.context, item.task_id, item.branch, item.base
+                );
+                let _ = append_coordinator_event_with_severity(
+                    repo_root,
+                    "branch_cleanup",
+                    &item.task_id,
+                    &item.phase,
+                    "success",
+                    &msg,
+                    "info",
+                );
+            }
+            Ok(BranchCleanupResult::Skipped { reason }) => {
+                processed += 1;
+                let msg = format!(
+                    "branch cleanup skipped context={} task={} branch={} base={} reason={} mode=maintenance",
+                    item.context, item.task_id, item.branch, item.base, reason
+                );
+                let _ = append_coordinator_event_with_severity(
+                    repo_root,
+                    "branch_cleanup",
+                    &item.task_id,
+                    &item.phase,
+                    "skipped",
+                    &msg,
+                    "warning",
+                );
+            }
+            Err(err) => {
+                item.attempts += 1;
+                if item.attempts >= 5 {
+                    let msg = format!(
+                        "branch cleanup dropped after retries context={} task={} branch={} base={} error={}",
+                        item.context, item.task_id, item.branch, item.base, err
+                    );
+                    let _ = append_coordinator_event_with_severity(
+                        repo_root,
+                        "branch_cleanup",
+                        &item.task_id,
+                        &item.phase,
+                        "failed",
+                        &msg,
+                        "warning",
+                    );
+                } else {
+                    remaining.push(item);
+                }
+            }
+        }
+    }
+    save_branch_cleanup_queue(repo_root, &remaining)?;
+    if let Some(log) = logger {
+        if processed > 0 {
+            let _ = log.note(format!(
+                "- Maintenance branch-cleanup processed={} remaining={}",
+                processed,
+                remaining.len()
+            ));
+        }
+    }
+    Ok(processed)
+}
+
+fn find_worktree_using_branch(
+    repo_root: &std::path::Path,
+    branch: &str,
+) -> Result<Option<std::path::PathBuf>> {
+    let output = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .map_err(|e| MaccError::Io {
+            path: repo_root.to_string_lossy().into(),
+            action: "list git worktrees".into(),
+            source: e,
+        })?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let mut current_path: Option<std::path::PathBuf> = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let trimmed = line.trim();
+        if let Some(path) = trimmed.strip_prefix("worktree ") {
+            current_path = Some(std::path::PathBuf::from(path));
+            continue;
+        }
+        if let Some(found_branch) = trimmed.strip_prefix("branch ") {
+            let normalized = found_branch.strip_prefix("refs/heads/").unwrap_or(found_branch);
+            if normalized == branch {
+                return Ok(current_path);
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn report_branch_cleanup_outcome(
@@ -3695,37 +3955,67 @@ fn report_branch_cleanup_outcome(
     branch: &str,
     base: &str,
     context: &str,
-    cleanup_result: std::result::Result<(), MaccError>,
+    cleanup_result: std::result::Result<BranchCleanupResult, MaccError>,
 ) {
     let task_ref = task_id.unwrap_or("unknown");
     match cleanup_result {
-        Ok(()) => {
+        Ok(BranchCleanupResult::Deleted) => {
             let msg = format!(
                 "branch cleanup success context={} task={} branch={} base={}",
                 context, task_ref, branch, base
             );
-            let _ = append_coordinator_event(
+            let _ = append_coordinator_event_with_severity(
                 repo_root,
                 "branch_cleanup",
                 task_ref,
                 phase,
                 "success",
                 &msg,
+                "info",
             );
         }
-        Err(err) => {
+        Ok(BranchCleanupResult::Skipped { reason }) => {
             let msg = format!(
-                "branch cleanup failed context={} task={} branch={} base={} error={}",
-                context, task_ref, branch, base, err
+                "branch cleanup skipped context={} task={} branch={} base={} reason={}",
+                context, task_ref, branch, base, reason
             );
             eprintln!("warning: {}", msg);
-            let _ = append_coordinator_event(
+            let _ = append_coordinator_event_with_severity(
                 repo_root,
                 "branch_cleanup",
                 task_ref,
                 phase,
-                "failed",
+                "skipped",
                 &msg,
+                "warning",
+            );
+        }
+        Err(err) => {
+            let msg = format!(
+                "branch cleanup deferred context={} task={} branch={} base={} error={}",
+                context, task_ref, branch, base, err
+            );
+            eprintln!("warning: {}", msg);
+            let _ = append_coordinator_event_with_severity(
+                repo_root,
+                "branch_cleanup",
+                task_ref,
+                phase,
+                "deferred",
+                &msg,
+                "warning",
+            );
+            let _ = append_branch_cleanup_queue_entry(
+                repo_root,
+                &BranchCleanupQueueEntry {
+                    task_id: task_ref.to_string(),
+                    phase: phase.to_string(),
+                    branch: branch.to_string(),
+                    base: base.to_string(),
+                    context: context.to_string(),
+                    reason: err.to_string(),
+                    attempts: 0,
+                },
             );
         }
     }
@@ -4063,6 +4353,7 @@ impl coordinator_engine::ControlPlaneBackend for NativeControlPlaneBackend<'_> {
     async fn on_cycle_start(&mut self, cycle: usize) -> Result<()> {
         let _ = cycle;
         sync_registry_from_prd_native(self.repo_root, &self.prd_file, None)?;
+        let _ = process_branch_cleanup_queue(self.repo_root, Some(&self.logger))?;
         let cycle_cleaned =
             cleanup_dead_runtime_tasks(self.repo_root, "run-cycle", Some(&self.logger))?;
         if cycle_cleaned > 0 {

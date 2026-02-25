@@ -657,6 +657,7 @@ fn consume_heartbeat_events(
 
     let project_paths = macc_core::ProjectPaths::from_root(repo_root);
     let mut heartbeat_updates: HashMap<String, String> = HashMap::new();
+    let mut terminal_success_sources: HashSet<(String, String)> = HashSet::new();
     for line in buf.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -665,13 +666,53 @@ fn consume_heartbeat_events(
         let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             continue;
         };
-        // Ingest performer/runtime events into SQLite source-of-truth.
-        let _ = macc_core::coordinator_storage::append_event_sqlite(&project_paths, &event)?;
         let event_type = event
             .get("type")
             .or_else(|| event.get("event"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
+        let event_status = event
+            .get("status")
+            .or_else(|| event.get("state"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let event_task_id = event
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let event_source = event
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+        let payload_attempt = payload
+            .get("attempt")
+            .and_then(serde_json::Value::as_i64)
+            .is_some();
+        let is_terminal_success = event_type == "commit_created"
+            || (event_type == "phase_result" && event_status == "done" && !payload_attempt);
+        if is_terminal_success && !event_task_id.is_empty() && !event_source.is_empty() {
+            terminal_success_sources
+                .insert((event_task_id.to_string(), event_source.to_string()));
+        }
+        let is_failed =
+            event_type == "failed" || (event_type == "phase_result" && event_status == "failed");
+        if is_failed
+            && !event_task_id.is_empty()
+            && !event_source.is_empty()
+            && terminal_success_sources
+                .contains(&(event_task_id.to_string(), event_source.to_string()))
+        {
+            if let Some(log) = logger {
+                let _ = log.note(format!(
+                    "- Ignored late inconsistent failed event task={} source={}",
+                    event_task_id, event_source
+                ));
+            }
+            continue;
+        }
+        // Ingest performer/runtime events into SQLite source-of-truth.
+        let _ = macc_core::coordinator_storage::append_event_sqlite(&project_paths, &event)?;
         if event_type != "heartbeat" {
             continue;
         }

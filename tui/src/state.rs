@@ -1466,6 +1466,13 @@ impl AppState {
                 .or_else(|| parsed.get("state"))
                 .and_then(|x| x.as_str())
                 .unwrap_or("");
+            let severity = parsed
+                .get("severity")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if !Self::is_blocking_failure_event(event, status, severity) {
+                continue;
+            }
             if !matches!(
                 event,
                 "command_error" | "task_blocked" | "failed" | "phase_result"
@@ -1513,6 +1520,25 @@ impl AppState {
             });
         }
         None
+    }
+
+    fn is_blocking_failure_event(event: &str, status: &str, severity: &str) -> bool {
+        let normalized_severity = if severity.is_empty() {
+            if matches!(event, "command_error" | "task_blocked" | "failed")
+                || (event == "phase_result" && matches!(status, "failed" | "error"))
+            {
+                "blocking"
+            } else {
+                "info"
+            }
+        } else {
+            severity
+        };
+        normalized_severity.eq_ignore_ascii_case("blocking")
+            && (matches!(
+                event,
+                "command_error" | "task_blocked" | "failed" | "phase_result"
+            ) || matches!(status, "failed" | "error"))
     }
 
     fn parse_failure_context_from_latest_run_log(&self) -> Option<CoordinatorFailureContext> {
@@ -4001,6 +4027,31 @@ mod tests {
         // Prev tool (loops back to second)
         state.prev_tool();
         assert_eq!(state.selected_tool_index, 1);
+    }
+
+    #[test]
+    fn test_non_blocking_failed_event_does_not_trigger_pause_context() {
+        assert!(!AppState::is_blocking_failure_event(
+            "branch_cleanup",
+            "failed",
+            "warning"
+        ));
+        assert!(!AppState::is_blocking_failure_event(
+            "branch_cleanup",
+            "failed",
+            "info"
+        ));
+    }
+
+    #[test]
+    fn test_blocking_failed_event_triggers_pause_context() {
+        assert!(AppState::is_blocking_failure_event(
+            "phase_result",
+            "failed",
+            "blocking"
+        ));
+        // Backward compatibility when severity is missing.
+        assert!(AppState::is_blocking_failure_event("failed", "failed", ""));
     }
 
     #[test]

@@ -32,6 +32,7 @@ CURRENT_PHASE="dev"
 LAST_ERROR_CODE=""
 LAST_ERROR_ORIGIN=""
 LAST_ERROR_MESSAGE=""
+TERMINAL_EVENT_EMITTED="false"
 
 PERFORMER_MAX_ITERATIONS="${PERFORMER_MAX_ITERATIONS:-50}"
 PERFORMER_TOOL_MAX_ATTEMPTS="${PERFORMER_TOOL_MAX_ATTEMPTS:-2}"
@@ -112,8 +113,9 @@ fi
 on_exit() {
   local rc=$?
   heartbeat_stop
-  if [[ "$rc" -ne 0 ]]; then
+  if [[ "$rc" -ne 0 && "$TERMINAL_EVENT_EMITTED" != "true" ]]; then
     emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(build_error_payload "$rc")"
+    TERMINAL_EVENT_EMITTED="true"
   fi
   if [[ -n "${EVENT_SEQ_FILE:-}" ]]; then
     rm -f "$EVENT_SEQ_FILE" "${EVENT_SEQ_FILE}.lock" >/dev/null 2>&1 || true
@@ -454,8 +456,14 @@ commit_changes() {
   local last_title="$2"
 
   if git status --porcelain | awk 'NF' | grep -q .; then
-    # Never commit coordinator scaffolding artifacts from worktree execution.
-    git add -A -- . ':(exclude)performer.sh' ':(exclude)worktree.prd.json'
+    local git_add_output=""
+    local git_commit_output=""
+    # Stage everything first; protected files are un-staged right after.
+    if ! git_add_output="$(git add -A 2>&1)"; then
+      git_add_output="${git_add_output//$'\n'/ }"
+      set_last_error "E202" "git" "git add failed: ${git_add_output:0:240}"
+      return 1
+    fi
     git reset -q HEAD -- performer.sh worktree.prd.json >/dev/null 2>&1 || true
     if git diff --cached --quiet; then
       if git status --porcelain -- performer.sh worktree.prd.json | awk 'NF' | grep -q .; then
@@ -469,7 +477,12 @@ commit_changes() {
     if [[ -n "$last_title" ]]; then
       msg="feat: ${last_id} - ${last_title}"
     fi
-    git commit -m "$msg"
+    if ! git_commit_output="$(git commit -m "$msg" 2>&1)"; then
+      git_commit_output="${git_commit_output//$'\n'/ }"
+      set_last_error "E201" "git" "git commit failed: ${git_commit_output:0:240}"
+      return 1
+    fi
+    printf '%s\n' "$git_commit_output"
     local sha
     sha="$(git rev-parse HEAD 2>/dev/null || true)"
     emit_performer_event "commit_created" "$CURRENT_PHASE" "done" "$(jq -nc --arg sha "$sha" --arg message "$msg" '{sha:$sha, message:$message}')"
@@ -487,8 +500,9 @@ heartbeat_start
 for ((i=1; i<=PERFORMER_MAX_ITERATIONS; i++)); do
   next_task_json="$(get_next_task_json)"
   if [[ -z "$next_task_json" ]]; then
-    emit_performer_event "phase_result" "$CURRENT_PHASE" "done" '{}'
     commit_changes "$last_id" "$last_title"
+    emit_performer_event "phase_result" "$CURRENT_PHASE" "done" '{}'
+    TERMINAL_EVENT_EMITTED="true"
     exit 0
   fi
 
@@ -529,6 +543,7 @@ for ((i=1; i<=PERFORMER_MAX_ITERATIONS; i++)); do
       set_last_error "E101" "runner" "tool execution failed"
     fi
     emit_performer_event "failed" "$CURRENT_PHASE" "failed" "$(jq -nc --arg task "$next_id" --arg code "$LAST_ERROR_CODE" --arg origin "$LAST_ERROR_ORIGIN" --arg message "$LAST_ERROR_MESSAGE" '{task_id:$task, reason:"tool execution failed", error_code:($code|select(length>0)), origin:($origin|select(length>0)), message:($message|select(length>0))}')"
+    TERMINAL_EVENT_EMITTED="true"
     echo "Error: tool execution failed for task ${next_id}" >&2
     exit 1
   fi
@@ -543,8 +558,9 @@ for ((i=1; i<=PERFORMER_MAX_ITERATIONS; i++)); do
   last_title="$next_title"
 
   if [[ "$(pending_task_count)" -eq 0 ]]; then
-    emit_performer_event "phase_result" "$CURRENT_PHASE" "done" "$(jq -nc --arg task "$next_id" '{task_id:$task, final:true}')"
     commit_changes "$last_id" "$last_title"
+    emit_performer_event "phase_result" "$CURRENT_PHASE" "done" "$(jq -nc --arg task "$next_id" '{task_id:$task, final:true}')"
+    TERMINAL_EVENT_EMITTED="true"
     exit 0
   fi
 

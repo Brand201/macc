@@ -241,6 +241,11 @@ pub fn spawn_performer_job(
     phase_timeout_seconds: usize,
 ) -> Result<Option<i64>> {
     let mut run_cmd = tokio::process::Command::new(executable_path);
+    let event_source = format!(
+        "coordinator-worktree:{}:{}",
+        task_id,
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
     let events_file = repo_root
         .join(".macc")
         .join("log")
@@ -249,14 +254,7 @@ pub fn spawn_performer_job(
     run_cmd
         .current_dir(repo_root)
         .env("COORD_EVENTS_FILE", events_file.to_string_lossy().to_string())
-        .env(
-            "MACC_EVENT_SOURCE",
-            format!(
-                "coordinator-worktree:{}:{}",
-                task_id,
-                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-            ),
-        )
+        .env("MACC_EVENT_SOURCE", event_source.clone())
         .env("MACC_EVENT_TASK_ID", task_id)
         .arg("--cwd")
         .arg(repo_root)
@@ -270,6 +268,7 @@ pub fn spawn_performer_job(
     })?;
     let pid = child.id().map(|v| v as i64);
     let task_id_owned = task_id.to_string();
+    let event_source_owned = event_source.clone();
     let tx = event_tx.clone();
     join_set.spawn(async move {
         let (success, status_text, timed_out) = if phase_timeout_seconds > 0 {
@@ -296,7 +295,9 @@ pub fn spawn_performer_job(
         let mut error_origin = None;
         let mut error_message = None;
         if !success {
-            if let Some(details) = read_last_error_details(&events_file, &task_id_owned) {
+            if let Some(details) =
+                read_last_error_details(&events_file, &task_id_owned, &event_source_owned)
+            {
                 error_code = details.error_code;
                 error_origin = details.error_origin;
                 error_message = details.error_message;
@@ -322,8 +323,10 @@ struct ErrorDetails {
     error_message: Option<String>,
 }
 
-fn read_last_error_details(events_file: &Path, task_id: &str) -> Option<ErrorDetails> {
+fn read_last_error_details(events_file: &Path, task_id: &str, event_source: &str) -> Option<ErrorDetails> {
     let content = std::fs::read_to_string(events_file).ok()?;
+    let mut failed_candidate: Option<ErrorDetails> = None;
+    let mut saw_terminal_success_before_failed = false;
     for line in content.lines().rev() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -338,6 +341,13 @@ fn read_last_error_details(events_file: &Path, task_id: &str) -> Option<ErrorDet
         if event_task_id != task_id {
             continue;
         }
+        let source = event
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !event_source.is_empty() && source != event_source {
+            continue;
+        }
         let event_type = event
             .get("type")
             .or_else(|| event.get("event"))
@@ -348,11 +358,22 @@ fn read_last_error_details(events_file: &Path, task_id: &str) -> Option<ErrorDet
             .or_else(|| event.get("state"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
+        let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+        let payload = normalize_payload_object(payload);
+        let is_terminal_success = event_type == "commit_created"
+            || (event_type == "phase_result"
+                && status == "done"
+                && payload
+                    .get("attempt")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_none());
+        if is_terminal_success && failed_candidate.is_some() {
+            saw_terminal_success_before_failed = true;
+            continue;
+        }
         if event_type != "failed" && !(event_type == "phase_result" && status == "failed") {
             continue;
         }
-        let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
-        let payload = normalize_payload_object(payload);
         let error_code = payload
             .get("error_code")
             .or_else(|| payload.get("code"))
@@ -368,15 +389,24 @@ fn read_last_error_details(events_file: &Path, task_id: &str) -> Option<ErrorDet
             .or_else(|| payload.get("error"))
             .and_then(serde_json::Value::as_str)
             .map(|v| v.to_string());
-        if error_code.is_some() || error_origin.is_some() || error_message.is_some() {
-            return Some(ErrorDetails {
+        if failed_candidate.is_none() {
+            failed_candidate = Some(ErrorDetails {
                 error_code,
                 error_origin,
                 error_message,
             });
         }
     }
-    None
+    if saw_terminal_success_before_failed {
+        return None;
+    }
+    failed_candidate.and_then(|details| {
+        if details.error_code.is_some() || details.error_origin.is_some() || details.error_message.is_some() {
+            Some(details)
+        } else {
+            None
+        }
+    })
 }
 
 fn normalize_payload_object(payload: &serde_json::Value) -> serde_json::Value {
