@@ -3739,15 +3739,6 @@ fn merge_task_with_policy_native(
             source: e,
         })?;
     if merge.status.success() {
-        report_branch_cleanup_outcome(
-            repo_root,
-            Some(task_id),
-            "integrate",
-            branch,
-            base,
-            "merge_success",
-            cleanup_merged_local_branch(repo_root, branch, base),
-        );
         return Ok(Ok(()));
     }
 
@@ -3806,15 +3797,6 @@ fn merge_task_with_policy_native(
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !unresolved && !in_merge {
-                report_branch_cleanup_outcome(
-                    repo_root,
-                    Some(task_id),
-                    "integrate",
-                    branch,
-                    base,
-                    "merge_ai_fix_success",
-                    cleanup_merged_local_branch(repo_root, branch, base),
-                );
                 return Ok(Ok(()));
             }
         }
@@ -3863,7 +3845,7 @@ fn merge_task_with_policy_native(
     Ok(Err(err))
 }
 
-fn cleanup_merged_local_branch(
+pub(crate) fn cleanup_merged_local_branch(
     repo_root: &std::path::Path,
     branch: &str,
     base: &str,
@@ -4113,7 +4095,7 @@ fn find_worktree_using_branch(
     Ok(None)
 }
 
-fn report_branch_cleanup_outcome(
+pub(crate) fn report_branch_cleanup_outcome(
     repo_root: &std::path::Path,
     task_id: Option<&str>,
     phase: &str,

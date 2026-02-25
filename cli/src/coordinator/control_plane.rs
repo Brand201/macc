@@ -1,8 +1,9 @@
 use crate::{
-    append_coordinator_event, append_coordinator_event_with_severity, build_non_task_worker_slug, build_phase_prompt_native,
-    count_pool_worktrees, ensure_tool_json, find_reusable_worktree_native, now_iso_coordinator,
-    recompute_resource_locks_from_tasks, resolve_phase_runner_native, set_registry_updated_at,
-    spawn_merge_job_native, spawn_performer_job_native, summarize_output,
+    append_coordinator_event, append_coordinator_event_with_severity, build_non_task_worker_slug,
+    build_phase_prompt_native, cleanup_merged_local_branch, count_pool_worktrees,
+    ensure_tool_json, find_reusable_worktree_native, now_iso_coordinator,
+    recompute_resource_locks_from_tasks, report_branch_cleanup_outcome, resolve_phase_runner_native,
+    set_registry_updated_at, spawn_merge_job_native, spawn_performer_job_native, summarize_output,
     write_worktree_prd_for_task, CoordinatorEnvConfig, CoordinatorMergeJob, CoordinatorRunState,
     NativeCoordinatorLogger,
 };
@@ -1239,9 +1240,40 @@ pub async fn monitor_merge_jobs_native(
                         })
                         .cloned()
                     {
-                        // Immediately detach merged task branches from active worktrees.
-                        let _ =
-                            switch_worktree_to_base_after_merge(repo_root, &task_snapshot, logger);
+                        // Post-merge order is strict:
+                        // 1) switch worktree to base (release task branch)
+                        // 2) cleanup merged task branch
+                        let _ = switch_worktree_to_base_after_merge(
+                            repo_root,
+                            &task_snapshot,
+                            logger,
+                        );
+                        let branch = task_snapshot
+                            .get("worktree")
+                            .and_then(|w| w.get("branch"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let base = task_snapshot
+                            .get("worktree")
+                            .and_then(|w| w.get("base_branch"))
+                            .and_then(serde_json::Value::as_str)
+                            .or_else(|| {
+                                task_snapshot
+                                    .get("base_branch")
+                                    .and_then(serde_json::Value::as_str)
+                            })
+                            .unwrap_or("master");
+                        if !branch.is_empty() && branch != base {
+                            report_branch_cleanup_outcome(
+                                repo_root,
+                                Some(&evt.task_id),
+                                "integrate",
+                                branch,
+                                base,
+                                "merge_success_post_switch",
+                                cleanup_merged_local_branch(repo_root, branch, base),
+                            );
+                        }
                     }
                     if let Some(log) = logger {
                         let _ = log.note(format!(
