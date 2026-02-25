@@ -9,6 +9,8 @@ use crate::{
 use macc_core::coordinator::{engine as coordinator_engine, runtime as coordinator_runtime};
 use macc_core::{MaccError, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 pub fn sync_registry_from_prd_native(
@@ -323,7 +325,7 @@ pub fn run_review_phase_for_task_native(
     coordinator_tool_override: Option<&str>,
     max_attempts: usize,
     logger: Option<&NativeCoordinatorLogger>,
-) -> Result<std::result::Result<coordinator_runtime::ReviewVerdict, String>> {
+) -> Result<std::result::Result<coordinator_engine::ReviewVerdict, String>> {
     let executor = NativePhaseExecutor { repo_root, logger };
     coordinator_runtime::run_review_phase(&executor, task, coordinator_tool_override, max_attempts)
 }
@@ -498,6 +500,8 @@ pub async fn monitor_active_jobs_native(
     phase_timeout_seconds: usize,
     logger: Option<&NativeCoordinatorLogger>,
 ) -> Result<()> {
+    consume_heartbeat_events(repo_root, state, logger)?;
+    apply_stale_heartbeat_policy(repo_root, env_cfg, logger)?;
     let retry_codes = resolve_error_code_retry_list(env_cfg);
     let retry_max = resolve_error_code_retry_max(env_cfg);
     loop {
@@ -606,6 +610,337 @@ pub async fn monitor_active_jobs_native(
         let _ = joined;
     }
     Ok(())
+}
+
+fn consume_heartbeat_events(
+    repo_root: &Path,
+    state: &mut CoordinatorRunState,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<usize> {
+    let events_file = repo_root
+        .join(".macc")
+        .join("log")
+        .join("coordinator")
+        .join("events.jsonl");
+    if !events_file.exists() {
+        return Ok(0);
+    }
+    let mut file = File::open(&events_file).map_err(|e| MaccError::Io {
+        path: events_file.to_string_lossy().into(),
+        action: "open coordinator events for heartbeat scan".into(),
+        source: e,
+    })?;
+    let len = file.metadata().map_err(|e| MaccError::Io {
+        path: events_file.to_string_lossy().into(),
+        action: "read coordinator events metadata".into(),
+        source: e,
+    })?.len();
+    if len < state.events_cursor_offset {
+        state.events_cursor_offset = 0;
+    }
+    file.seek(SeekFrom::Start(state.events_cursor_offset))
+        .map_err(|e| MaccError::Io {
+            path: events_file.to_string_lossy().into(),
+            action: "seek coordinator events file".into(),
+            source: e,
+        })?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).map_err(|e| MaccError::Io {
+        path: events_file.to_string_lossy().into(),
+        action: "read coordinator events file".into(),
+        source: e,
+    })?;
+    state.events_cursor_offset = len;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+
+    let mut heartbeat_updates: HashMap<String, String> = HashMap::new();
+    for line in buf.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let event_type = event
+            .get("type")
+            .or_else(|| event.get("event"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if event_type != "heartbeat" {
+            continue;
+        }
+        let task_id = event
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let ts = event
+            .get("ts")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if task_id.is_empty() || ts.is_empty() {
+            continue;
+        }
+        heartbeat_updates.insert(task_id.to_string(), ts.to_string());
+    }
+    if heartbeat_updates.is_empty() {
+        return Ok(0);
+    }
+
+    let mut registry =
+        crate::coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
+    let mut updated = 0usize;
+    if let Some(tasks) = registry.get_mut("tasks").and_then(serde_json::Value::as_array_mut) {
+        for task in tasks {
+            let id = task
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let Some(ts) = heartbeat_updates.get(id) else {
+                continue;
+            };
+            coordinator_engine::ensure_runtime_object(task);
+            task["task_runtime"]["last_heartbeat"] = serde_json::Value::String(ts.clone());
+            updated += 1;
+        }
+    }
+    if updated > 0 {
+        set_registry_updated_at(&mut registry);
+        crate::coordinator::state::coordinator_state_registry_save(
+            repo_root,
+            &BTreeMap::new(),
+            &registry,
+        )?;
+        if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Heartbeat updates applied count={} registry_updated",
+                updated
+            ));
+        }
+    }
+    Ok(updated)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleHeartbeatAction {
+    Retry,
+    Block,
+    Requeue,
+}
+
+fn apply_stale_heartbeat_policy(
+    repo_root: &Path,
+    env_cfg: &CoordinatorEnvConfig,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<usize> {
+    let stale_seconds = resolve_stale_heartbeat_seconds(env_cfg);
+    if stale_seconds == 0 {
+        return Ok(0);
+    }
+    let action = resolve_stale_heartbeat_action(env_cfg, logger);
+    let now = chrono::Utc::now();
+    let now_ts = now.timestamp();
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let mut registry =
+        crate::coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
+    let Some(tasks) = registry.get_mut("tasks").and_then(serde_json::Value::as_array_mut) else {
+        return Ok(0);
+    };
+
+    let mut stale_ids = Vec::new();
+    for task in tasks.iter_mut() {
+        coordinator_engine::ensure_runtime_object(task);
+        let status = task["task_runtime"]["status"]
+            .as_str()
+            .unwrap_or_default();
+        if status != "running" {
+            continue;
+        }
+        let phase = task["task_runtime"]["current_phase"]
+            .as_str()
+            .unwrap_or("dev")
+            .to_string();
+        let last_ts = task["task_runtime"]["last_heartbeat"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                task["task_runtime"]["started_at"]
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+            })
+            .or_else(|| task.get("updated_at").and_then(serde_json::Value::as_str));
+        let Some(last_ts) = last_ts else {
+            continue;
+        };
+        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(last_ts) else {
+            continue;
+        };
+        let age = now_ts.saturating_sub(parsed.timestamp());
+        if age <= stale_seconds as i64 {
+            continue;
+        }
+
+        let task_id = task
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if task_id.is_empty() {
+            continue;
+        }
+
+        let detail = format!(
+            "stale heartbeat: last={} age={}s threshold={}s action={}",
+            last_ts,
+            age,
+            stale_seconds,
+            match action {
+                StaleHeartbeatAction::Retry => "retry",
+                StaleHeartbeatAction::Block => "block",
+                StaleHeartbeatAction::Requeue => "requeue",
+            }
+        );
+
+        match action {
+            StaleHeartbeatAction::Block => {
+                task["task_runtime"]["status"] =
+                    serde_json::Value::String("stale".to_string());
+                task["task_runtime"]["pid"] = serde_json::Value::Null;
+                task["task_runtime"]["last_error"] =
+                    serde_json::Value::String(detail.clone());
+                task["state"] = serde_json::Value::String("blocked".to_string());
+            }
+            StaleHeartbeatAction::Requeue => {
+                crate::coordinator::state::reset_runtime_to_idle(task);
+                task["task_runtime"]["last_error"] =
+                    serde_json::Value::String(detail.clone());
+                task["state"] = serde_json::Value::String("todo".to_string());
+                task["assignee"] = serde_json::Value::Null;
+                task["claimed_at"] = serde_json::Value::Null;
+                task["worktree"] = serde_json::Value::Null;
+            }
+            StaleHeartbeatAction::Retry => {
+                increment_runtime_retries(task);
+                crate::coordinator::state::reset_runtime_to_idle(task);
+                task["task_runtime"]["last_error"] =
+                    serde_json::Value::String(detail.clone());
+                task["state"] = serde_json::Value::String("todo".to_string());
+                task["assignee"] = serde_json::Value::Null;
+                task["claimed_at"] = serde_json::Value::Null;
+                task["worktree"] = serde_json::Value::Null;
+            }
+        }
+
+        task["updated_at"] = serde_json::Value::String(now_iso.clone());
+        task["state_changed_at"] = serde_json::Value::String(now_iso.clone());
+        stale_ids.push((task_id, phase));
+    }
+
+    if stale_ids.is_empty() {
+        return Ok(0);
+    }
+
+    recompute_resource_locks_from_tasks(&mut registry);
+    set_registry_updated_at(&mut registry);
+    crate::coordinator::state::coordinator_state_registry_save(
+        repo_root,
+        &BTreeMap::new(),
+        &registry,
+    )?;
+
+    for (task_id, phase) in &stale_ids {
+        let _ = append_coordinator_event(
+            repo_root,
+            "task_runtime_stale",
+            task_id,
+            phase,
+            "stale",
+            "stale heartbeat detected",
+        );
+        if action == StaleHeartbeatAction::Retry {
+            let _ = append_coordinator_event(
+                repo_root,
+                "task_runtime_retry",
+                task_id,
+                phase,
+                "queued",
+                "stale heartbeat retry queued",
+            );
+        } else if action == StaleHeartbeatAction::Requeue {
+            let _ = append_coordinator_event(
+                repo_root,
+                "task_runtime_requeue",
+                task_id,
+                phase,
+                "queued",
+                "stale heartbeat requeue queued",
+            );
+        }
+    }
+
+    if let Some(log) = logger {
+        let _ = log.note(format!(
+            "- Stale heartbeat policy applied count={} action={:?}",
+            stale_ids.len(),
+            action
+        ));
+    }
+
+    Ok(stale_ids.len())
+}
+
+fn resolve_stale_heartbeat_seconds(_env_cfg: &CoordinatorEnvConfig) -> usize {
+    if let Ok(raw) = std::env::var("STALE_HEARTBEAT_SECONDS") {
+        if let Ok(value) = raw.trim().parse::<usize>() {
+            return value;
+        }
+    }
+    0
+}
+
+fn resolve_stale_heartbeat_action(
+    _env_cfg: &CoordinatorEnvConfig,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> StaleHeartbeatAction {
+    let raw = std::env::var("STALE_HEARTBEAT_ACTION")
+        .unwrap_or_else(|_| "block".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    match raw.as_str() {
+        "retry" => StaleHeartbeatAction::Retry,
+        "requeue" => StaleHeartbeatAction::Requeue,
+        "block" => StaleHeartbeatAction::Block,
+        other => {
+            if let Some(log) = logger {
+                let _ = log.note(format!(
+                    "- Unknown STALE_HEARTBEAT_ACTION='{}', defaulting to block",
+                    other
+                ));
+            }
+            StaleHeartbeatAction::Block
+        }
+    }
+}
+
+fn increment_runtime_retries(task: &mut serde_json::Value) {
+    coordinator_engine::ensure_runtime_object(task);
+    if !task
+        .get("task_runtime")
+        .and_then(|v| v.get("metrics"))
+        .map(serde_json::Value::is_object)
+        .unwrap_or(false)
+    {
+        task["task_runtime"]["metrics"] = serde_json::json!({});
+    }
+    let current = task["task_runtime"]["metrics"]["retries"]
+        .as_u64()
+        .unwrap_or(0);
+    let next = current.saturating_add(1);
+    task["task_runtime"]["metrics"]["retries"] = serde_json::Value::from(next);
+    task["task_runtime"]["retries"] = serde_json::Value::from(next);
 }
 
 fn resolve_error_code_retry_list(env_cfg: &CoordinatorEnvConfig) -> Vec<String> {

@@ -10,6 +10,7 @@ use crate::{
     CoordinatorRunState, NativeCoordinatorLogger,
 };
 use macc_core::coordinator::engine as coordinator_engine;
+use macc_core::coordinator::WorkflowState;
 use macc_core::coordinator_storage::{
     sync_coordinator_storage, CoordinatorStorageMode, CoordinatorStoragePhase,
 };
@@ -645,7 +646,7 @@ fn handle_retry_phase_native(
 
     match phase.as_str() {
         "dev" => {
-            retry_dev_phase_native(repo_root, canonical, env_cfg, &mut snapshot, task_id)?;
+            retry_dev_phase_native(repo_root, canonical, env_cfg, task_id.as_str())?;
             return Ok(());
         }
         "review" | "fix" | "integrate" => retry_tool_phase_native(
@@ -654,7 +655,7 @@ fn handle_retry_phase_native(
             coordinator_cfg,
             env_cfg,
             &mut snapshot,
-            task_id,
+            task_id.as_str(),
             &phase,
         )?,
         other => {
@@ -876,12 +877,12 @@ fn retry_tool_phase_native(
             let transition = match phase {
                 "fix" => coordinator_engine::PhaseTransition {
                     mode: "fix",
-                    next_state: coordinator_engine::WorkflowState::PrOpen,
+                    next_state: WorkflowState::PrOpen,
                     runtime_phase: "fix",
                 },
                 "integrate" => coordinator_engine::PhaseTransition {
                     mode: "integrate",
-                    next_state: coordinator_engine::WorkflowState::Queued,
+                    next_state: WorkflowState::Queued,
                     runtime_phase: "integrate",
                 },
                 _ => return Ok(()),
@@ -893,9 +894,20 @@ fn retry_tool_phase_native(
             )?;
         }
         Err(reason) => {
+            let phase_static = match phase {
+                "review" => "review",
+                "fix" => "fix",
+                "integrate" => "integrate",
+                _ => {
+                    return Err(MaccError::Validation(format!(
+                        "unsupported retry phase '{}'",
+                        phase
+                    )))
+                }
+            };
             coordinator_engine::apply_phase_failure(
                 find_task_mut(&mut snapshot.registry, task_id)?,
-                phase,
+                phase_static,
                 &reason,
                 &crate::now_iso_coordinator(),
             )?;

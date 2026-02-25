@@ -511,6 +511,9 @@ Important behavior:
 - Worktrees are reused as worker slots (not task-coupled names): once a task is merged, the slot is reset to reference, moved to a fresh branch, refreshed for the new task, then relaunched.
 - New worker worktrees are created only when no reusable slot is available; pool size is bounded by `max_parallel`.
 - CLI options can override YAML settings (`--max-dispatch`, `--max-parallel`, `--timeout-seconds`, etc.).
+- Stale heartbeat policy is enforced during control-plane runs via env:
+  - `STALE_HEARTBEAT_SECONDS` (0 disables)
+  - `STALE_HEARTBEAT_ACTION=retry|block|requeue`
 - Extra raw args with `--` are for coordinator subcommands that require raw passthrough args.
 - Optional VCS automation hook:
   - `COORDINATOR_VCS_HOOK=/path/to/hook.sh`
@@ -530,7 +533,7 @@ Migration direction:
 
 1. strict transition table in core (single source of truth),
 2. versioned event contract (JSON schema),
-3. event consumer with durable cursor (`.macc/state/coordinator.cursor`),
+3. heartbeat event consumer now updates `task_runtime.last_heartbeat` (cursor is in-memory today),
 4. control-plane loop split (scheduler / event monitor / runtime monitor),
 5. TUI live timeline + blocking error gate (Retry / Skip / Stop / Logs).
 

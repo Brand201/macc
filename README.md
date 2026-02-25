@@ -358,7 +358,8 @@ Coordinator orchestrates the end-to-end automation cycle: it reads the task regi
   - `--max-dispatch`, `--max-parallel`, `--timeout-seconds`
   - `--phase-runner-max-attempts`
   - `--stale-claimed-seconds`, `--stale-in-progress-seconds`, `--stale-changes-requested-seconds`, `--stale-action`
-  - Runtime stale heartbeat policy via env: `STALE_HEARTBEAT_SECONDS`, `STALE_HEARTBEAT_ACTION=retry|block|requeue`
+  - Heartbeat events update `task_runtime.last_heartbeat` from `events.jsonl`.
+  - Runtime stale heartbeat policy via env: `STALE_HEARTBEAT_SECONDS`, `STALE_HEARTBEAT_ACTION=retry|block|requeue` (retry/requeue resets task to `todo`; retry also increments runtime retries).
 - Task registry path is fixed to `.macc/automation/task/task_registry.json`.
 - Coordinator emits event bus lines to `.macc/log/coordinator/events.jsonl` (used by TUI live screen).
 - `run`, `dispatch`, `advance`, `reconcile`, and `cleanup` are executed by native Rust handlers (async supervision + retries/timeouts per phase).

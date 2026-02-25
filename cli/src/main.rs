@@ -1972,9 +1972,12 @@ pub(crate) struct CoordinatorEnvConfig {
     max_parallel: Option<usize>,
     timeout_seconds: Option<usize>,
     phase_runner_max_attempts: Option<usize>,
+    #[allow(dead_code)]
     stale_claimed_seconds: Option<usize>,
     stale_in_progress_seconds: Option<usize>,
+    #[allow(dead_code)]
     stale_changes_requested_seconds: Option<usize>,
+    #[allow(dead_code)]
     stale_action: Option<String>,
     storage_mode: Option<String>,
     error_code_retry_list: Option<String>,
@@ -2498,6 +2501,7 @@ fn parse_json_string_vec_map(
     Ok(out)
 }
 
+#[cfg(test)]
 fn apply_coordinator_env(
     command: &mut std::process::Command,
     canonical: &macc_core::config::CanonicalConfig,
@@ -2509,6 +2513,7 @@ fn apply_coordinator_env(
     }
 }
 
+#[cfg(test)]
 fn coordinator_env_pairs(
     canonical: &macc_core::config::CanonicalConfig,
     coordinator: Option<&macc_core::config::CoordinatorConfig>,
@@ -2640,6 +2645,7 @@ fn coordinator_env_pairs(
     out
 }
 
+#[cfg(test)]
 fn run_coordinator_action(
     repo_root: &std::path::Path,
     coordinator_path: &std::path::Path,
@@ -2661,6 +2667,7 @@ fn run_coordinator_action(
     )
 }
 
+#[cfg(test)]
 fn run_coordinator_action_with_options(
     repo_root: &std::path::Path,
     coordinator_path: &std::path::Path,
@@ -4421,6 +4428,7 @@ fn sync_storage_with_startup_reconcile(
     }
 }
 
+#[cfg(test)]
 fn coordinator_action_hint(action: &str) -> &'static str {
     match action {
         "dispatch" => {

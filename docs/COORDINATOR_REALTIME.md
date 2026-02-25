@@ -85,6 +85,8 @@ Split coordinator into logical loops:
 - persists cursor in `.macc/state/coordinator.cursor`:
   - `path`, `inode`, `offset`, `last_event_id`, `updated_at`
 
+Current implementation note: heartbeat events are consumed in the native control-plane to update `task_runtime.last_heartbeat` using an in-memory cursor (not yet persisted).
+
 3) Runtime monitor loop:
 - heartbeat timeout detection (`running` with stale heartbeat -> `stale` action).
 

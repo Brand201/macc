@@ -1,6 +1,5 @@
 use crate::coordinator::engine::ReviewVerdict;
 use crate::{MaccError, Result};
-use chrono::Utc;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -45,6 +44,7 @@ pub struct CoordinatorRunState {
     pub merge_join_set: tokio::task::JoinSet<()>,
     pub merge_event_tx: tokio::sync::mpsc::UnboundedSender<CoordinatorMergeEvent>,
     pub merge_event_rx: tokio::sync::mpsc::UnboundedReceiver<CoordinatorMergeEvent>,
+    pub events_cursor_offset: u64,
 }
 
 pub trait PhaseExecutor {
@@ -70,6 +70,7 @@ impl CoordinatorRunState {
             merge_join_set: tokio::task::JoinSet::new(),
             merge_event_tx,
             merge_event_rx,
+            events_cursor_offset: 0,
         }
     }
 }
