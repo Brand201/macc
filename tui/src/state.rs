@@ -1,6 +1,9 @@
 use crate::screen::Screen;
 use macc_adapter_shared::fetch::materialize_fetch_units;
 use macc_core::catalog::{Agent, McpEntry, Skill};
+use macc_core::coordinator_storage::{
+    CoordinatorSnapshot, CoordinatorStorage, CoordinatorStoragePaths, JsonStorage, SqliteStorage,
+};
 use macc_core::config::{CanonicalConfig, CoordinatorConfig};
 use macc_core::doctor::ToolCheck;
 use macc_core::plan::{render_diff, ActionPlan, DiffView, PlannedOp, Scope};
@@ -479,19 +482,37 @@ impl AppState {
         }
     }
 
-    fn coordinator_registry_path(&self) -> Option<PathBuf> {
-        let paths = self.project_paths.as_ref()?;
-        Some(paths.root.join(Self::COORDINATOR_TASK_REGISTRY_REL_PATH))
+    fn allow_legacy_json_fallback(&self) -> bool {
+        let raw = std::env::var("COORDINATOR_LEGACY_JSON_FALLBACK")
+            .ok()
+            .unwrap_or_else(|| "0".to_string());
+        !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
     }
 
-    fn read_registry_snapshot(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<CoordinatorTaskSnapshot, String> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read registry '{}': {}", path.display(), e))?;
-        let root: Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("invalid registry JSON '{}': {}", path.display(), e))?;
+    fn load_coordinator_storage_snapshot(&self) -> Result<CoordinatorSnapshot, String> {
+        let paths = self
+            .project_paths
+            .as_ref()
+            .ok_or_else(|| "No project loaded.".to_string())?;
+        let storage_paths = CoordinatorStoragePaths::from_project_paths(paths);
+        match SqliteStorage::new(storage_paths.clone()).load_snapshot() {
+            Ok(snapshot) => Ok(snapshot),
+            Err(err) if self.allow_legacy_json_fallback() => JsonStorage::new(storage_paths)
+                .load_snapshot()
+                .map_err(|json_err| {
+                    format!(
+                        "failed to load coordinator snapshot (sqlite={}, json={})",
+                        err, json_err
+                    )
+                }),
+            Err(err) => Err(format!("failed to load coordinator snapshot from sqlite: {}", err)),
+        }
+    }
+
+    fn read_registry_snapshot_from_value(&self, root: &Value) -> Result<CoordinatorTaskSnapshot, String> {
         let tasks = root
             .get("tasks")
             .and_then(|v| v.as_array())
@@ -592,10 +613,9 @@ impl AppState {
 
     pub fn refresh_coordinator_snapshot(&mut self) {
         self.refresh_coordinator_pause_state();
-        let Some(registry_path) = self.coordinator_registry_path() else {
-            return;
-        };
-        match self.read_registry_snapshot(&registry_path) {
+        match self.load_coordinator_storage_snapshot().and_then(|snapshot| {
+            self.read_registry_snapshot_from_value(&snapshot.registry)
+        }) {
             Ok(snapshot) => {
                 self.coordinator_snapshot = Some(snapshot);
                 self.coordinator_last_refresh = Some(Instant::now());
@@ -652,11 +672,8 @@ impl AppState {
     }
 
     pub fn refresh_coordinator_events(&mut self) {
-        let Some(path) = self.coordinator_events_path() else {
-            return;
-        };
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
+        let snapshot = match self.load_coordinator_storage_snapshot() {
+            Ok(s) => s,
             Err(_) => {
                 self.coordinator_events.clear();
                 self.coordinator_events_per_sec = None;
@@ -666,83 +683,73 @@ impl AppState {
             }
         };
         let now = Instant::now();
-        let mut lines: Vec<String> = content
-            .lines()
-            .filter_map(|line| {
-                if line.trim().is_empty() {
+        let mut lines: Vec<String> = snapshot
+            .events
+            .iter()
+            .filter_map(|v| {
+                let ts = v.get("ts").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let event = v
+                    .get("type")
+                    .or_else(|| v.get("event"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("event")
+                    .to_string();
+                if !Self::is_essential_coordinator_event(&event) {
                     return None;
                 }
-                if let Ok(v) = serde_json::from_str::<Value>(line) {
-                    let ts = v
-                        .get("ts")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let event = v
-                        .get("type")
-                        .or_else(|| v.get("event"))
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("event")
-                        .to_string();
-                    if !Self::is_essential_coordinator_event(&event) {
-                        return None;
-                    }
-                    let msg = v
-                        .get("msg")
-                        .or_else(|| v.get("payload").and_then(|p| p.get("message")))
-                        .or_else(|| v.get("payload").and_then(|p| p.get("reason")))
-                        .and_then(|x| x.as_str())
-                        .unwrap_or(event.as_str())
-                        .to_string();
-                    let task = v
-                        .get("task_id")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let state = v
-                        .get("state")
-                        .or_else(|| v.get("status"))
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let mut rendered = format!("[{}] {}", event, msg);
-                    if !task.is_empty() {
-                        rendered.push_str(&format!(" | task={}", task));
-                    }
-                    if !state.is_empty() {
-                        rendered.push_str(&format!(" | state={}", state));
-                    }
-                    let phase = v
-                        .get("phase")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !phase.is_empty() {
-                        rendered.push_str(&format!(" | phase={}", phase));
-                    }
-                    let detail = v
-                        .get("detail")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !detail.is_empty() {
-                        rendered.push_str(&format!(" | {}", detail));
-                    }
-                    let source = v
-                        .get("source")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !source.is_empty() {
-                        rendered.push_str(&format!(" | src={}", source));
-                    }
-                    if !ts.is_empty() {
-                        rendered.push_str(&format!(" | {}", ts));
-                    }
-                    Some(rendered)
-                } else {
-                    Some(line.to_string())
+                let msg = v
+                    .get("msg")
+                    .or_else(|| v.get("payload").and_then(|p| p.get("message")))
+                    .or_else(|| v.get("payload").and_then(|p| p.get("reason")))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(event.as_str())
+                    .to_string();
+                let task = v
+                    .get("task_id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let state = v
+                    .get("state")
+                    .or_else(|| v.get("status"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mut rendered = format!("[{}] {}", event, msg);
+                if !task.is_empty() {
+                    rendered.push_str(&format!(" | task={}", task));
                 }
+                if !state.is_empty() {
+                    rendered.push_str(&format!(" | state={}", state));
+                }
+                let phase = v
+                    .get("phase")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !phase.is_empty() {
+                    rendered.push_str(&format!(" | phase={}", phase));
+                }
+                let detail = v
+                    .get("detail")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !detail.is_empty() {
+                    rendered.push_str(&format!(" | {}", detail));
+                }
+                let source = v
+                    .get("source")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !source.is_empty() {
+                    rendered.push_str(&format!(" | src={}", source));
+                }
+                if !ts.is_empty() {
+                    rendered.push_str(&format!(" | {}", ts));
+                }
+                Some(rendered)
             })
             .collect();
         let total_count = lines.len();
@@ -764,8 +771,9 @@ impl AppState {
             self.coordinator_events_per_sec = Some(0.0);
         }
 
-        self.coordinator_last_event_age = std::fs::metadata(&path)
-            .ok()
+        self.coordinator_last_event_age = self
+            .coordinator_events_path()
+            .and_then(|path| std::fs::metadata(&path).ok())
             .and_then(|meta| meta.modified().ok())
             .and_then(|modified| modified.elapsed().ok());
 
@@ -1446,16 +1454,8 @@ impl AppState {
     }
 
     fn parse_failure_context_from_events(&self) -> Option<CoordinatorFailureContext> {
-        let path = self.coordinator_events_path()?;
-        let content = std::fs::read_to_string(path).ok()?;
-        for line in content.lines().rev() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let parsed: Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+        let snapshot = self.load_coordinator_storage_snapshot().ok()?;
+        for parsed in snapshot.events.iter().rev() {
             let event = parsed
                 .get("type")
                 .or_else(|| parsed.get("event"))

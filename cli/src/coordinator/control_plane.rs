@@ -655,6 +655,7 @@ fn consume_heartbeat_events(
         return Ok(0);
     }
 
+    let project_paths = macc_core::ProjectPaths::from_root(repo_root);
     let mut heartbeat_updates: HashMap<String, String> = HashMap::new();
     for line in buf.lines() {
         let trimmed = line.trim();
@@ -664,6 +665,8 @@ fn consume_heartbeat_events(
         let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             continue;
         };
+        // Ingest performer/runtime events into SQLite source-of-truth.
+        let _ = macc_core::coordinator_storage::append_event_sqlite(&project_paths, &event)?;
         let event_type = event
             .get("type")
             .or_else(|| event.get("event"))

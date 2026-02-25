@@ -10,7 +10,9 @@ use macc_core::coordinator::{
     runtime as coordinator_runtime, runtime_status_from_event, RuntimeStatus, WorkflowState,
 };
 use macc_core::coordinator_storage::{
-    sync_coordinator_storage, CoordinatorStorageMode, CoordinatorStoragePhase,
+    append_event_sqlite, coordinator_storage_bootstrap_sqlite_from_json,
+    coordinator_storage_export_sqlite_to_json, coordinator_storage_import_json_to_sqlite,
+    coordinator_storage_verify_parity, CoordinatorStorageMode, CoordinatorStorageTransfer,
 };
 use macc_core::engine::{Engine, MaccEngine};
 use macc_core::plan::builders::{plan_mcp_install, plan_skill_install};
@@ -178,7 +180,7 @@ enum Commands {
     },
     /// Run the project coordinator automation script
     Coordinator {
-        /// Coordinator action (run, control-plane-run, dispatch, advance, resume, sync, status, reconcile, unlock, cleanup, retry-phase, cutover-gate, stop, validate-transition, validate-runtime-transition, runtime-status-from-event, storage-sync, select-ready-task, state-apply-transition, state-set-runtime, state-task-field, state-task-exists, state-counts, state-locks, state-set-merge-pending, state-set-merge-processed, state-increment-retries, state-upsert-slo-warning, state-slo-metric)
+        /// Coordinator action (run, control-plane-run, dispatch, advance, resume, sync, status, reconcile, unlock, cleanup, retry-phase, cutover-gate, stop, validate-transition, validate-runtime-transition, runtime-status-from-event, storage-import, storage-export, storage-verify, storage-sync, select-ready-task, state-apply-transition, state-set-runtime, state-task-field, state-task-exists, state-counts, state-locks, state-set-merge-pending, state-set-merge-processed, state-increment-retries, state-upsert-slo-warning, state-slo-metric)
         #[arg(default_value = "run")]
         action: String,
         /// Disable TUI live view for `macc coordinator run`
@@ -2209,61 +2211,39 @@ fn parse_coordinator_runtime_status_from_event_args(args: &[String]) -> Result<(
 
 fn parse_coordinator_storage_sync_args(
     args: &[String],
-) -> Result<(CoordinatorStorageMode, CoordinatorStoragePhase)> {
-    let mut mode: Option<CoordinatorStorageMode> = None;
-    let mut phase: Option<CoordinatorStoragePhase> = None;
+) -> Result<CoordinatorStorageTransfer> {
+    let mut direction: Option<CoordinatorStorageTransfer> = None;
     let mut idx = 0usize;
     while idx < args.len() {
         match args[idx].as_str() {
-            "--mode" => {
+            "--direction" => {
                 let value = args.get(idx + 1).ok_or_else(|| {
                     MaccError::Validation(
-                        "Missing value for --mode. Usage: macc coordinator storage-sync --mode <json|dual-write|sqlite> --phase <pre|post>"
+                        "Missing value for --direction. Usage: macc coordinator storage-sync --direction <import|export|verify>"
                             .into(),
                     )
                 })?;
-                mode = Some(
+                direction = Some(
                     value
-                        .parse::<CoordinatorStorageMode>()
-                        .map_err(MaccError::Validation)?,
-                );
-                idx += 2;
-            }
-            "--phase" => {
-                let value = args.get(idx + 1).ok_or_else(|| {
-                    MaccError::Validation(
-                        "Missing value for --phase. Usage: macc coordinator storage-sync --mode <json|dual-write|sqlite> --phase <pre|post>"
-                            .into(),
-                    )
-                })?;
-                phase = Some(
-                    value
-                        .parse::<CoordinatorStoragePhase>()
+                        .parse::<CoordinatorStorageTransfer>()
                         .map_err(MaccError::Validation)?,
                 );
                 idx += 2;
             }
             other => {
                 return Err(MaccError::Validation(format!(
-                    "Unknown arg for storage-sync: '{}'. Usage: macc coordinator storage-sync --mode <json|dual-write|sqlite> --phase <pre|post>",
+                    "Unknown arg for storage-sync: '{}'. Usage: macc coordinator storage-sync --direction <import|export|verify>",
                     other
                 )));
             }
         }
     }
-    let mode = mode.ok_or_else(|| {
+    direction.ok_or_else(|| {
         MaccError::Validation(
-            "Missing --mode. Usage: macc coordinator storage-sync --mode <json|dual-write|sqlite> --phase <pre|post>"
+            "Missing --direction. Usage: macc coordinator storage-sync --direction <import|export|verify>"
                 .into(),
         )
-    })?;
-    let phase = phase.ok_or_else(|| {
-        MaccError::Validation(
-            "Missing --phase. Usage: macc coordinator storage-sync --mode <json|dual-write|sqlite> --phase <pre|post>"
-                .into(),
-        )
-    })?;
-    Ok((mode, phase))
+    })
 }
 
 fn validate_coordinator_transition_action(args: &[String]) -> Result<()> {
@@ -2298,9 +2278,17 @@ fn coordinator_runtime_status_from_event_action(args: &[String]) -> Result<()> {
 }
 
 fn coordinator_storage_sync_action(repo_root: &std::path::Path, args: &[String]) -> Result<()> {
-    let (mode, phase) = parse_coordinator_storage_sync_args(args)?;
+    let direction = parse_coordinator_storage_sync_args(args)?;
     let paths = macc_core::ProjectPaths::from_root(repo_root);
-    sync_coordinator_storage(&paths, mode, phase)
+    match direction {
+        CoordinatorStorageTransfer::ImportJsonToSqlite => {
+            coordinator_storage_import_json_to_sqlite(&paths)
+        }
+        CoordinatorStorageTransfer::ExportSqliteToJson => {
+            coordinator_storage_export_sqlite_to_json(&paths)
+        }
+        CoordinatorStorageTransfer::VerifyParity => coordinator_storage_verify_parity(&paths),
+    }
 }
 
 fn coordinator_select_ready_task_action(
@@ -3344,25 +3332,10 @@ pub(crate) fn count_pool_worktrees(repo_root: &std::path::Path) -> Result<usize>
 fn read_coordinator_counts(
     paths: &macc_core::ProjectPaths,
 ) -> Result<coordinator_engine::CoordinatorCounts> {
-    let registry_path = paths
-        .root
-        .join(".macc")
-        .join("automation")
-        .join("task")
-        .join("task_registry.json");
-    let raw = std::fs::read_to_string(&registry_path).map_err(|e| MaccError::Io {
-        path: registry_path.to_string_lossy().into(),
-        action: "read coordinator registry".into(),
-        source: e,
-    })?;
-    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-        MaccError::Validation(format!(
-            "Failed to parse coordinator registry {}: {}",
-            registry_path.display(),
-            e
-        ))
-    })?;
-    let tasks = value
+    let snapshot =
+        coordinator::state::coordinator_state_snapshot(&paths.root, &BTreeMap::new())?;
+    let tasks = snapshot
+        .registry
         .get("tasks")
         .and_then(|v| v.as_array())
         .ok_or_else(|| MaccError::Validation("Registry missing .tasks array".into()))?;
@@ -3480,6 +3453,9 @@ pub(crate) fn append_coordinator_event(
     let line = serde_json::to_string(&payload).map_err(|e| {
         MaccError::Validation(format!("Failed to serialize coordinator event: {}", e))
     })?;
+    let project_paths = macc_core::ProjectPaths::from_root(repo_root);
+    // SQLite is source-of-truth for coordinator state/events.
+    let _ = append_event_sqlite(&project_paths, &payload)?;
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -4034,8 +4010,6 @@ struct NativeControlPlaneBackend<'a> {
     phase_timeout_seconds: usize,
     storage_mode: CoordinatorStorageMode,
     storage_paths: macc_core::ProjectPaths,
-    storage_reconcile_attempted: bool,
-    storage_degraded_json_mode: bool,
     last_logged_counts: Option<coordinator_engine::CoordinatorCounts>,
 }
 
@@ -4079,8 +4053,6 @@ impl<'a> NativeControlPlaneBackend<'a> {
             phase_timeout_seconds,
             storage_mode,
             storage_paths,
-            storage_reconcile_attempted: false,
-            storage_degraded_json_mode: false,
             last_logged_counts: None,
         })
     }
@@ -4173,51 +4145,8 @@ impl coordinator_engine::ControlPlaneBackend for NativeControlPlaneBackend<'_> {
             ));
         }
 
-        if self.storage_mode != CoordinatorStorageMode::Json && !self.storage_degraded_json_mode {
-            if let Err(err) = sync_coordinator_storage(
-                &self.storage_paths,
-                self.storage_mode,
-                CoordinatorStoragePhase::Post,
-            ) {
-                if is_storage_mismatch_error(&err) {
-                    if !self.storage_reconcile_attempted {
-                        self.storage_reconcile_attempted = true;
-                        let _ = self.logger.note(format!(
-                            "- Storage post-sync mismatch on cycle {} ({}); rebuilding sqlite (single attempt)",
-                            cycle, err
-                        ));
-                        if let Err(rebuild_err) = rebuild_sqlite_storage_from_json(
-                            &self.storage_paths,
-                            Some(&self.logger),
-                        ) {
-                            if is_storage_mismatch_error(&rebuild_err) {
-                                self.storage_degraded_json_mode = true;
-                                let _ = self.logger.note(format!(
-                                    "- Storage degraded mode enabled: mismatch persists after rebuild ({}). Continuing without post-sync validation.",
-                                    rebuild_err
-                                ));
-                            } else {
-                                return Err(rebuild_err);
-                            }
-                        } else if self.storage_mode == CoordinatorStorageMode::DualWrite {
-                            sync_coordinator_storage(
-                                &self.storage_paths,
-                                self.storage_mode,
-                                CoordinatorStoragePhase::Post,
-                            )?;
-                        }
-                    } else {
-                        self.storage_degraded_json_mode = true;
-                        let _ = self.logger.note(format!(
-                            "- Storage degraded mode enabled after repeated mismatch on cycle {} ({}). Skipping further post-sync checks this run.",
-                            cycle, err
-                        ));
-                    }
-                } else {
-                    return Err(err);
-                }
-            }
-        }
+        let _ = self.storage_mode;
+        let _ = &self.storage_paths;
 
         let _ = coordinator::logs::aggregate_performer_logs(self.repo_root);
         let paths = macc_core::ProjectPaths::from_root(self.repo_root);
@@ -4348,57 +4277,6 @@ fn resolve_coordinator_storage_mode(
         .map_err(MaccError::Validation)
 }
 
-fn is_storage_mismatch_error(err: &MaccError) -> bool {
-    match err {
-        MaccError::Validation(msg) => msg.contains("Coordinator storage mismatch"),
-        _ => false,
-    }
-}
-
-fn rebuild_sqlite_storage_from_json(
-    project_paths: &macc_core::ProjectPaths,
-    logger: Option<&NativeCoordinatorLogger>,
-) -> Result<()> {
-    let sqlite_path = project_paths
-        .macc_dir
-        .join("state")
-        .join("coordinator.sqlite");
-    if sqlite_path.exists() {
-        let backup = sqlite_path.with_extension(format!(
-            "bak-{}",
-            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
-        ));
-        if let Err(err) = std::fs::rename(&sqlite_path, &backup) {
-            let _ = std::fs::remove_file(&sqlite_path);
-            if let Some(log) = logger {
-                let _ = log.note(format!(
-                    "- Storage reconcile warning: failed to backup sqlite {} -> {} ({})",
-                    sqlite_path.display(),
-                    backup.display(),
-                    err
-                ));
-            }
-        } else if let Some(log) = logger {
-            let _ = log.note(format!(
-                "- Storage reconcile: sqlite backup={} from={}",
-                backup.display(),
-                sqlite_path.display()
-            ));
-        }
-    }
-    sync_coordinator_storage(
-        project_paths,
-        CoordinatorStorageMode::Sqlite,
-        CoordinatorStoragePhase::Pre,
-    )?;
-    sync_coordinator_storage(
-        project_paths,
-        CoordinatorStorageMode::Sqlite,
-        CoordinatorStoragePhase::Post,
-    )?;
-    Ok(())
-}
-
 fn sync_storage_with_startup_reconcile(
     project_paths: &macc_core::ProjectPaths,
     storage_mode: CoordinatorStorageMode,
@@ -4407,32 +4285,25 @@ fn sync_storage_with_startup_reconcile(
     if storage_mode == CoordinatorStorageMode::Json {
         return Ok(());
     }
-    sync_coordinator_storage(project_paths, storage_mode, CoordinatorStoragePhase::Pre)?;
-    match sync_coordinator_storage(project_paths, storage_mode, CoordinatorStoragePhase::Post) {
-        Ok(()) => Ok(()),
-        Err(err) if is_storage_mismatch_error(&err) => {
-            if let Some(log) = logger {
-                let _ = log.note(format!(
-                    "- Storage reconcile: detected mismatch on startup ({}), rebuilding sqlite",
-                    err
-                ));
-            }
-            match rebuild_sqlite_storage_from_json(project_paths, logger) {
-                Ok(()) => Ok(()),
-                Err(rebuild_err) if is_storage_mismatch_error(&rebuild_err) => {
-                    if let Some(log) = logger {
-                        let _ = log.note(format!(
-                            "- Storage reconcile warning: mismatch persists after rebuild; continuing with JSON source ({})",
-                            rebuild_err
-                        ));
-                    }
-                    Ok(())
-                }
-                Err(rebuild_err) => Err(rebuild_err),
-            }
+    let imported = coordinator_storage_bootstrap_sqlite_from_json(project_paths)?;
+    if imported {
+        if let Some(log) = logger {
+            let _ = log.note("- Storage bootstrap: imported JSON snapshot into SQLite");
         }
-        Err(err) => Err(err),
     }
+    if std::env::var("COORDINATOR_JSON_COMPAT")
+        .ok()
+        .map(|raw| {
+            !matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(false)
+    {
+        coordinator_storage_export_sqlite_to_json(project_paths)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -8145,15 +8016,9 @@ mod tests {
 
     #[test]
     fn test_parse_coordinator_storage_sync_args() {
-        let args = vec![
-            "--mode".to_string(),
-            "dual-write".to_string(),
-            "--phase".to_string(),
-            "post".to_string(),
-        ];
-        let (mode, phase) = parse_coordinator_storage_sync_args(&args).unwrap();
-        assert_eq!(mode, CoordinatorStorageMode::DualWrite);
-        assert_eq!(phase, CoordinatorStoragePhase::Post);
+        let args = vec!["--direction".to_string(), "import".to_string()];
+        let direction = parse_coordinator_storage_sync_args(&args).unwrap();
+        assert_eq!(direction, CoordinatorStorageTransfer::ImportJsonToSqlite);
     }
 
     #[test]

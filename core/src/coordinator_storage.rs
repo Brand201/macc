@@ -35,6 +35,29 @@ pub enum CoordinatorStoragePhase {
     Post,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatorStorageTransfer {
+    ImportJsonToSqlite,
+    ExportSqliteToJson,
+    VerifyParity,
+}
+
+impl FromStr for CoordinatorStorageTransfer {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "import" | "json-to-sqlite" | "json_to_sqlite" => Ok(Self::ImportJsonToSqlite),
+            "export" | "sqlite-to-json" | "sqlite_to_json" => Ok(Self::ExportSqliteToJson),
+            "verify" | "parity" => Ok(Self::VerifyParity),
+            other => Err(format!(
+                "Unknown coordinator storage transfer '{}'. Expected import|export|verify.",
+                other
+            )),
+        }
+    }
+}
+
 impl FromStr for CoordinatorStoragePhase {
     type Err = String;
 
@@ -165,6 +188,19 @@ pub struct SloWarningMutation {
 }
 
 #[derive(Debug, Clone)]
+pub struct EventMutation {
+    pub event_id: Option<String>,
+    pub seq: Option<i64>,
+    pub ts: Option<String>,
+    pub source: String,
+    pub task_id: String,
+    pub event_type: String,
+    pub phase: String,
+    pub status: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone)]
 pub struct JsonStorage {
     paths: CoordinatorStoragePaths,
 }
@@ -277,6 +313,105 @@ impl SqliteStorage {
         Ok(registry_meta_exists > 0 || task_count > 0)
     }
 
+    pub fn append_event(&self, event: &Value) -> Result<bool> {
+        let mut conn = self.open()?;
+        self.init_schema(&conn)?;
+        let tx = conn.transaction().map_err(sql_err)?;
+        let mutation = EventMutation {
+            event_id: event
+                .get("event_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
+            seq: event.get("seq").and_then(|v| v.as_i64()),
+            ts: event.get("ts").and_then(|v| v.as_str()).map(|v| v.to_string()),
+            source: event
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            task_id: event
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            event_type: event
+                .get("type")
+                .or_else(|| event.get("event"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            phase: event
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            status: event
+                .get("status")
+                .or_else(|| event.get("state"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            payload: event.get("payload").cloned().unwrap_or_else(|| json!({})),
+        };
+        let inserted = self.append_event_in_tx(&tx, &mutation)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(inserted)
+    }
+
+    fn append_event_in_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        event: &EventMutation,
+    ) -> Result<bool> {
+        let now = now_iso_string();
+        let seq = event
+            .seq
+            .unwrap_or_else(|| Utc::now().timestamp_nanos_opt().unwrap_or_default());
+        let ts = event.ts.as_deref().unwrap_or(now.as_str());
+        let event_id = event
+            .event_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("evt-{}-{}-{}", event.event_type, event.task_id, seq));
+        let payload_raw = serde_json::to_string(&event.payload).map_err(|e| {
+            MaccError::Validation(format!("Failed to serialize event payload: {}", e))
+        })?;
+        let raw_json = serde_json::to_string(&json!({
+            "schema_version":"1",
+            "event_id": event_id,
+            "seq": seq,
+            "ts": ts,
+            "source": event.source,
+            "task_id": event.task_id,
+            "type": event.event_type,
+            "phase": event.phase,
+            "status": event.status,
+            "payload": event.payload
+        }))
+        .map_err(|e| MaccError::Validation(format!("Failed to serialize event json: {}", e)))?;
+
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO events (event_id, seq, ts, source, task_id, event_type, phase, status, payload_json, raw_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    event_id,
+                    seq,
+                    ts,
+                    event.source,
+                    event.task_id,
+                    event.event_type,
+                    event.phase,
+                    event.status,
+                    payload_raw,
+                    raw_json
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(inserted > 0)
+    }
+
     fn open(&self) -> Result<Connection> {
         ensure_parent_dir(&self.paths.sqlite_path)?;
         Connection::open(&self.paths.sqlite_path).map_err(sql_err)
@@ -354,6 +489,14 @@ impl SqliteStorage {
     }
 
     pub fn apply_transition(&self, change: &TransitionMutation) -> Result<()> {
+        self.apply_transition_with_event(change, None)
+    }
+
+    pub fn apply_transition_with_event(
+        &self,
+        change: &TransitionMutation,
+        event: Option<&EventMutation>,
+    ) -> Result<()> {
         let mut conn = self.open()?;
         self.init_schema(&conn)?;
         let tx = conn.transaction().map_err(sql_err)?;
@@ -443,11 +586,22 @@ impl SqliteStorage {
             .unwrap_or_else(|| json!({}));
         self.upsert_task_runtime_row(&tx, &change.task_id, &runtime, &change.now)?;
         self.recompute_resource_locks(&tx, &change.now)?;
+        if let Some(event) = event {
+            self.append_event_in_tx(&tx, event)?;
+        }
         tx.commit().map_err(sql_err)?;
         Ok(())
     }
 
     pub fn set_runtime(&self, change: &RuntimeMutation) -> Result<()> {
+        self.set_runtime_with_event(change, None)
+    }
+
+    pub fn set_runtime_with_event(
+        &self,
+        change: &RuntimeMutation,
+        event: Option<&EventMutation>,
+    ) -> Result<()> {
         let mut conn = self.open()?;
         self.init_schema(&conn)?;
         let tx = conn.transaction().map_err(sql_err)?;
@@ -547,6 +701,9 @@ impl SqliteStorage {
             .cloned()
             .unwrap_or_else(|| json!({}));
         self.upsert_task_runtime_row(&tx, &change.task_id, &runtime, &change.now)?;
+        if let Some(event) = event {
+            self.append_event_in_tx(&tx, event)?;
+        }
         tx.commit().map_err(sql_err)?;
         Ok(())
     }
@@ -1329,50 +1486,100 @@ pub fn sync_coordinator_storage(
     mode: CoordinatorStorageMode,
     phase: CoordinatorStoragePhase,
 ) -> Result<()> {
-    if mode == CoordinatorStorageMode::Json {
-        return Ok(());
+    // Backward-compatible entry point. New code should call explicit transfer APIs.
+    match (mode, phase) {
+        (CoordinatorStorageMode::Json, _) => Ok(()),
+        (CoordinatorStorageMode::DualWrite, _) => coordinator_storage_import_json_to_sqlite(project_paths),
+        (CoordinatorStorageMode::Sqlite, CoordinatorStoragePhase::Pre) => {
+            let imported = coordinator_storage_bootstrap_sqlite_from_json(project_paths)?;
+            if !imported {
+                coordinator_storage_export_sqlite_to_json(project_paths)?;
+            }
+            Ok(())
+        }
+        (CoordinatorStorageMode::Sqlite, CoordinatorStoragePhase::Post) => {
+            coordinator_storage_export_sqlite_to_json(project_paths)
+        }
     }
+}
 
+pub fn coordinator_storage_bootstrap_sqlite_from_json(project_paths: &ProjectPaths) -> Result<bool> {
     let paths = CoordinatorStoragePaths::from_project_paths(project_paths);
     let json_store = JsonStorage::new(paths.clone());
     let sqlite_store = SqliteStorage::new(paths);
+    if sqlite_store.has_snapshot_data()? {
+        return Ok(false);
+    }
+    let json_snapshot = json_store.load_snapshot()?;
+    sqlite_store.save_snapshot(&json_snapshot)?;
+    Ok(true)
+}
 
-    match (mode, phase) {
-        (CoordinatorStorageMode::DualWrite, _) => {
-            let json_snapshot = json_store.load_snapshot()?;
-            sqlite_store.save_snapshot(&json_snapshot)?;
-        }
-        (CoordinatorStorageMode::Sqlite, CoordinatorStoragePhase::Pre) => {
-            if sqlite_store.has_snapshot_data()? {
-                let sqlite_snapshot = sqlite_store.load_snapshot()?;
-                json_store.save_snapshot(&sqlite_snapshot)?;
-            } else {
-                let json_snapshot = json_store.load_snapshot()?;
-                sqlite_store.save_snapshot(&json_snapshot)?;
-            }
-        }
-        (CoordinatorStorageMode::Sqlite, CoordinatorStoragePhase::Post) => {
-            let sqlite_snapshot = sqlite_store.load_snapshot()?;
-            json_store.save_snapshot(&sqlite_snapshot)?;
-        }
-        (CoordinatorStorageMode::Json, _) => {}
+pub fn coordinator_storage_import_json_to_sqlite(project_paths: &ProjectPaths) -> Result<()> {
+    let paths = CoordinatorStoragePaths::from_project_paths(project_paths);
+    let json_store = JsonStorage::new(paths.clone());
+    let sqlite_store = SqliteStorage::new(paths);
+    let json_snapshot = json_store.load_snapshot()?;
+    sqlite_store.save_snapshot(&json_snapshot)
+}
+
+pub fn coordinator_storage_export_sqlite_to_json(project_paths: &ProjectPaths) -> Result<()> {
+    let paths = CoordinatorStoragePaths::from_project_paths(project_paths);
+    let json_store = JsonStorage::new(paths.clone());
+    let sqlite_store = SqliteStorage::new(paths);
+    let sqlite_snapshot = sqlite_store.load_snapshot()?;
+    json_store.save_snapshot(&sqlite_snapshot)
+}
+
+pub fn coordinator_storage_verify_parity(project_paths: &ProjectPaths) -> Result<()> {
+    let paths = CoordinatorStoragePaths::from_project_paths(project_paths);
+    let json_store = JsonStorage::new(paths.clone());
+    let sqlite_store = SqliteStorage::new(paths);
+    let json_snapshot = json_store.load_snapshot()?;
+    let sqlite_snapshot = sqlite_store.load_snapshot()?;
+    if json_snapshot != sqlite_snapshot {
+        return Err(MaccError::Validation(
+            "Coordinator storage mismatch: json and sqlite snapshots differ".into(),
+        ));
     }
     Ok(())
+}
+
+pub fn append_event_sqlite(project_paths: &ProjectPaths, event: &Value) -> Result<bool> {
+    let paths = CoordinatorStoragePaths::from_project_paths(project_paths);
+    let sqlite = SqliteStorage::new(paths);
+    sqlite.append_event(event)
 }
 
 pub fn apply_transition_sqlite(
     project_paths: &ProjectPaths,
     change: &TransitionMutation,
 ) -> Result<()> {
+    apply_transition_sqlite_with_event(project_paths, change, None)
+}
+
+pub fn apply_transition_sqlite_with_event(
+    project_paths: &ProjectPaths,
+    change: &TransitionMutation,
+    event: Option<&EventMutation>,
+) -> Result<()> {
     let paths = CoordinatorStoragePaths::from_project_paths(project_paths);
     let sqlite = SqliteStorage::new(paths);
-    sqlite.apply_transition(change)
+    sqlite.apply_transition_with_event(change, event)
 }
 
 pub fn set_runtime_sqlite(project_paths: &ProjectPaths, change: &RuntimeMutation) -> Result<()> {
+    set_runtime_sqlite_with_event(project_paths, change, None)
+}
+
+pub fn set_runtime_sqlite_with_event(
+    project_paths: &ProjectPaths,
+    change: &RuntimeMutation,
+    event: Option<&EventMutation>,
+) -> Result<()> {
     let paths = CoordinatorStoragePaths::from_project_paths(project_paths);
     let sqlite = SqliteStorage::new(paths);
-    sqlite.set_runtime(change)
+    sqlite.set_runtime_with_event(change, event)
 }
 
 pub fn set_merge_pending_sqlite(
@@ -1833,6 +2040,75 @@ mod tests {
         assert_eq!(baseline.registry, restored.registry);
         assert_eq!(baseline.events, restored.events);
         assert_eq!(baseline.cursor, restored.cursor);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn set_runtime_with_event_is_atomic_and_idempotent() {
+        let root = temp_project_root("macc_coord_storage_runtime_event");
+        let project_paths = ProjectPaths::from_root(&root);
+        let storage_paths = CoordinatorStoragePaths::from_project_paths(&project_paths);
+        seed_files(&storage_paths);
+
+        coordinator_storage_import_json_to_sqlite(&project_paths).unwrap();
+        let now = "2026-02-25T00:00:00Z".to_string();
+        let runtime = RuntimeMutation {
+            task_id: "TASK-1".to_string(),
+            runtime_status: "phase_done".to_string(),
+            phase: "dev".to_string(),
+            pid: None,
+            last_error: "".to_string(),
+            heartbeat_ts: now.clone(),
+            attempt: Some(1),
+            now: now.clone(),
+        };
+        let event = EventMutation {
+            event_id: Some("evt-runtime-done-1".to_string()),
+            seq: Some(42),
+            ts: Some(now.clone()),
+            source: "test".to_string(),
+            task_id: "TASK-1".to_string(),
+            event_type: "phase_result".to_string(),
+            phase: "dev".to_string(),
+            status: "done".to_string(),
+            payload: json!({"message":"phase done"}),
+        };
+        set_runtime_sqlite_with_event(&project_paths, &runtime, Some(&event)).unwrap();
+        set_runtime_sqlite_with_event(&project_paths, &runtime, Some(&event)).unwrap();
+
+        let snapshot = SqliteStorage::new(storage_paths).load_snapshot().unwrap();
+        let task = snapshot
+            .registry
+            .get("tasks")
+            .and_then(Value::as_array)
+            .and_then(|tasks| {
+                tasks.iter().find(|t| {
+                    t.get("id")
+                        .and_then(Value::as_str)
+                        .map(|id| id == "TASK-1")
+                        .unwrap_or(false)
+                })
+            })
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            task.get("task_runtime")
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str),
+            Some("phase_done")
+        );
+        let matching_events = snapshot
+            .events
+            .iter()
+            .filter(|e| {
+                e.get("event_id")
+                    .and_then(Value::as_str)
+                    .map(|id| id == "evt-runtime-done-1")
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(matching_events, 1, "event insert must stay idempotent");
 
         let _ = fs::remove_dir_all(root);
     }

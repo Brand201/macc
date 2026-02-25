@@ -12,7 +12,8 @@ use crate::{
 use macc_core::coordinator::engine as coordinator_engine;
 use macc_core::coordinator::WorkflowState;
 use macc_core::coordinator_storage::{
-    sync_coordinator_storage, CoordinatorStorageMode, CoordinatorStoragePhase,
+    coordinator_storage_export_sqlite_to_json, coordinator_storage_import_json_to_sqlite,
+    coordinator_storage_verify_parity, CoordinatorStorageMode,
 };
 use macc_core::{MaccError, Result};
 use std::path::Path;
@@ -45,6 +46,24 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
     }
     if action_name == "storage-sync" {
         coordinator_storage_sync_action(absolute_cwd, &input.extra_args)?;
+        return Ok(());
+    }
+    if action_name == "storage-import" {
+        let paths = macc_core::ProjectPaths::from_root(absolute_cwd);
+        coordinator_storage_import_json_to_sqlite(&paths)?;
+        println!("Coordinator storage import complete (json -> sqlite).");
+        return Ok(());
+    }
+    if action_name == "storage-export" {
+        let paths = macc_core::ProjectPaths::from_root(absolute_cwd);
+        coordinator_storage_export_sqlite_to_json(&paths)?;
+        println!("Coordinator storage export complete (sqlite -> json).");
+        return Ok(());
+    }
+    if action_name == "storage-verify" {
+        let paths = macc_core::ProjectPaths::from_root(absolute_cwd);
+        coordinator_storage_verify_parity(&paths)?;
+        println!("Coordinator storage parity OK (json == sqlite).");
         return Ok(());
     }
     if action_name == "select-ready-task" {
@@ -340,7 +359,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
             resolve_coordinator_storage_mode(&input.env_cfg, coordinator_cfg.as_ref())?;
         if storage_mode != CoordinatorStorageMode::Json {
             let storage_paths = macc_core::ProjectPaths::from_root(&paths.root);
-            sync_coordinator_storage(&storage_paths, storage_mode, CoordinatorStoragePhase::Pre)?;
+            coordinator_storage_import_json_to_sqlite(&storage_paths)?;
         }
         coordinator::control_plane::sync_registry_from_prd_native(
             &paths.root,
@@ -349,7 +368,18 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         )?;
         if storage_mode != CoordinatorStorageMode::Json {
             let storage_paths = macc_core::ProjectPaths::from_root(&paths.root);
-            sync_coordinator_storage(&storage_paths, storage_mode, CoordinatorStoragePhase::Post)?;
+            if std::env::var("COORDINATOR_JSON_COMPAT")
+                .ok()
+                .map(|raw| {
+                    !matches!(
+                        raw.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "no" | "off"
+                    )
+                })
+                .unwrap_or(false)
+            {
+                coordinator_storage_export_sqlite_to_json(&storage_paths)?;
+            }
         }
     } else if action_name == "reconcile" {
         if !input.extra_args.is_empty() {

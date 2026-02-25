@@ -1,10 +1,11 @@
 use macc_core::coordinator_storage::{
-    apply_transition_sqlite, increment_retries_sqlite, set_merge_pending_sqlite,
-    set_merge_processed_sqlite, set_runtime_sqlite, sync_coordinator_storage,
+    coordinator_storage_export_sqlite_to_json,
+    increment_retries_sqlite, set_merge_pending_sqlite, set_merge_processed_sqlite,
     upsert_slo_warning_sqlite, CoordinatorSnapshot, CoordinatorStorage, CoordinatorStorageMode,
-    CoordinatorStoragePaths, CoordinatorStoragePhase, JsonStorage, MergePendingMutation,
+    CoordinatorStoragePaths, EventMutation, JsonStorage, MergePendingMutation,
     MergeProcessedMutation, RetryIncrementMutation, RuntimeMutation, SloWarningMutation,
-    SqliteStorage, TransitionMutation,
+    SqliteStorage, TransitionMutation, apply_transition_sqlite_with_event,
+    set_runtime_sqlite_with_event,
 };
 use macc_core::{MaccError, ProjectPaths, Result};
 use serde_json::{json, Value};
@@ -25,6 +26,7 @@ pub fn coordinator_state_apply_transition(
     let storage_mode = resolve_storage_mode(args)?;
     if storage_mode != CoordinatorStorageMode::Json {
         let paths = ProjectPaths::from_root(repo_root);
+        let event = parse_optional_event_mutation(args, &task_id, &new_state)?;
         let change = TransitionMutation {
             task_id: task_id.clone(),
             new_state: new_state.clone(),
@@ -33,13 +35,9 @@ pub fn coordinator_state_apply_transition(
             reason,
             now,
         };
-        apply_transition_sqlite(&paths, &change)?;
+        apply_transition_sqlite_with_event(&paths, &change, event.as_ref())?;
         if should_mirror_json(args) {
-            sync_coordinator_storage(
-                &paths,
-                CoordinatorStorageMode::Sqlite,
-                CoordinatorStoragePhase::Pre,
-            )?;
+            coordinator_storage_export_sqlite_to_json(&paths)?;
         }
         return Ok(());
     }
@@ -116,6 +114,7 @@ pub fn coordinator_state_set_runtime(
     let storage_mode = resolve_storage_mode(args)?;
     if storage_mode != CoordinatorStorageMode::Json {
         let paths = ProjectPaths::from_root(repo_root);
+        let event = parse_optional_event_mutation(args, &task_id, &runtime_status)?;
         let change = RuntimeMutation {
             task_id: task_id.clone(),
             runtime_status: runtime_status.clone(),
@@ -134,13 +133,9 @@ pub fn coordinator_state_set_runtime(
             },
             now,
         };
-        set_runtime_sqlite(&paths, &change)?;
+        set_runtime_sqlite_with_event(&paths, &change, event.as_ref())?;
         if should_mirror_json(args) {
-            sync_coordinator_storage(
-                &paths,
-                CoordinatorStorageMode::Sqlite,
-                CoordinatorStoragePhase::Pre,
-            )?;
+            coordinator_storage_export_sqlite_to_json(&paths)?;
         }
         return Ok(());
     }
@@ -382,7 +377,7 @@ pub fn coordinator_state_save_snapshot(
         CoordinatorStorageMode::DualWrite | CoordinatorStorageMode::Sqlite => {
             SqliteStorage::new(store_paths.clone()).save_snapshot(snapshot)?;
             if should_mirror_json(args) {
-                sync_coordinator_storage(&project_paths, CoordinatorStorageMode::Sqlite, CoordinatorStoragePhase::Pre)?;
+                coordinator_storage_export_sqlite_to_json(&project_paths)?;
             }
         }
     }
@@ -431,11 +426,7 @@ pub fn coordinator_state_set_merge_pending(
     };
     set_merge_pending_sqlite(&paths, &change)?;
     if should_mirror_json(args) {
-        sync_coordinator_storage(
-            &paths,
-            CoordinatorStorageMode::Sqlite,
-            CoordinatorStoragePhase::Pre,
-        )?;
+        coordinator_storage_export_sqlite_to_json(&paths)?;
     }
     Ok(())
 }
@@ -459,11 +450,7 @@ pub fn coordinator_state_set_merge_processed(
     };
     set_merge_processed_sqlite(&paths, &change)?;
     if should_mirror_json(args) {
-        sync_coordinator_storage(
-            &paths,
-            CoordinatorStorageMode::Sqlite,
-            CoordinatorStoragePhase::Pre,
-        )?;
+        coordinator_storage_export_sqlite_to_json(&paths)?;
     }
     Ok(())
 }
@@ -478,11 +465,7 @@ pub fn coordinator_state_increment_retries(
     let change = RetryIncrementMutation { task_id, now };
     increment_retries_sqlite(&paths, &change)?;
     if should_mirror_json(args) {
-        sync_coordinator_storage(
-            &paths,
-            CoordinatorStorageMode::Sqlite,
-            CoordinatorStoragePhase::Pre,
-        )?;
+        coordinator_storage_export_sqlite_to_json(&paths)?;
     }
     Ok(())
 }
@@ -512,11 +495,7 @@ pub fn coordinator_state_upsert_slo_warning(
     };
     upsert_slo_warning_sqlite(&paths, &change)?;
     if should_mirror_json(args) {
-        sync_coordinator_storage(
-            &paths,
-            CoordinatorStorageMode::Sqlite,
-            CoordinatorStoragePhase::Pre,
-        )?;
+        coordinator_storage_export_sqlite_to_json(&paths)?;
     }
     Ok(())
 }
@@ -604,7 +583,9 @@ pub fn coordinator_state_registry_save(
         }
         CoordinatorStorageMode::DualWrite | CoordinatorStorageMode::Sqlite => {
             SqliteStorage::new(store_paths.clone()).save_snapshot(&snapshot)?;
-            let _ = JsonStorage::new(store_paths).save_snapshot(&snapshot);
+            if should_mirror_json(args) {
+                let _ = JsonStorage::new(store_paths).save_snapshot(&snapshot);
+            }
         }
     }
     Ok(())
@@ -780,33 +761,27 @@ fn load_snapshot_view(
         CoordinatorStorageMode::Json => JsonStorage::new(store_paths).load_snapshot(),
         CoordinatorStorageMode::DualWrite | CoordinatorStorageMode::Sqlite => {
             let sqlite = SqliteStorage::new(store_paths.clone()).load_snapshot();
-            let json = JsonStorage::new(store_paths).load_snapshot();
-            match (sqlite, json) {
-                (Ok(sqlite_snapshot), Ok(json_snapshot)) => {
-                    let sqlite_len = sqlite_snapshot
-                        .registry
-                        .get("tasks")
-                        .and_then(Value::as_array)
-                        .map(|v| v.len())
-                        .unwrap_or(0);
-                    let json_len = json_snapshot
-                        .registry
-                        .get("tasks")
-                        .and_then(Value::as_array)
-                        .map(|v| v.len())
-                        .unwrap_or(0);
-                    if sqlite_len == 0 && json_len > 0 {
-                        Ok(json_snapshot)
-                    } else {
-                        Ok(sqlite_snapshot)
-                    }
+            match sqlite {
+                Ok(snapshot) => Ok(snapshot),
+                Err(sql_err) if allow_legacy_json_fallback(args) => {
+                    JsonStorage::new(store_paths).load_snapshot().or(Err(sql_err))
                 }
-                (Ok(snapshot), Err(_)) => Ok(snapshot),
-                (Err(_), Ok(snapshot)) => Ok(snapshot),
-                (Err(sql_err), Err(_)) => Err(sql_err),
+                Err(sql_err) => Err(sql_err),
             }
         }
     }
+}
+
+fn allow_legacy_json_fallback(args: &BTreeMap<String, String>) -> bool {
+    let raw = args
+        .get("legacy-json-fallback")
+        .cloned()
+        .or_else(|| std::env::var("COORDINATOR_LEGACY_JSON_FALLBACK").ok())
+        .unwrap_or_else(|| "0".to_string());
+    !matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 fn extract_task_field_value(task: &Value, field_expr: &str) -> Option<String> {
@@ -873,4 +848,56 @@ fn extract_task_field_value(task: &Value, field_expr: &str) -> Option<String> {
             None
         }
     }
+}
+
+fn parse_optional_event_mutation(
+    args: &BTreeMap<String, String>,
+    default_task_id: &str,
+    default_status: &str,
+) -> Result<Option<EventMutation>> {
+    let event_type = args.get("event-type").cloned().unwrap_or_default();
+    if event_type.trim().is_empty() {
+        return Ok(None);
+    }
+    let event_task_id = args
+        .get("event-task-id")
+        .cloned()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default_task_id.to_string());
+    let event_status = args
+        .get("event-status")
+        .cloned()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default_status.to_string());
+    let event_phase = args.get("event-phase").cloned().unwrap_or_default();
+    let event_source = args
+        .get("event-source")
+        .cloned()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "coordinator:native:state".to_string());
+    let payload = match args.get("event-payload-json").cloned() {
+        Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<Value>(&raw).map_err(|e| {
+            MaccError::Validation(format!("Invalid --event-payload-json: {}", e))
+        })?,
+        _ => {
+            let msg = args.get("event-message").cloned().unwrap_or_default();
+            if msg.is_empty() {
+                json!({})
+            } else {
+                json!({ "message": msg })
+            }
+        }
+    };
+    let seq = args.get("event-seq").and_then(|v| v.parse::<i64>().ok());
+    Ok(Some(EventMutation {
+        event_id: args.get("event-id").cloned(),
+        seq,
+        ts: args.get("event-ts").cloned(),
+        source: event_source,
+        task_id: event_task_id,
+        event_type,
+        phase: event_phase,
+        status: event_status,
+        payload,
+    }))
 }
