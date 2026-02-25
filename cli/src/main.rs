@@ -2893,6 +2893,17 @@ fn cleanup_dead_runtime_tasks_in_registry(
         .ok()
         .and_then(|raw| raw.trim().parse::<i64>().ok())
         .unwrap_or(60);
+    if let Some(root) = repo_root {
+        let refreshed = refresh_candidate_heartbeats_from_events(
+            registry,
+            root,
+            heartbeat_grace_seconds,
+            logger,
+        )?;
+        if refreshed > 0 {
+            set_registry_updated_at(registry);
+        }
+    }
     let cleaned = coordinator_engine::cleanup_dead_runtime_tasks_in_registry_with(
         registry,
         &now,
@@ -2920,6 +2931,150 @@ fn cleanup_dead_runtime_tasks_in_registry(
         }
     }
     Ok(fixed)
+}
+
+fn refresh_candidate_heartbeats_from_events(
+    registry: &mut serde_json::Value,
+    repo_root: &std::path::Path,
+    heartbeat_grace_seconds: i64,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<usize> {
+    if heartbeat_grace_seconds <= 0 {
+        return Ok(0);
+    }
+    let Some(tasks) = registry.get("tasks").and_then(serde_json::Value::as_array) else {
+        return Ok(0);
+    };
+    let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for task in tasks {
+        let id = task
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let pid = task
+            .get("task_runtime")
+            .and_then(|v| v.get("pid"))
+            .and_then(serde_json::Value::as_i64);
+        let runtime_status = task
+            .get("task_runtime")
+            .and_then(|v| v.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !id.is_empty()
+            && pid.is_some()
+            && runtime_status == RuntimeStatus::Running.as_str()
+            && !is_pid_running(pid.unwrap_or_default())
+        {
+            candidates.insert(id.to_string());
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    let events_path = repo_root
+        .join(".macc")
+        .join("log")
+        .join("coordinator")
+        .join("events.jsonl");
+    if !events_path.exists() {
+        return Ok(0);
+    }
+    let run_id = std::env::var("COORDINATOR_RUN_ID").ok();
+    let now_ts = chrono::DateTime::parse_from_rfc3339(&now_iso_coordinator())
+        .ok()
+        .map(|dt| dt.timestamp())
+        .unwrap_or_default();
+    let raw = std::fs::read_to_string(&events_path).map_err(|e| MaccError::Io {
+        path: events_path.to_string_lossy().into(),
+        action: "read coordinator events for heartbeat grace".into(),
+        source: e,
+    })?;
+    let mut latest_by_task: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if let Some(expected_run_id) = run_id.as_deref() {
+            let event_run_id = event
+                .get("run_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !event_run_id.is_empty() && event_run_id != expected_run_id {
+                continue;
+            }
+        }
+        let event_type = event
+            .get("type")
+            .or_else(|| event.get("event"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if event_type != "heartbeat" {
+            continue;
+        }
+        let task_id = event
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !candidates.contains(task_id) {
+            continue;
+        }
+        let ts = event
+            .get("ts")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let Some(parsed) = chrono::DateTime::parse_from_rfc3339(ts).ok() else {
+            continue;
+        };
+        if now_ts.saturating_sub(parsed.timestamp()) > heartbeat_grace_seconds {
+            continue;
+        }
+        let entry = latest_by_task
+            .entry(task_id.to_string())
+            .or_insert_with(|| ts.to_string());
+        let existing_ts = chrono::DateTime::parse_from_rfc3339(entry)
+            .ok()
+            .map(|dt| dt.timestamp())
+            .unwrap_or_default();
+        if parsed.timestamp() > existing_ts {
+            *entry = ts.to_string();
+        }
+    }
+    if latest_by_task.is_empty() {
+        return Ok(0);
+    }
+    let mut updated = 0usize;
+    if let Some(tasks_mut) = registry
+        .get_mut("tasks")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for task in tasks_mut.iter_mut() {
+            let id = task
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let Some(ts) = latest_by_task.get(&id) else {
+                continue;
+            };
+            coordinator_engine::ensure_runtime_object(task);
+            task["task_runtime"]["last_heartbeat"] = serde_json::Value::String(ts.clone());
+            updated += 1;
+        }
+    }
+    if updated > 0 {
+        if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Refreshed {} candidate heartbeat(s) from events before ghost cleanup",
+                updated
+            ));
+        }
+    }
+    Ok(updated)
 }
 
 fn cleanup_dead_runtime_tasks(
