@@ -130,6 +130,72 @@ For production-like usage, the recommended sequence is:
   - `.macc/log/coordinator/`
   - `.macc/log/performer/`
 
+#### 3.4.4.1 Coordinator mechanism (end-to-end diagram)
+
+```mermaid
+flowchart TD
+    A["macc coordinator"] --> B["TUI Coordinator Live + run loop"]
+    B --> C["Load config + PRD + registry (SQLite source of truth)"]
+    C --> D["Select ready tasks (priority/dependencies/exclusive_resources)"]
+    D --> E{"Reusable clean worktree available?"}
+    E -- Yes --> F["Reuse worktree slot"]
+    E -- No --> G["Create new worktree slot (<= Max Parallel)"]
+    F --> H["Ensure branch merged guard + checkout base + create new task branch"]
+    G --> H
+    H --> I["Write worktree.prd.json + sync context files + tool.json"]
+    I --> J["Spawn performer (phase=dev)"]
+    J --> K["Stream events (heartbeat/progress/phase_result/commit_created)"]
+    K --> L["Advance FSM: dev -> review -> fix (optional) -> integrate -> merge"]
+    L --> M{"Local merge success?"}
+    M -- Yes --> N["Task -> merged"]
+    M -- No --> O["AI merge-fix policy"]
+    O --> P{"Still failing?"}
+    P -- Yes --> Q["Pause coordinator (blocking) + wait resume signal"]
+    P -- No --> N
+    N --> R["Best-effort branch cleanup (warning if skipped/deferred)"]
+    R --> S["Maintenance queue retry for deferred cleanup"]
+    S --> T{"No todo and no active?"}
+    T -- No --> D
+    T -- Yes --> U["Run complete"]
+```
+
+```mermaid
+sequenceDiagram
+    participant U as User/TUI
+    participant C as Coordinator
+    participant W as Worktree
+    participant P as Performer
+    participant R as Reviewer
+    participant G as Git
+
+    U->>C: Start run
+    C->>C: Select ready task
+    C->>W: Reuse/create slot + create task branch from base
+    C->>W: Write worktree.prd.json + sync context files
+    C->>P: Launch dev phase
+    P-->>C: heartbeat/progress
+    P-->>C: phase_result(done) + commit_created
+    C->>R: Launch review phase on same worktree branch
+    R-->>C: review_done (OK / changes requested)
+    alt changes requested
+        C->>P: Launch fix phase
+        P-->>C: phase_result(done)
+    end
+    C->>C: integrate phase
+    C->>G: Merge task branch into base
+    alt merge conflict
+        C->>G: AI merge-fix attempt
+        alt still failing
+            C-->>U: Pause (blocking) + wait resume
+        else resolved
+            C->>C: Continue
+        end
+    else merge success
+        C->>G: Branch cleanup (best effort)
+        C->>C: Queue deferred cleanup for maintenance retry
+    end
+```
+
 #### 3.4.5 Failure recovery
 Standard recovery sequence:
 1) `macc coordinator status`

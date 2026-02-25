@@ -24,7 +24,7 @@ task_log_file=""
 EVENT_FILE="${COORD_EVENTS_FILE:-}"
 EVENT_SOURCE="${MACC_EVENT_SOURCE:-}"
 EVENT_TASK_ID="${MACC_EVENT_TASK_ID:-}"
-EVENT_RUN_ID="$(date +%s%N)-$$"
+EVENT_RUN_ID="${COORDINATOR_RUN_ID:-$(date +%s%N)-$$}"
 EVENT_SEQ=0
 EVENT_SEQ_FILE=""
 HEARTBEAT_PID=""
@@ -197,6 +197,7 @@ emit_performer_event() {
   jq -nc \
     --arg schema_version "1" \
     --arg event_id "${EVENT_TASK_ID}-${seq}-$(date +%s%N)" \
+    --arg run_id "$EVENT_RUN_ID" \
     --argjson seq "$seq" \
     --arg ts "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
     --arg source "$EVENT_SOURCE" \
@@ -208,6 +209,7 @@ emit_performer_event() {
     '{
       schema_version:$schema_version,
       event_id:$event_id,
+      run_id:$run_id,
       seq:$seq,
       ts:$ts,
       source:$source,

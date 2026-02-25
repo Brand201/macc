@@ -891,6 +891,7 @@ fn parse_optional_event_mutation(
     let seq = args.get("event-seq").and_then(|v| v.parse::<i64>().ok());
     Ok(Some(EventMutation {
         event_id: args.get("event-id").cloned(),
+        run_id: args.get("event-run-id").cloned(),
         seq,
         ts: args.get("event-ts").cloned(),
         source: event_source,

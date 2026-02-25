@@ -47,6 +47,7 @@ pub struct CoordinatorRunState {
     pub events_cursor_offset: u64,
     pub last_heartbeat_log_at: Option<std::time::Instant>,
     pub heartbeat_updates_since_log: usize,
+    pub dispatch_retry_not_before: HashMap<String, std::time::Instant>,
 }
 
 pub trait PhaseExecutor {
@@ -75,6 +76,7 @@ impl CoordinatorRunState {
             events_cursor_offset: 0,
             last_heartbeat_log_at: None,
             heartbeat_updates_since_log: 0,
+            dispatch_retry_not_before: HashMap::new(),
         }
     }
 }
@@ -254,6 +256,16 @@ pub fn spawn_performer_job(
     run_cmd
         .current_dir(repo_root)
         .env("COORD_EVENTS_FILE", events_file.to_string_lossy().to_string())
+        .env(
+            "COORDINATOR_RUN_ID",
+            std::env::var("COORDINATOR_RUN_ID").unwrap_or_else(|_| {
+                format!(
+                    "run-{}-{}",
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+                    std::process::id()
+                )
+            }),
+        )
         .env("MACC_EVENT_SOURCE", event_source.clone())
         .env("MACC_EVENT_TASK_ID", task_id)
         .arg("--cwd")

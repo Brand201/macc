@@ -705,11 +705,16 @@ fn should_auto_retry_error_code(
 pub fn cleanup_dead_runtime_tasks_in_registry_with<F>(
     registry: &mut Value,
     now: &str,
+    heartbeat_grace_seconds: i64,
     mut is_pid_running: F,
 ) -> Result<Vec<DeadRuntimeCleanupEntry>>
 where
     F: FnMut(i64) -> bool,
 {
+    let now_ts = chrono::DateTime::parse_from_rfc3339(now)
+        .ok()
+        .map(|dt| dt.timestamp())
+        .unwrap_or_default();
     let mut cleaned = Vec::new();
     let tasks = registry
         .get_mut("tasks")
@@ -723,6 +728,16 @@ where
         let runtime_status = task["task_runtime"]["status"].as_str().unwrap_or_default();
         if runtime_status != RuntimeStatus::Running.as_str() || is_pid_running(pid) {
             continue;
+        }
+        if heartbeat_grace_seconds > 0 {
+            let within_grace = task["task_runtime"]["last_heartbeat"]
+                .as_str()
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                .map(|dt| now_ts.saturating_sub(dt.timestamp()) <= heartbeat_grace_seconds)
+                .unwrap_or(false);
+            if within_grace {
+                continue;
+            }
         }
 
         let task_id = task
@@ -965,6 +980,7 @@ mod tests {
         let cleaned = cleanup_dead_runtime_tasks_in_registry_with(
             &mut registry,
             "2026-02-21T00:00:00Z",
+            0,
             |_| false,
         )
         .unwrap();
@@ -973,6 +989,34 @@ mod tests {
         assert!(registry["tasks"][0]["assignee"].is_null());
         assert_eq!(registry["tasks"][0]["task_runtime"]["status"], "stale");
         assert!(registry["tasks"][0]["task_runtime"]["pid"].is_null());
+    }
+
+    #[test]
+    fn cleanup_dead_runtime_tasks_respects_recent_heartbeat_grace() {
+        let mut registry = json!({
+            "tasks": [{
+                "id":"T4b",
+                "state":"claimed",
+                "assignee":"agentA",
+                "task_runtime":{
+                    "status":"running",
+                    "current_phase":"dev",
+                    "pid":999,
+                    "last_heartbeat":"2026-02-21T00:00:30Z"
+                }
+            }]
+        });
+        let cleaned = cleanup_dead_runtime_tasks_in_registry_with(
+            &mut registry,
+            "2026-02-21T00:01:00Z",
+            60,
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(cleaned.len(), 0);
+        assert_eq!(registry["tasks"][0]["state"], "claimed");
+        assert_eq!(registry["tasks"][0]["task_runtime"]["status"], "running");
+        assert_eq!(registry["tasks"][0]["task_runtime"]["pid"], 999);
     }
 
     #[test]

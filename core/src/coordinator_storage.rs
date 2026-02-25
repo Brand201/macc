@@ -190,6 +190,7 @@ pub struct SloWarningMutation {
 #[derive(Debug, Clone)]
 pub struct EventMutation {
     pub event_id: Option<String>,
+    pub run_id: Option<String>,
     pub seq: Option<i64>,
     pub ts: Option<String>,
     pub source: String,
@@ -322,6 +323,10 @@ impl SqliteStorage {
                 .get("event_id")
                 .and_then(|v| v.as_str())
                 .map(|v| v.to_string()),
+            run_id: event
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
             seq: event.get("seq").and_then(|v| v.as_i64()),
             ts: event.get("ts").and_then(|v| v.as_str()).map(|v| v.to_string()),
             source: event
@@ -368,6 +373,19 @@ impl SqliteStorage {
             .seq
             .unwrap_or_else(|| Utc::now().timestamp_nanos_opt().unwrap_or_default());
         let ts = event.ts.as_deref().unwrap_or(now.as_str());
+        let run_id = event
+            .run_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("COORDINATOR_RUN_ID").ok())
+            .unwrap_or_else(|| {
+                format!(
+                    "run-{}-{}",
+                    Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+                    std::process::id()
+                )
+            });
         let event_id = event
             .event_id
             .as_deref()
@@ -380,6 +398,7 @@ impl SqliteStorage {
         let raw_json = serde_json::to_string(&json!({
             "schema_version":"1",
             "event_id": event_id,
+            "run_id": run_id,
             "seq": seq,
             "ts": ts,
             "source": event.source,
@@ -2065,6 +2084,7 @@ mod tests {
         };
         let event = EventMutation {
             event_id: Some("evt-runtime-done-1".to_string()),
+            run_id: Some("run-test".to_string()),
             seq: Some(42),
             ts: Some(now.clone()),
             source: "test".to_string(),

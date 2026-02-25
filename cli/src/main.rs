@@ -1282,6 +1282,7 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                         "COORD_EVENTS_FILE",
                         events_file.to_string_lossy().to_string(),
                     )
+                    .env("COORDINATOR_RUN_ID", ensure_coordinator_run_id())
                     .env(
                         "MACC_EVENT_SOURCE",
                         format!(
@@ -2888,9 +2889,14 @@ fn cleanup_dead_runtime_tasks_in_registry(
     repo_root: Option<&std::path::Path>,
 ) -> Result<usize> {
     let now = now_iso_coordinator();
+    let heartbeat_grace_seconds = std::env::var("COORDINATOR_GHOST_HEARTBEAT_GRACE_SECONDS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(60);
     let cleaned = coordinator_engine::cleanup_dead_runtime_tasks_in_registry_with(
         registry,
         &now,
+        heartbeat_grace_seconds,
         is_pid_running,
     )?;
     let fixed = cleaned.len();
@@ -3081,6 +3087,34 @@ fn can_reuse_worktree_slot(registry: &serde_json::Value, worktree_path: &std::pa
     !seen || all_merged
 }
 
+fn has_in_progress_or_queued_on_worktree(
+    registry: &serde_json::Value,
+    worktree_path: &std::path::Path,
+) -> bool {
+    let key = worktree_path.to_string_lossy().to_string();
+    registry
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .map(|tasks| {
+            tasks.iter().any(|task| {
+                let state = task
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("todo");
+                if !matches!(state, "in_progress" | "queued") {
+                    return false;
+                }
+                let path = task
+                    .get("worktree")
+                    .and_then(|w| w.get("worktree_path"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                path == key
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn write_worktree_metadata_file(
     worktree_path: &std::path::Path,
     metadata: &macc_core::WorktreeMetadata,
@@ -3122,21 +3156,6 @@ fn build_reuse_branch_name(tool: &str, worktree_path: &std::path::Path) -> Strin
     )
 }
 
-fn git_rev_parse(worktree_path: &std::path::Path, rev: &str) -> Option<String> {
-    std::process::Command::new("git")
-        .current_dir(worktree_path)
-        .args(["rev-parse", rev])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })
-}
-
 fn git_current_branch_name(worktree_path: &std::path::Path) -> Option<String> {
     std::process::Command::new("git")
         .current_dir(worktree_path)
@@ -3156,71 +3175,85 @@ fn prepare_reused_worktree_base(
     worktree_path: &std::path::Path,
     base_branch: &str,
 ) -> Result<(bool, bool)> {
-    let Some(base_head) = git_rev_parse(worktree_path, base_branch) else {
-        return Ok((false, false));
-    };
-    let current_head = git_rev_parse(worktree_path, "HEAD").unwrap_or_default();
-    let current_branch = git_current_branch_name(worktree_path).unwrap_or_default();
-    if current_branch == base_branch && current_head == base_head {
-        // Remove residual untracked artifacts (e.g. __pycache__) so the slot is reusable.
-        let cleaned = std::process::Command::new("git")
+    fn run_git_status_ok(
+        worktree_path: &std::path::Path,
+        action: &str,
+        args: &[&str],
+    ) -> Result<bool> {
+        let status = std::process::Command::new("git")
             .current_dir(worktree_path)
-            .args(["clean", "-fd"])
+            .args(args)
             .status()
             .map_err(|e| MaccError::Io {
                 path: worktree_path.to_string_lossy().into(),
-                action: "clean reused worktree artifacts".into(),
+                action: action.to_string(),
                 source: e,
             })?;
-        return Ok((cleaned.success(), true));
+        Ok(status.success())
     }
-    let checkout = std::process::Command::new("git")
-        .current_dir(worktree_path)
-        .args(["checkout", base_branch])
-        .status()
-        .map_err(|e| MaccError::Io {
-            path: worktree_path.to_string_lossy().into(),
-            action: "checkout base branch in reused worktree".into(),
-            source: e,
-        })?;
-    if !checkout.success() {
+
+    // Stateless worktree reuse policy:
+    // always hard reset + clean before switching to the next task branch.
+    if !run_git_status_ok(
+        worktree_path,
+        "reset reused worktree tracked changes",
+        &["reset", "--hard", "HEAD"],
+    )? {
         return Ok((false, false));
     }
-    let checked_out_head = git_rev_parse(worktree_path, "HEAD").unwrap_or_default();
-    if checked_out_head == base_head {
-        let cleaned = std::process::Command::new("git")
-            .current_dir(worktree_path)
-            .args(["clean", "-fd"])
-            .status()
-            .map_err(|e| MaccError::Io {
-                path: worktree_path.to_string_lossy().into(),
-                action: "clean reused worktree artifacts".into(),
-                source: e,
-            })?;
-        return Ok((cleaned.success(), true));
-    }
-    let reset = std::process::Command::new("git")
-        .current_dir(worktree_path)
-        .args(["reset", "--hard", base_branch])
-        .status()
-        .map_err(|e| MaccError::Io {
-            path: worktree_path.to_string_lossy().into(),
-            action: "reset reused worktree to base branch".into(),
-            source: e,
-        })?;
-    if !reset.success() {
+    if !run_git_status_ok(
+        worktree_path,
+        "clean reused worktree artifacts",
+        &["clean", "-fd"],
+    )? {
         return Ok((false, false));
     }
-    let cleaned = std::process::Command::new("git")
-        .current_dir(worktree_path)
-        .args(["clean", "-fd"])
-        .status()
-        .map_err(|e| MaccError::Io {
-            path: worktree_path.to_string_lossy().into(),
-            action: "clean reused worktree artifacts".into(),
-            source: e,
-        })?;
-    Ok((cleaned.success(), false))
+
+    if !run_git_status_ok(
+        worktree_path,
+        "checkout base branch in reused worktree",
+        &["checkout", base_branch],
+    )? && !run_git_status_ok(
+        worktree_path,
+        "checkout reset base branch in reused worktree",
+        &["checkout", "-B", base_branch, base_branch],
+    )? {
+        return Ok((false, false));
+    }
+
+    // Stateless reuse policy: sync refs then force-reset to base.
+    if !run_git_status_ok(
+        worktree_path,
+        "fetch refs in reused worktree",
+        &["fetch"],
+    )? {
+        return Ok((false, false));
+    }
+    if !run_git_status_ok(
+        worktree_path,
+        "force reset reused worktree to base branch",
+        &["reset", "--hard", base_branch],
+    )? {
+        return Ok((false, false));
+    }
+
+    // Final nuke to guarantee a pristine state for the next task branch.
+    if !run_git_status_ok(
+        worktree_path,
+        "reset reused worktree to refreshed base branch",
+        &["reset", "--hard", "HEAD"],
+    )? {
+        return Ok((false, false));
+    }
+    if !run_git_status_ok(
+        worktree_path,
+        "clean reused worktree artifacts",
+        &["clean", "-fd"],
+    )? {
+        return Ok((false, false));
+    }
+
+    Ok((true, false))
 }
 
 fn is_branch_merged_into_base(worktree_path: &std::path::Path, branch: &str, base_branch: &str) -> bool {
@@ -3249,10 +3282,14 @@ pub(crate) fn find_reusable_worktree_native(
     registry: &serde_json::Value,
     tool: &str,
     base_branch: &str,
-) -> Result<Option<(std::path::PathBuf, String, String, bool)>> {
+) -> Result<(
+    Option<(std::path::PathBuf, String, String, bool, bool)>,
+    Option<(String, String)>,
+)> {
     let active_paths = active_task_worktree_paths(registry);
     let pool_root = repo_root.join(".macc").join("worktree");
     let entries = macc_core::list_worktrees(repo_root)?;
+    let mut last_prepare_error: Option<(String, String)> = None;
     for entry in entries {
         if !entry.path.starts_with(&pool_root) {
             continue;
@@ -3264,7 +3301,15 @@ pub(crate) fn find_reusable_worktree_native(
         if !can_reuse_worktree_slot(registry, &entry.path) {
             continue;
         }
-        if !is_worktree_clean(&entry.path)? {
+        let dirty_before = !is_worktree_clean(&entry.path)?;
+        if dirty_before && has_in_progress_or_queued_on_worktree(registry, &entry.path) {
+            last_prepare_error = Some((
+                "dirty_inflight_guard".to_string(),
+                format!(
+                    "worktree {} is dirty and still assigned to an in_progress/queued task",
+                    entry.path.display()
+                ),
+            ));
             continue;
         }
         let merge_head = std::process::Command::new("git")
@@ -3274,6 +3319,10 @@ pub(crate) fn find_reusable_worktree_native(
             .map(|s| s.success())
             .unwrap_or(false);
         if merge_head {
+            last_prepare_error = Some((
+                "merge_head_present".to_string(),
+                format!("worktree {} has unresolved MERGE_HEAD", entry.path.display()),
+            ));
             continue;
         }
         let base_ok = std::process::Command::new("git")
@@ -3283,19 +3332,48 @@ pub(crate) fn find_reusable_worktree_native(
             .map(|s| s.success())
             .unwrap_or(false);
         if !base_ok {
+            last_prepare_error = Some((
+                "base_branch_missing".to_string(),
+                format!(
+                    "worktree {} cannot resolve base branch {}",
+                    entry.path.display(),
+                    base_branch
+                ),
+            ));
             continue;
         }
 
         let previous_branch = git_current_branch_name(&entry.path).unwrap_or_default();
         if !is_branch_merged_into_base(&entry.path, &previous_branch, base_branch) {
+            last_prepare_error = Some((
+                "previous_branch_not_merged".to_string(),
+                format!(
+                    "worktree {} branch {} is not merged into {}",
+                    entry.path.display(),
+                    previous_branch,
+                    base_branch
+                ),
+            ));
             continue;
         }
 
         let (prepared, skipped_reset) = prepare_reused_worktree_base(&entry.path, base_branch)?;
         if !prepared {
+            last_prepare_error = Some((
+                "sanitize_failed".to_string(),
+                format!(
+                    "sanitize failed for worktree {} on base {}",
+                    entry.path.display(),
+                    base_branch
+                ),
+            ));
             continue;
         }
         if !is_worktree_clean(&entry.path)? {
+            last_prepare_error = Some((
+                "sanitize_dirty_after".to_string(),
+                format!("sanitize left worktree {} dirty", entry.path.display()),
+            ));
             continue;
         }
 
@@ -3324,6 +3402,14 @@ pub(crate) fn find_reusable_worktree_native(
                 source: e,
             })?;
         if !status.success() {
+            last_prepare_error = Some((
+                "checkout_new_branch_failed".to_string(),
+                format!(
+                    "failed to create branch {} in reused worktree {}",
+                    branch,
+                    entry.path.display()
+                ),
+            ));
             continue;
         }
         if !previous_branch.is_empty() && previous_branch != base_branch && previous_branch != branch
@@ -3370,9 +3456,15 @@ pub(crate) fn find_reusable_worktree_native(
             branch: branch.clone(),
         };
         write_worktree_metadata_file(&entry.path, &updated)?;
-        return Ok(Some((entry.path, branch, last_commit, skipped_reset)));
+        return Ok((Some((
+            entry.path,
+            branch,
+            last_commit,
+            skipped_reset,
+            dirty_before,
+        )), None));
     }
-    Ok(None)
+    Ok((None, last_prepare_error))
 }
 
 pub(crate) fn count_pool_worktrees(repo_root: &std::path::Path) -> Result<usize> {
@@ -3499,6 +3591,7 @@ pub(crate) fn append_coordinator_event_with_severity(
     message: &str,
     severity: &str,
 ) -> Result<()> {
+    let run_id = ensure_coordinator_run_id();
     let events_path = repo_root
         .join(".macc")
         .join("log")
@@ -3516,6 +3609,7 @@ pub(crate) fn append_coordinator_event_with_severity(
     let payload = serde_json::json!({
         "schema_version":"1",
         "event_id": format!("evt-{}-{}-{}", event_type, task_id, seq),
+        "run_id": run_id,
         "seq": seq,
         "ts": now,
         "source": "coordinator:native",
@@ -3553,6 +3647,22 @@ pub(crate) fn append_coordinator_event_with_severity(
         source: e,
     })?;
     Ok(())
+}
+
+fn ensure_coordinator_run_id() -> String {
+    if let Ok(existing) = std::env::var("COORDINATOR_RUN_ID") {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let generated = format!(
+        "run-{}-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        std::process::id()
+    );
+    std::env::set_var("COORDINATOR_RUN_ID", &generated);
+    generated
 }
 
 fn merge_task_with_policy_native(
@@ -4543,6 +4653,16 @@ async fn run_coordinator_control_plane_rust_async(
     coordinator: Option<&macc_core::config::CoordinatorConfig>,
     env_cfg: &CoordinatorEnvConfig,
 ) -> Result<()> {
+    let run_id = ensure_coordinator_run_id();
+    let _ = append_coordinator_event_with_severity(
+        repo_root,
+        "command_start",
+        "-",
+        "run",
+        "started",
+        &format!("Coordinator run started (run_id={})", run_id),
+        "info",
+    );
     let prd_file = env_cfg
         .prd
         .as_ref()
@@ -4597,6 +4717,17 @@ async fn run_coordinator_control_plane_rust_async(
     };
     let run_result = coordinator_engine::run_control_plane(&mut backend, loop_cfg).await;
     if run_result.is_err() {
+        if let Err(err) = &run_result {
+            let _ = append_coordinator_event_with_severity(
+                repo_root,
+                "command_end",
+                "-",
+                "run",
+                "failed",
+                &format!("Coordinator run failed: {}", err),
+                "blocking",
+            );
+        }
         terminate_active_jobs(&backend.run_state, Some(&backend.logger));
         backend.run_state.active_jobs.clear();
         backend.run_state.join_set.abort_all();
@@ -4606,6 +4737,15 @@ async fn run_coordinator_control_plane_rust_async(
     }
 
     let _ = backend.logger.note("- Run complete");
+    let _ = append_coordinator_event_with_severity(
+        repo_root,
+        "command_end",
+        "-",
+        "run",
+        "done",
+        "Coordinator run complete",
+        "info",
+    );
     println!("Coordinator run complete.");
     Ok(())
 }

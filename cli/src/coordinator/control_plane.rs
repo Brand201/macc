@@ -1,5 +1,5 @@
 use crate::{
-    append_coordinator_event, build_non_task_worker_slug, build_phase_prompt_native,
+    append_coordinator_event, append_coordinator_event_with_severity, build_non_task_worker_slug, build_phase_prompt_native,
     count_pool_worktrees, ensure_tool_json, find_reusable_worktree_native, now_iso_coordinator,
     recompute_resource_locks_from_tasks, resolve_phase_runner_native, set_registry_updated_at,
     spawn_merge_job_native, spawn_performer_job_native, summarize_output,
@@ -12,6 +12,184 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+fn resolve_dispatch_cooldown_seconds() -> u64 {
+    std::env::var("COORDINATOR_DISPATCH_COOLDOWN_SECONDS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(10)
+}
+
+fn emit_dispatch_skipped(
+    repo_root: &Path,
+    logger: Option<&NativeCoordinatorLogger>,
+    task_id: &str,
+    reason: &str,
+    detail: &str,
+) {
+    let msg = format!(
+        "dispatch skipped task={} reason={} detail={}",
+        task_id, reason, detail
+    );
+    let _ = append_coordinator_event_with_severity(
+        repo_root,
+        "dispatch_skipped",
+        task_id,
+        "dev",
+        "skipped",
+        &msg,
+        "warning",
+    );
+    if let Some(log) = logger {
+        let _ = log.note(format!("- {}", msg));
+    }
+}
+
+fn switch_worktree_to_base_after_merge(
+    repo_root: &Path,
+    task: &serde_json::Value,
+    logger: Option<&NativeCoordinatorLogger>,
+) -> Result<()> {
+    let task_id = task
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let worktree_path = task
+        .get("worktree")
+        .and_then(|w| w.get("worktree_path"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if task_id.is_empty() || worktree_path.is_empty() {
+        return Ok(());
+    }
+    let base_branch = task
+        .get("worktree")
+        .and_then(|w| w.get("base_branch"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            task.get("base_branch")
+                .and_then(serde_json::Value::as_str)
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or("master");
+
+    let wt = Path::new(worktree_path);
+    let run = |action: &str, args: &[&str]| -> Result<std::process::Output> {
+        std::process::Command::new("git")
+            .current_dir(wt)
+            .args(args)
+            .output()
+            .map_err(|e| MaccError::Io {
+                path: wt.to_string_lossy().into(),
+                action: action.to_string(),
+                source: e,
+            })
+    };
+
+    // First action after merge success: force checkout base to release task branch immediately.
+    let checkout = run(
+        "force checkout merged worktree base",
+        &["checkout", "-f", base_branch],
+    )?;
+    let switched = if checkout.status.success() {
+        true
+    } else {
+        run(
+            "force checkout reset merged worktree base",
+            &["checkout", "-f", "-B", base_branch, base_branch],
+        )?
+        .status
+        .success()
+    };
+    if !switched {
+        let msg = format!(
+            "worktree switch skipped task={} path={} base={} reason=checkout_failed",
+            task_id, worktree_path, base_branch
+        );
+        let _ = append_coordinator_event_with_severity(
+            repo_root,
+            "worktree_switch",
+            task_id,
+            "integrate",
+            "failed",
+            &msg,
+            "warning",
+        );
+        if let Some(log) = logger {
+            let _ = log.note(format!("- {}", msg));
+        }
+        return Ok(());
+    }
+    // Continue with sanitization now that the worker branch is no longer checked out.
+    let _ = run(
+        "reset merged worktree tracked changes",
+        &["reset", "--hard", "HEAD"],
+    )?;
+    let _ = run("clean merged worktree artifacts", &["clean", "-fd"])?;
+    // Stateless policy: fetch refs then hard reset to base.
+    let fetch = run("fetch merged worktree refs", &["fetch"])?;
+    if !fetch.status.success() {
+        let msg = format!(
+            "worktree switch warning task={} path={} base={} reason=fetch_failed",
+            task_id, worktree_path, base_branch
+        );
+        let _ = append_coordinator_event_with_severity(
+            repo_root,
+            "worktree_switch",
+            task_id,
+            "integrate",
+            "warning",
+            &msg,
+            "warning",
+        );
+        if let Some(log) = logger {
+            let _ = log.note(format!("- {}", msg));
+        }
+        return Ok(());
+    }
+    let reset = run(
+        "reset merged worktree to base",
+        &["reset", "--hard", base_branch],
+    )?;
+    if !reset.status.success() {
+        let msg = format!(
+            "worktree switch warning task={} path={} base={} reason=reset_hard_failed",
+            task_id, worktree_path, base_branch
+        );
+        let _ = append_coordinator_event_with_severity(
+            repo_root,
+            "worktree_switch",
+            task_id,
+            "integrate",
+            "warning",
+            &msg,
+            "warning",
+        );
+        if let Some(log) = logger {
+            let _ = log.note(format!("- {}", msg));
+        }
+        return Ok(());
+    }
+    let msg = format!(
+        "worktree switched to base task={} path={} base={}",
+        task_id, worktree_path, base_branch
+    );
+    let _ = append_coordinator_event_with_severity(
+        repo_root,
+        "worktree_switch",
+        task_id,
+        "integrate",
+        "success",
+        &msg,
+        "info",
+    );
+    if let Some(log) = logger {
+        let _ = log.note(format!("- {}", msg));
+    }
+    Ok(())
+}
 
 pub fn sync_registry_from_prd_native(
     repo_root: &Path,
@@ -617,6 +795,7 @@ fn consume_heartbeat_events(
     state: &mut CoordinatorRunState,
     logger: Option<&NativeCoordinatorLogger>,
 ) -> Result<usize> {
+    let current_run_id = std::env::var("COORDINATOR_RUN_ID").ok();
     let events_file = repo_root
         .join(".macc")
         .join("log")
@@ -666,6 +845,15 @@ fn consume_heartbeat_events(
         let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             continue;
         };
+        if let Some(expected_run_id) = current_run_id.as_deref() {
+            let event_run_id = event
+                .get("run_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if event_run_id != expected_run_id {
+                continue;
+            }
+        }
         let event_type = event
             .get("type")
             .or_else(|| event.get("event"))
@@ -1038,6 +1226,23 @@ pub async fn monitor_merge_jobs_native(
                     &now,
                 )?;
                 if evt.success {
+                    if let Some(task_snapshot) = registry
+                        .get("tasks")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|tasks| {
+                            tasks.iter().find(|task| {
+                                task.get("id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    == evt.task_id
+                            })
+                        })
+                        .cloned()
+                    {
+                        // Immediately detach merged task branches from active worktrees.
+                        let _ =
+                            switch_worktree_to_base_after_merge(repo_root, &task_snapshot, logger);
+                    }
                     if let Some(log) = logger {
                         let _ = log.note(format!(
                             "- Merge done task={} elapsed={}s",
@@ -1081,6 +1286,11 @@ pub async fn dispatch_ready_tasks_native(
     logger: Option<&NativeCoordinatorLogger>,
 ) -> Result<usize> {
     let mut dispatched = 0usize;
+    let mut dispatch_failed_this_cycle: HashSet<String> = HashSet::new();
+    let cooldown_seconds = resolve_dispatch_cooldown_seconds();
+    state
+        .dispatch_retry_not_before
+        .retain(|_, until| *until > Instant::now());
     let max_dispatch = env_cfg
         .max_dispatch
         .or_else(|| coordinator.and_then(|c| c.max_dispatch))
@@ -1157,6 +1367,35 @@ pub async fn dispatch_ready_tasks_native(
         else {
             break;
         };
+        if let Some(until) = state.dispatch_retry_not_before.get(&selected.id) {
+            let now = Instant::now();
+            if *until > now {
+                let remaining = until.duration_since(now).as_secs();
+                emit_dispatch_skipped(
+                    repo_root,
+                    logger,
+                    &selected.id,
+                    "cooldown_active",
+                    &format!("retry in {}s", remaining),
+                );
+                break;
+            }
+        }
+        if dispatch_failed_this_cycle.contains(&selected.id) {
+            if let Some(log) = logger {
+                let _ = log.note(format!(
+                    "- Dispatch stop: task {} already failed worktree preparation in this cycle",
+                    selected.id
+                ));
+            }
+            break;
+        }
+        if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Lifecycle task={} stage=claim",
+                selected.id
+            ));
+        }
         if let Some(log) = logger {
             let _ = log.note(format!(
                 "- Dispatch candidate task={} tool={} base={}",
@@ -1164,7 +1403,7 @@ pub async fn dispatch_ready_tasks_native(
             ));
         }
 
-        let reusable = find_reusable_worktree_native(
+        let (reusable, reuse_prepare_error) = find_reusable_worktree_native(
             repo_root,
             &registry,
             &selected.tool,
@@ -1172,11 +1411,13 @@ pub async fn dispatch_ready_tasks_native(
         )?;
 
         let (worktree_path, branch, last_commit) = if let Some(reused) = reusable {
-            let (path, branch, last_commit, skipped_reset) = reused;
+            let (path, branch, last_commit, skipped_reset, dirty_before) = reused;
             if let Some(log) = logger {
                 let _ = log.note(format!(
-                    "- reused_worktree path={} skipped_reset={}",
+                    "- Lifecycle task={} stage=sanitize path={} dirty_before={} skipped_reset={}",
+                    selected.id,
                     path.display(),
+                    dirty_before,
                     skipped_reset
                 ));
             }
@@ -1184,6 +1425,16 @@ pub async fn dispatch_ready_tasks_native(
         } else {
             let pool_count = count_pool_worktrees(repo_root)?;
             if max_parallel > 0 && pool_count >= max_parallel {
+                if let Some((reason, detail)) = reuse_prepare_error {
+                    emit_dispatch_skipped(repo_root, logger, &selected.id, &reason, &detail);
+                    if cooldown_seconds > 0 {
+                        state.dispatch_retry_not_before.insert(
+                            selected.id.clone(),
+                            Instant::now() + Duration::from_secs(cooldown_seconds),
+                        );
+                    }
+                    dispatch_failed_this_cycle.insert(selected.id.clone());
+                }
                 break;
             }
             let create_spec = macc_core::WorktreeCreateSpec {
@@ -1195,7 +1446,42 @@ pub async fn dispatch_ready_tasks_native(
                 scope: None,
                 feature: None,
             };
-            let mut created = macc_core::create_worktrees(repo_root, &create_spec)?;
+            let mut created = match macc_core::create_worktrees(repo_root, &create_spec) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = format!(
+                        "dispatch failed for task {}: create worktree failed ({})",
+                        selected.id, e
+                    );
+                    let _ = append_coordinator_event_with_severity(
+                        repo_root,
+                        "dispatch_failed",
+                        &selected.id,
+                        "dev",
+                        "failed",
+                        &msg,
+                        "warning",
+                    );
+                    if let Some(log) = logger {
+                        let _ = log.note(format!("- {}", msg));
+                    }
+                    emit_dispatch_skipped(
+                        repo_root,
+                        logger,
+                        &selected.id,
+                        "create_worktree_failed",
+                        &e.to_string(),
+                    );
+                    if cooldown_seconds > 0 {
+                        state.dispatch_retry_not_before.insert(
+                            selected.id.clone(),
+                            Instant::now() + Duration::from_secs(cooldown_seconds),
+                        );
+                    }
+                    dispatch_failed_this_cycle.insert(selected.id.clone());
+                    break;
+                }
+            };
             let created = created
                 .pop()
                 .ok_or_else(|| MaccError::Validation("No worktree created".into()))?;
@@ -1206,23 +1492,240 @@ pub async fn dispatch_ready_tasks_native(
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
+            if let Some(log) = logger {
+                let _ = log.note(format!(
+                    "- Lifecycle task={} stage=sanitize path={} dirty_before=false skipped_reset=true",
+                    selected.id,
+                    created.path.display()
+                ));
+            }
             (created.path, created.branch, last_commit)
         };
-        write_worktree_prd_for_task(prd_file, &selected.id, &worktree_path)?;
-        ensure_tool_json(repo_root, &worktree_path, &selected.tool)?;
+        let dispatch_now = now_iso_coordinator();
+        let dispatch_session_id = format!("coordinator-{}-{}", selected.id, dispatch_now);
+        let claim_update = coordinator_engine::DispatchClaimUpdate {
+            task_id: selected.id.clone(),
+            tool: selected.tool.clone(),
+            worktree_path: worktree_path.to_string_lossy().to_string(),
+            branch: branch.clone(),
+            base_branch: selected.base_branch.clone(),
+            last_commit: last_commit.clone(),
+            session_id: dispatch_session_id.clone(),
+            pid: None,
+            phase: "dev".to_string(),
+            now: dispatch_now.clone(),
+        };
+        coordinator_engine::apply_dispatch_claim_in_registry(&mut registry, &claim_update)?;
+        recompute_resource_locks_from_tasks(&mut registry);
+        set_registry_updated_at(&mut registry);
+        crate::coordinator::state::coordinator_state_registry_save(
+            repo_root,
+            &BTreeMap::new(),
+            &registry,
+        )?;
+        if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Lifecycle task={} stage=claim persisted session_id={}",
+                selected.id, dispatch_session_id
+            ));
+        }
+
+        let rollback_claim = |detail: &str| -> Result<()> {
+            let mut rollback_registry = crate::coordinator::state::coordinator_state_registry_load(
+                repo_root,
+                &BTreeMap::new(),
+            )?;
+            if let Some(tasks) = rollback_registry
+                .get_mut("tasks")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for task in tasks.iter_mut() {
+                    if task
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        == selected.id
+                    {
+                        task["state"] = serde_json::Value::String("todo".to_string());
+                        task["assignee"] = serde_json::Value::Null;
+                        task["claimed_at"] = serde_json::Value::Null;
+                        task["worktree"] = serde_json::Value::Null;
+                        coordinator_engine::ensure_runtime_object(task);
+                        task["task_runtime"]["status"] =
+                            serde_json::Value::String("idle".to_string());
+                        task["task_runtime"]["pid"] = serde_json::Value::Null;
+                        task["task_runtime"]["current_phase"] = serde_json::Value::Null;
+                        task["task_runtime"]["last_error"] =
+                            serde_json::Value::String(detail.to_string());
+                        task["updated_at"] = serde_json::Value::String(now_iso_coordinator());
+                        task["state_changed_at"] =
+                            serde_json::Value::String(now_iso_coordinator());
+                        break;
+                    }
+                }
+            }
+            recompute_resource_locks_from_tasks(&mut rollback_registry);
+            set_registry_updated_at(&mut rollback_registry);
+            crate::coordinator::state::coordinator_state_registry_save(
+                repo_root,
+                &BTreeMap::new(),
+                &rollback_registry,
+            )
+        };
+
+        if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Lifecycle task={} stage=setup",
+                selected.id
+            ));
+        }
+        if let Err(err) = write_worktree_prd_for_task(prd_file, &selected.id, &worktree_path) {
+            let msg = format!(
+                "dispatch failed for task {}: write worktree.prd.json failed ({})",
+                selected.id, err
+            );
+            let _ = append_coordinator_event_with_severity(
+                repo_root,
+                "dispatch_failed",
+                &selected.id,
+                "dev",
+                "failed",
+                &msg,
+                "warning",
+            );
+            emit_dispatch_skipped(
+                repo_root,
+                logger,
+                &selected.id,
+                "write_worktree_prd_failed",
+                &err.to_string(),
+            );
+            let _ = rollback_claim(&msg);
+            if let Some(log) = logger {
+                let _ = log.note(format!("- {}", msg));
+            }
+            if cooldown_seconds > 0 {
+                state.dispatch_retry_not_before.insert(
+                    selected.id.clone(),
+                    Instant::now() + Duration::from_secs(cooldown_seconds),
+                );
+            }
+            dispatch_failed_this_cycle.insert(selected.id.clone());
+            break;
+        }
+        if let Err(err) = ensure_tool_json(repo_root, &worktree_path, &selected.tool) {
+            let msg = format!(
+                "dispatch failed for task {}: ensure tool.json failed ({})",
+                selected.id, err
+            );
+            let _ = append_coordinator_event_with_severity(
+                repo_root,
+                "dispatch_failed",
+                &selected.id,
+                "dev",
+                "failed",
+                &msg,
+                "warning",
+            );
+            emit_dispatch_skipped(
+                repo_root,
+                logger,
+                &selected.id,
+                "ensure_tool_json_failed",
+                &err.to_string(),
+            );
+            let _ = rollback_claim(&msg);
+            if let Some(log) = logger {
+                let _ = log.note(format!("- {}", msg));
+            }
+            if cooldown_seconds > 0 {
+                state.dispatch_retry_not_before.insert(
+                    selected.id.clone(),
+                    Instant::now() + Duration::from_secs(cooldown_seconds),
+                );
+            }
+            dispatch_failed_this_cycle.insert(selected.id.clone());
+            break;
+        }
         let worktree_paths = macc_core::ProjectPaths::from_root(&worktree_path);
-        macc_core::init(&worktree_paths, false)?;
+        if let Err(err) = macc_core::init(&worktree_paths, false) {
+            let msg = format!(
+                "dispatch failed for task {}: initialize worktree failed ({})",
+                selected.id, err
+            );
+            let _ = append_coordinator_event_with_severity(
+                repo_root,
+                "dispatch_failed",
+                &selected.id,
+                "dev",
+                "failed",
+                &msg,
+                "warning",
+            );
+            emit_dispatch_skipped(
+                repo_root,
+                logger,
+                &selected.id,
+                "worktree_init_failed",
+                &err.to_string(),
+            );
+            let _ = rollback_claim(&msg);
+            if let Some(log) = logger {
+                let _ = log.note(format!("- {}", msg));
+            }
+            if cooldown_seconds > 0 {
+                state.dispatch_retry_not_before.insert(
+                    selected.id.clone(),
+                    Instant::now() + Duration::from_secs(cooldown_seconds),
+                );
+            }
+            dispatch_failed_this_cycle.insert(selected.id.clone());
+            break;
+        }
         let canonical_yaml = canonical.to_yaml().map_err(|e| {
             MaccError::Validation(format!(
                 "Failed to serialize canonical config for worktree dispatch apply: {}",
                 e
             ))
         })?;
-        macc_core::atomic_write(
+        if let Err(err) = macc_core::atomic_write(
             &worktree_paths,
             &worktree_paths.config_path,
             canonical_yaml.as_bytes(),
-        )?;
+        ) {
+            let msg = format!(
+                "dispatch failed for task {}: write canonical config failed ({})",
+                selected.id, err
+            );
+            let _ = append_coordinator_event_with_severity(
+                repo_root,
+                "dispatch_failed",
+                &selected.id,
+                "dev",
+                "failed",
+                &msg,
+                "warning",
+            );
+            emit_dispatch_skipped(
+                repo_root,
+                logger,
+                &selected.id,
+                "write_canonical_config_failed",
+                &err.to_string(),
+            );
+            let _ = rollback_claim(&msg);
+            if let Some(log) = logger {
+                let _ = log.note(format!("- {}", msg));
+            }
+            if cooldown_seconds > 0 {
+                state.dispatch_retry_not_before.insert(
+                    selected.id.clone(),
+                    Instant::now() + Duration::from_secs(cooldown_seconds),
+                );
+            }
+            dispatch_failed_this_cycle.insert(selected.id.clone());
+            break;
+        }
 
         let mut apply_cmd = tokio::process::Command::new(std::env::current_exe().map_err(|e| {
             MaccError::Validation(format!("Failed to resolve current executable path: {}", e))
@@ -1247,16 +1750,38 @@ pub async fn dispatch_ready_tasks_native(
                 summarize_output(&String::from_utf8_lossy(&apply_output.stdout)),
                 summarize_output(&String::from_utf8_lossy(&apply_output.stderr))
             );
-            if let Some(log) = logger {
-                let _ = log.note(format!(
-                    "- Worktree apply failed task={} status={} {}",
-                    selected.id, apply_output.status, detail
-                ));
-            }
-            return Err(MaccError::Validation(format!(
-                "worktree apply failed for {} with status {} ({})",
+            let msg = format!(
+                "dispatch failed for task {}: worktree apply failed status={} {}",
                 selected.id, apply_output.status, detail
-            )));
+            );
+            let _ = append_coordinator_event_with_severity(
+                repo_root,
+                "dispatch_failed",
+                &selected.id,
+                "dev",
+                "failed",
+                &msg,
+                "warning",
+            );
+            if let Some(log) = logger {
+                let _ = log.note(format!("- {}", msg));
+            }
+            emit_dispatch_skipped(
+                repo_root,
+                logger,
+                &selected.id,
+                "worktree_apply_failed",
+                &detail,
+            );
+            let _ = rollback_claim(&msg);
+            if cooldown_seconds > 0 {
+                state.dispatch_retry_not_before.insert(
+                    selected.id.clone(),
+                    Instant::now() + Duration::from_secs(cooldown_seconds),
+                );
+            }
+            dispatch_failed_this_cycle.insert(selected.id.clone());
+            break;
         }
         if let Some(log) = logger {
             let _ = log.note(format!(
@@ -1266,41 +1791,54 @@ pub async fn dispatch_ready_tasks_native(
             ));
         }
 
-        let dispatch_now = now_iso_coordinator();
-        let dispatch_session_id = format!("coordinator-{}-{}", selected.id, dispatch_now);
-        let update = coordinator_engine::DispatchClaimUpdate {
-            task_id: selected.id.clone(),
-            tool: selected.tool.clone(),
-            worktree_path: worktree_path.to_string_lossy().to_string(),
-            branch: branch.clone(),
-            base_branch: selected.base_branch.clone(),
-            last_commit: last_commit.clone(),
-            session_id: dispatch_session_id.clone(),
-            pid: None,
-            phase: "dev".to_string(),
-            now: dispatch_now.clone(),
-        };
-        coordinator_engine::apply_dispatch_claim_in_registry(&mut registry, &update)?;
-        recompute_resource_locks_from_tasks(&mut registry);
-        set_registry_updated_at(&mut registry);
-        crate::coordinator::state::coordinator_state_registry_save(
-            repo_root,
-            &BTreeMap::new(),
-            &registry,
-        )?;
-
         let phase_timeout_seconds = env_cfg
             .stale_in_progress_seconds
             .or_else(|| coordinator.and_then(|c| c.stale_in_progress_seconds))
             .unwrap_or(0);
-        let pid = spawn_performer_job_native(
+        let pid = match spawn_performer_job_native(
             repo_root,
             &selected.id,
             &worktree_path,
             &state.event_tx,
             &mut state.join_set,
             phase_timeout_seconds,
-        )?;
+        ) {
+            Ok(pid) => pid,
+            Err(err) => {
+                let msg = format!(
+                    "dispatch failed for task {}: performer spawn failed ({})",
+                    selected.id, err
+                );
+                let _ = append_coordinator_event_with_severity(
+                    repo_root,
+                    "dispatch_failed",
+                    &selected.id,
+                    "dev",
+                    "failed",
+                    &msg,
+                    "warning",
+                );
+                let _ = rollback_claim(&msg);
+                if let Some(log) = logger {
+                    let _ = log.note(format!("- {}", msg));
+                }
+                emit_dispatch_skipped(
+                    repo_root,
+                    logger,
+                    &selected.id,
+                    "spawn_performer_failed",
+                    &err.to_string(),
+                );
+                dispatch_failed_this_cycle.insert(selected.id.clone());
+                if cooldown_seconds > 0 {
+                    state.dispatch_retry_not_before.insert(
+                        selected.id.clone(),
+                        Instant::now() + Duration::from_secs(cooldown_seconds),
+                    );
+                }
+                break;
+            }
+        };
         let mut registry = crate::coordinator::state::coordinator_state_registry_load(
             repo_root,
             &BTreeMap::new(),
@@ -1312,6 +1850,14 @@ pub async fn dispatch_ready_tasks_native(
             &BTreeMap::new(),
             &registry,
         )?;
+        if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Lifecycle task={} stage=run pid_persisted={}",
+                selected.id,
+                pid.map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
 
         state.active_jobs.insert(
             selected.id.clone(),
@@ -1324,6 +1870,10 @@ pub async fn dispatch_ready_tasks_native(
             },
         );
         if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Lifecycle task={} stage=run",
+                selected.id
+            ));
             let _ = log.note(format!(
                 "- Task dispatched task={} pid={}",
                 selected.id,

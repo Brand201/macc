@@ -195,6 +195,7 @@ pub struct AppState {
     pub coordinator_events_per_sec: Option<f64>,
     pub coordinator_last_event_age: Option<Duration>,
     pub coordinator_paused: bool,
+    pub coordinator_current_run_id: Option<String>,
     coordinator_events_last_seen_count: usize,
     pub search_query: String,
     pub search_editing: bool,
@@ -285,6 +286,7 @@ impl AppState {
             coordinator_events_per_sec: None,
             coordinator_last_event_age: None,
             coordinator_paused: false,
+            coordinator_current_run_id: None,
             coordinator_events_last_seen_count: 0,
             search_query: String::new(),
             search_editing: false,
@@ -671,6 +673,26 @@ impl AppState {
         )
     }
 
+    fn resolve_current_run_id(events: &[Value]) -> Option<String> {
+        events
+            .iter()
+            .rev()
+            .filter_map(|event| event.get("run_id").and_then(|v| v.as_str()))
+            .find(|run_id| !run_id.trim().is_empty())
+            .map(|run_id| run_id.to_string())
+    }
+
+    fn event_matches_current_run(event: &Value, run_id: Option<&str>) -> bool {
+        match run_id {
+            Some(expected) if !expected.is_empty() => event
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .map(|value| value == expected)
+                .unwrap_or(false),
+            _ => true,
+        }
+    }
+
     pub fn refresh_coordinator_events(&mut self) {
         let snapshot = match self.load_coordinator_storage_snapshot() {
             Ok(s) => s,
@@ -678,14 +700,18 @@ impl AppState {
                 self.coordinator_events.clear();
                 self.coordinator_events_per_sec = None;
                 self.coordinator_last_event_age = None;
+                self.coordinator_current_run_id = None;
                 self.coordinator_events_last_seen_count = 0;
                 return;
             }
         };
+        self.coordinator_current_run_id = Self::resolve_current_run_id(&snapshot.events);
+        let current_run_id = self.coordinator_current_run_id.as_deref();
         let now = Instant::now();
         let mut lines: Vec<String> = snapshot
             .events
             .iter()
+            .filter(|v| Self::event_matches_current_run(v, current_run_id))
             .filter_map(|v| {
                 let ts = v.get("ts").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let event = v
@@ -1455,7 +1481,13 @@ impl AppState {
 
     fn parse_failure_context_from_events(&self) -> Option<CoordinatorFailureContext> {
         let snapshot = self.load_coordinator_storage_snapshot().ok()?;
-        for parsed in snapshot.events.iter().rev() {
+        let current_run_id = Self::resolve_current_run_id(&snapshot.events);
+        for parsed in snapshot
+            .events
+            .iter()
+            .rev()
+            .filter(|event| Self::event_matches_current_run(event, current_run_id.as_deref()))
+        {
             let event = parsed
                 .get("type")
                 .or_else(|| parsed.get("event"))
@@ -4052,6 +4084,30 @@ mod tests {
         ));
         // Backward compatibility when severity is missing.
         assert!(AppState::is_blocking_failure_event("failed", "failed", ""));
+    }
+
+    #[test]
+    fn test_resolve_current_run_id_uses_latest_event() {
+        let events = vec![
+            serde_json::json!({"type":"heartbeat","run_id":"run-1"}),
+            serde_json::json!({"type":"phase_result","run_id":"run-2"}),
+        ];
+        assert_eq!(
+            AppState::resolve_current_run_id(&events),
+            Some("run-2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_event_matches_current_run_filters_legacy_events() {
+        let with_run = serde_json::json!({"type":"heartbeat","run_id":"run-2"});
+        let without_run = serde_json::json!({"type":"heartbeat"});
+        assert!(AppState::event_matches_current_run(&with_run, Some("run-2")));
+        assert!(!AppState::event_matches_current_run(
+            &without_run,
+            Some("run-2")
+        ));
+        assert!(AppState::event_matches_current_run(&without_run, None));
     }
 
     #[test]

@@ -157,6 +157,9 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         };
         std::env::set_var("COORDINATOR_STORAGE_MODE", mode_raw);
     }
+    if action_emits_runtime_events(action_name) {
+        ensure_coordinator_run_id();
+    }
 
     if action_name == "control-plane-run" {
         run_coordinator_control_plane_rust(
@@ -441,6 +444,36 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
     }
 
     Ok(())
+}
+
+fn action_emits_runtime_events(action: &str) -> bool {
+    matches!(
+        action,
+        "run"
+            | "control-plane-run"
+            | "dispatch"
+            | "advance"
+            | "reconcile"
+            | "cleanup"
+            | "sync"
+            | "retry-phase"
+    )
+}
+
+fn ensure_coordinator_run_id() -> String {
+    if let Ok(existing) = std::env::var("COORDINATOR_RUN_ID") {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let generated = format!(
+        "run-{}-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        std::process::id()
+    );
+    std::env::set_var("COORDINATOR_RUN_ID", &generated);
+    generated
 }
 
 fn parse_unlock_args(args: &[String]) -> Result<(Option<String>, Option<String>, bool, String)> {

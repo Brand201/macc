@@ -1186,17 +1186,23 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
                 .coordinator_last_event_age
                 .map(|d| format!("Last event age: {}", format_hms(d.as_secs())))
                 .unwrap_or_else(|| "Last event age: n/a".to_string());
+            let run_id_line = state
+                .coordinator_current_run_id
+                .as_deref()
+                .map(|run_id| format!("Run ID: {}", run_id))
+                .unwrap_or_else(|| "Run ID: n/a".to_string());
             let result_line = state
                 .coordinator_last_result
                 .clone()
                 .unwrap_or_else(|| "Last result: n/a".to_string());
             let runtime = format!(
-                "Coordinator runtime\n\n{}\n{}\n{}\n{}\n{}\n\n{}\n\nActions:\n- r: run full cycle\n- y: sync registry\n- c: reconcile\n- u: resume paused run\n- k: stop\n- l: refresh status",
+                "Coordinator runtime\n\n{}\n{}\n{}\n{}\n{}\n{}\n\n{}\n\nActions:\n- r: run full cycle\n- y: sync registry\n- c: reconcile\n- u: resume paused run\n- k: stop\n- l: refresh status",
                 status_line,
                 snapshot_line,
                 refresh_line,
                 events_rate_line,
                 event_age_line,
+                run_id_line,
                 result_line
             );
             let runtime_para = wrapped_paragraph(runtime, "Runtime");
