@@ -1502,15 +1502,34 @@ pub async fn dispatch_ready_tasks_native(
             ));
         }
 
+        let reuse_scan_started = Instant::now();
         let (reusable, reuse_prepare_error) = find_reusable_worktree_native(
             repo_root,
             &registry,
             &selected.tool,
             &selected.base_branch,
         )?;
+        let reuse_scan_elapsed_ms = reuse_scan_started.elapsed().as_millis();
 
         let (worktree_path, branch, last_commit) = if let Some(reused) = reusable {
             let (path, branch, last_commit, skipped_reset, dirty_before) = reused;
+            let sanitize_msg = format!(
+                "sanitize done task={} mode=reused path={} duration_ms={} dirty_before={} skipped_reset={}",
+                selected.id,
+                path.display(),
+                reuse_scan_elapsed_ms,
+                dirty_before,
+                skipped_reset
+            );
+            let _ = append_coordinator_event_with_severity(
+                repo_root,
+                "sanitize_done",
+                &selected.id,
+                "dev",
+                "success",
+                &sanitize_msg,
+                "info",
+            );
             if let Some(log) = logger {
                 let _ = log.note(format!(
                     "- Lifecycle task={} stage=sanitize path={} dirty_before={} skipped_reset={}",
@@ -1584,6 +1603,7 @@ pub async fn dispatch_ready_tasks_native(
             let created = created
                 .pop()
                 .ok_or_else(|| MaccError::Validation("No worktree created".into()))?;
+            let sanitize_started = Instant::now();
             if !sanitize_worktree_to_base(&created.path, &selected.base_branch)? {
                 let msg = format!(
                     "dispatch failed for task {}: sanitize new worktree failed ({})",
@@ -1618,6 +1638,22 @@ pub async fn dispatch_ready_tasks_native(
                 dispatch_failed_this_cycle.insert(selected.id.clone());
                 break;
             }
+            let sanitize_elapsed_ms = sanitize_started.elapsed().as_millis();
+            let sanitize_msg = format!(
+                "sanitize done task={} mode=new path={} duration_ms={} dirty_before=false skipped_reset=false",
+                selected.id,
+                created.path.display(),
+                sanitize_elapsed_ms
+            );
+            let _ = append_coordinator_event_with_severity(
+                repo_root,
+                "sanitize_done",
+                &selected.id,
+                "dev",
+                "success",
+                &sanitize_msg,
+                "info",
+            );
             let last_commit = std::process::Command::new("git")
                 .current_dir(&created.path)
                 .args(["rev-parse", "HEAD"])

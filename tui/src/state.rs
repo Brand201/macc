@@ -650,6 +650,7 @@ impl AppState {
                 | "command_error"
                 | "task_transition"
                 | "task_dispatched"
+                | "sanitize_done"
                 | "performer_complete"
                 | "task_blocked"
                 | "dispatch_complete"
