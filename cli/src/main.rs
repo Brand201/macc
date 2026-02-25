@@ -3162,7 +3162,17 @@ fn prepare_reused_worktree_base(
     let current_head = git_rev_parse(worktree_path, "HEAD").unwrap_or_default();
     let current_branch = git_current_branch_name(worktree_path).unwrap_or_default();
     if current_branch == base_branch && current_head == base_head {
-        return Ok((true, true));
+        // Remove residual untracked artifacts (e.g. __pycache__) so the slot is reusable.
+        let cleaned = std::process::Command::new("git")
+            .current_dir(worktree_path)
+            .args(["clean", "-fd"])
+            .status()
+            .map_err(|e| MaccError::Io {
+                path: worktree_path.to_string_lossy().into(),
+                action: "clean reused worktree artifacts".into(),
+                source: e,
+            })?;
+        return Ok((cleaned.success(), true));
     }
     let checkout = std::process::Command::new("git")
         .current_dir(worktree_path)
@@ -3178,7 +3188,16 @@ fn prepare_reused_worktree_base(
     }
     let checked_out_head = git_rev_parse(worktree_path, "HEAD").unwrap_or_default();
     if checked_out_head == base_head {
-        return Ok((true, true));
+        let cleaned = std::process::Command::new("git")
+            .current_dir(worktree_path)
+            .args(["clean", "-fd"])
+            .status()
+            .map_err(|e| MaccError::Io {
+                path: worktree_path.to_string_lossy().into(),
+                action: "clean reused worktree artifacts".into(),
+                source: e,
+            })?;
+        return Ok((cleaned.success(), true));
     }
     let reset = std::process::Command::new("git")
         .current_dir(worktree_path)
@@ -3189,7 +3208,40 @@ fn prepare_reused_worktree_base(
             action: "reset reused worktree to base branch".into(),
             source: e,
         })?;
-    Ok((reset.success(), false))
+    if !reset.success() {
+        return Ok((false, false));
+    }
+    let cleaned = std::process::Command::new("git")
+        .current_dir(worktree_path)
+        .args(["clean", "-fd"])
+        .status()
+        .map_err(|e| MaccError::Io {
+            path: worktree_path.to_string_lossy().into(),
+            action: "clean reused worktree artifacts".into(),
+            source: e,
+        })?;
+    Ok((cleaned.success(), false))
+}
+
+fn is_branch_merged_into_base(worktree_path: &std::path::Path, branch: &str, base_branch: &str) -> bool {
+    if branch.is_empty() || branch == base_branch {
+        return true;
+    }
+    let exists = std::process::Command::new("git")
+        .current_dir(worktree_path)
+        .args(["rev-parse", "--verify", branch])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !exists {
+        return true;
+    }
+    std::process::Command::new("git")
+        .current_dir(worktree_path)
+        .args(["merge-base", "--is-ancestor", branch, base_branch])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 pub(crate) fn find_reusable_worktree_native(
@@ -3234,6 +3286,11 @@ pub(crate) fn find_reusable_worktree_native(
             continue;
         }
 
+        let previous_branch = git_current_branch_name(&entry.path).unwrap_or_default();
+        if !is_branch_merged_into_base(&entry.path, &previous_branch, base_branch) {
+            continue;
+        }
+
         let (prepared, skipped_reset) = prepare_reused_worktree_base(&entry.path, base_branch)?;
         if !prepared {
             continue;
@@ -3257,7 +3314,6 @@ pub(crate) fn find_reusable_worktree_native(
             i += 1;
             branch = format!("{}-{}", build_reuse_branch_name(tool, &entry.path), i);
         }
-        let previous_branch = git_current_branch_name(&entry.path);
         let status = std::process::Command::new("git")
             .current_dir(&entry.path)
             .args(["checkout", "-B", &branch, base_branch])
@@ -3270,18 +3326,17 @@ pub(crate) fn find_reusable_worktree_native(
         if !status.success() {
             continue;
         }
-        if let Some(prev) = previous_branch {
-            if !prev.is_empty() && prev != base_branch && prev != branch {
+        if !previous_branch.is_empty() && previous_branch != base_branch && previous_branch != branch
+        {
                 report_branch_cleanup_outcome(
                     repo_root,
                     None,
                     "dispatch",
-                    &prev,
+                    &previous_branch,
                     base_branch,
                     "reused_worktree_switch",
-                    cleanup_merged_local_branch(repo_root, &prev, base_branch),
+                    cleanup_merged_local_branch(repo_root, &previous_branch, base_branch),
                 );
-            }
         }
         let last_commit = std::process::Command::new("git")
             .current_dir(&entry.path)
