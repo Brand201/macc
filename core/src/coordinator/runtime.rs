@@ -45,6 +45,8 @@ pub struct CoordinatorRunState {
     pub merge_event_tx: tokio::sync::mpsc::UnboundedSender<CoordinatorMergeEvent>,
     pub merge_event_rx: tokio::sync::mpsc::UnboundedReceiver<CoordinatorMergeEvent>,
     pub events_cursor_offset: u64,
+    pub last_heartbeat_log_at: Option<std::time::Instant>,
+    pub heartbeat_updates_since_log: usize,
 }
 
 pub trait PhaseExecutor {
@@ -71,6 +73,8 @@ impl CoordinatorRunState {
             merge_event_tx,
             merge_event_rx,
             events_cursor_offset: 0,
+            last_heartbeat_log_at: None,
+            heartbeat_updates_since_log: 0,
         }
     }
 }

@@ -714,10 +714,19 @@ fn consume_heartbeat_events(
             &registry,
         )?;
         if let Some(log) = logger {
-            let _ = log.note(format!(
-                "- Heartbeat updates applied count={} registry_updated",
-                updated
-            ));
+            state.heartbeat_updates_since_log += updated;
+            let should_log = state
+                .last_heartbeat_log_at
+                .map(|last| last.elapsed() >= std::time::Duration::from_secs(30))
+                .unwrap_or(true);
+            if should_log {
+                let _ = log.note(format!(
+                    "- Heartbeat updates applied count={} (30s window)",
+                    state.heartbeat_updates_since_log
+                ));
+                state.last_heartbeat_log_at = Some(std::time::Instant::now());
+                state.heartbeat_updates_since_log = 0;
+            }
         }
     }
     Ok(updated)

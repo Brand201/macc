@@ -4036,6 +4036,7 @@ struct NativeControlPlaneBackend<'a> {
     storage_paths: macc_core::ProjectPaths,
     storage_reconcile_attempted: bool,
     storage_degraded_json_mode: bool,
+    last_logged_counts: Option<coordinator_engine::CoordinatorCounts>,
 }
 
 impl<'a> NativeControlPlaneBackend<'a> {
@@ -4080,6 +4081,7 @@ impl<'a> NativeControlPlaneBackend<'a> {
             storage_paths,
             storage_reconcile_attempted: false,
             storage_degraded_json_mode: false,
+            last_logged_counts: None,
         })
     }
 }
@@ -4087,15 +4089,14 @@ impl<'a> NativeControlPlaneBackend<'a> {
 #[async_trait]
 impl coordinator_engine::ControlPlaneBackend for NativeControlPlaneBackend<'_> {
     async fn on_cycle_start(&mut self, cycle: usize) -> Result<()> {
-        let _ = self.logger.note(format!("- Cycle {} start", cycle));
-        sync_registry_from_prd_native(self.repo_root, &self.prd_file, Some(&self.logger))?;
+        let _ = cycle;
+        sync_registry_from_prd_native(self.repo_root, &self.prd_file, None)?;
         let cycle_cleaned =
             cleanup_dead_runtime_tasks(self.repo_root, "run-cycle", Some(&self.logger))?;
         if cycle_cleaned > 0 {
-            let _ = self.logger.note(format!(
-                "- Cycle {} runtime cleanup fixed {} ghost task(s)",
-                cycle, cycle_cleaned
-            ));
+            let _ = self
+                .logger
+                .note(format!("- Runtime cleanup fixed {} ghost task(s)", cycle_cleaned));
         }
         Ok(())
     }
@@ -4165,10 +4166,12 @@ impl coordinator_engine::ControlPlaneBackend for NativeControlPlaneBackend<'_> {
         advance: &coordinator_engine::AdvanceResult,
         dispatched: usize,
     ) -> Result<coordinator_engine::CoordinatorCounts> {
-        let _ = self.logger.note(format!(
-            "- Cycle {} transition summary progressed={} dispatched={}",
-            cycle, advance.progressed, dispatched
-        ));
+        if advance.progressed || dispatched > 0 {
+            let _ = self.logger.note(format!(
+                "- Cycle {} transition summary progressed={} dispatched={}",
+                cycle, advance.progressed, dispatched
+            ));
+        }
 
         if self.storage_mode != CoordinatorStorageMode::Json && !self.storage_degraded_json_mode {
             if let Err(err) = sync_coordinator_storage(
@@ -4219,14 +4222,18 @@ impl coordinator_engine::ControlPlaneBackend for NativeControlPlaneBackend<'_> {
         let _ = coordinator::logs::aggregate_performer_logs(self.repo_root);
         let paths = macc_core::ProjectPaths::from_root(self.repo_root);
         let counts = read_coordinator_counts(&paths)?;
-        println!(
-            "Coordinator cycle {}: total={} todo={} active={} blocked={} merged={}",
-            cycle, counts.total, counts.todo, counts.active, counts.blocked, counts.merged
-        );
-        let _ = self.logger.note(format!(
-            "- Cycle {} counts total={} todo={} active={} blocked={} merged={}",
-            cycle, counts.total, counts.todo, counts.active, counts.blocked, counts.merged
-        ));
+        let counts_changed = self.last_logged_counts != Some(counts);
+        if counts_changed {
+            println!(
+                "Coordinator cycle {}: total={} todo={} active={} blocked={} merged={}",
+                cycle, counts.total, counts.todo, counts.active, counts.blocked, counts.merged
+            );
+            let _ = self.logger.note(format!(
+                "- Cycle {} counts total={} todo={} active={} blocked={} merged={}",
+                cycle, counts.total, counts.todo, counts.active, counts.blocked, counts.merged
+            ));
+            self.last_logged_counts = Some(counts);
+        }
         Ok(counts)
     }
 
