@@ -17,6 +17,7 @@ use macc_core::coordinator_storage::{
 };
 use macc_core::{MaccError, Result};
 use std::path::Path;
+use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorCommandInput {
@@ -29,32 +30,155 @@ pub struct CoordinatorCommandInput {
     pub extra_args: Vec<String>,
 }
 
-pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()> {
-    let action_name = input.action.as_str();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordinatorAction {
+    Run,
+    ControlPlaneRun,
+    Dispatch,
+    Advance,
+    Resume,
+    Sync,
+    Status,
+    Reconcile,
+    Unlock,
+    Cleanup,
+    RetryPhase,
+    CutoverGate,
+    Stop,
+    ValidateTransition,
+    ValidateRuntimeTransition,
+    RuntimeStatusFromEvent,
+    StorageSync,
+    StorageImport,
+    StorageExport,
+    EventsExport,
+    StorageVerify,
+    SelectReadyTask,
+    AggregatePerformerLogs,
+    StateApplyTransition,
+    StateSetRuntime,
+    StateTaskField,
+    StateTaskExists,
+    StateCounts,
+    StateLocks,
+    StateSetMergePending,
+    StateSetMergeProcessed,
+    StateIncrementRetries,
+    StateUpsertSloWarning,
+    StateSloMetric,
+}
 
-    if action_name == "validate-transition" {
+impl CoordinatorAction {
+    fn emits_runtime_events(self) -> bool {
+        matches!(
+            self,
+            Self::Run
+                | Self::ControlPlaneRun
+                | Self::Dispatch
+                | Self::Advance
+                | Self::Reconcile
+                | Self::Cleanup
+                | Self::Sync
+                | Self::RetryPhase
+        )
+    }
+}
+
+impl FromStr for CoordinatorAction {
+    type Err = MaccError;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "run" => Ok(Self::Run),
+            "control-plane-run" => Ok(Self::ControlPlaneRun),
+            "dispatch" => Ok(Self::Dispatch),
+            "advance" => Ok(Self::Advance),
+            "resume" => Ok(Self::Resume),
+            "sync" => Ok(Self::Sync),
+            "status" => Ok(Self::Status),
+            "reconcile" => Ok(Self::Reconcile),
+            "unlock" => Ok(Self::Unlock),
+            "cleanup" => Ok(Self::Cleanup),
+            "retry-phase" => Ok(Self::RetryPhase),
+            "cutover-gate" => Ok(Self::CutoverGate),
+            "stop" => Ok(Self::Stop),
+            "validate-transition" => Ok(Self::ValidateTransition),
+            "validate-runtime-transition" => Ok(Self::ValidateRuntimeTransition),
+            "runtime-status-from-event" => Ok(Self::RuntimeStatusFromEvent),
+            "storage-sync" => Ok(Self::StorageSync),
+            "storage-import" => Ok(Self::StorageImport),
+            "storage-export" => Ok(Self::StorageExport),
+            "events-export" => Ok(Self::EventsExport),
+            "storage-verify" => Ok(Self::StorageVerify),
+            "select-ready-task" => Ok(Self::SelectReadyTask),
+            "aggregate-performer-logs" => Ok(Self::AggregatePerformerLogs),
+            "state-apply-transition" => Ok(Self::StateApplyTransition),
+            "state-set-runtime" => Ok(Self::StateSetRuntime),
+            "state-task-field" => Ok(Self::StateTaskField),
+            "state-task-exists" => Ok(Self::StateTaskExists),
+            "state-counts" => Ok(Self::StateCounts),
+            "state-locks" => Ok(Self::StateLocks),
+            "state-set-merge-pending" => Ok(Self::StateSetMergePending),
+            "state-set-merge-processed" => Ok(Self::StateSetMergeProcessed),
+            "state-increment-retries" => Ok(Self::StateIncrementRetries),
+            "state-upsert-slo-warning" => Ok(Self::StateUpsertSloWarning),
+            "state-slo-metric" => Ok(Self::StateSloMetric),
+            other => Err(MaccError::Validation(format!(
+                "Unsupported coordinator action in native mode: {}",
+                other
+            ))),
+        }
+    }
+}
+
+struct ProjectContext {
+    paths: macc_core::ProjectPaths,
+    canonical: macc_core::config::CanonicalConfig,
+    coordinator_cfg: Option<macc_core::config::CoordinatorConfig>,
+}
+
+impl ProjectContext {
+    fn load(absolute_cwd: &Path) -> Result<Self> {
+        let paths = ensure_initialized_paths(absolute_cwd)?;
+        let canonical = load_canonical_config(&paths.config_path)?;
+        let coordinator_cfg = canonical.automation.coordinator.clone();
+        Ok(Self {
+            paths,
+            canonical,
+            coordinator_cfg,
+        })
+    }
+}
+
+pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()> {
+    let action = CoordinatorAction::from_str(input.action.as_str())?;
+
+    if action == CoordinatorAction::ValidateTransition {
         validate_coordinator_transition_action(&input.extra_args)?;
         return Ok(());
     }
-    if action_name == "validate-runtime-transition" {
+    if action == CoordinatorAction::ValidateRuntimeTransition {
         validate_coordinator_runtime_transition_action(&input.extra_args)?;
         return Ok(());
     }
-    if action_name == "runtime-status-from-event" {
+    if action == CoordinatorAction::RuntimeStatusFromEvent {
         coordinator_runtime_status_from_event_action(&input.extra_args)?;
         return Ok(());
     }
-    if action_name == "storage-sync" {
+    if action == CoordinatorAction::StorageSync {
         coordinator_storage_sync_action(absolute_cwd, &input.extra_args)?;
         return Ok(());
     }
-    if action_name == "storage-import" {
+    if action == CoordinatorAction::StorageImport {
         let paths = macc_core::ProjectPaths::from_root(absolute_cwd);
         coordinator_storage_import_json_to_sqlite(&paths)?;
         println!("Coordinator storage import complete (json -> sqlite).");
         return Ok(());
     }
-    if action_name == "storage-export" || action_name == "events-export" {
+    if matches!(
+        action,
+        CoordinatorAction::StorageExport | CoordinatorAction::EventsExport
+    ) {
         let paths = macc_core::ProjectPaths::from_root(absolute_cwd);
         coordinator_storage_export_sqlite_to_json(&paths)?;
         println!(
@@ -69,82 +193,83 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         );
         return Ok(());
     }
-    if action_name == "storage-verify" {
+    if action == CoordinatorAction::StorageVerify {
         let paths = macc_core::ProjectPaths::from_root(absolute_cwd);
         coordinator_storage_verify_parity(&paths)?;
         println!("Coordinator storage parity OK (json == sqlite).");
         return Ok(());
     }
-    if action_name == "select-ready-task" {
+    if action == CoordinatorAction::SelectReadyTask {
         coordinator_select_ready_task_action(absolute_cwd, &input.extra_args)?;
         return Ok(());
     }
-    if action_name == "aggregate-performer-logs" {
+    if action == CoordinatorAction::AggregatePerformerLogs {
         let copied = coordinator::logs::aggregate_performer_logs(absolute_cwd)?;
         println!("Aggregated {} performer log file(s).", copied);
         return Ok(());
     }
-    if action_name == "state-apply-transition" {
+    if action == CoordinatorAction::StateApplyTransition {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
         coordinator::state::coordinator_state_apply_transition(absolute_cwd, &args)?;
         return Ok(());
     }
-    if action_name == "state-set-runtime" {
+    if action == CoordinatorAction::StateSetRuntime {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
         coordinator::state::coordinator_state_set_runtime(absolute_cwd, &args)?;
         return Ok(());
     }
-    if action_name == "state-task-field" {
+    if action == CoordinatorAction::StateTaskField {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
         coordinator::state::coordinator_state_task_field(absolute_cwd, &args)?;
         return Ok(());
     }
-    if action_name == "state-task-exists" {
+    if action == CoordinatorAction::StateTaskExists {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
         coordinator::state::coordinator_state_task_exists(absolute_cwd, &args)?;
         return Ok(());
     }
-    if action_name == "state-counts" {
+    if action == CoordinatorAction::StateCounts {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
         coordinator::state::coordinator_state_counts(absolute_cwd, &args)?;
         return Ok(());
     }
-    if action_name == "state-locks" {
+    if action == CoordinatorAction::StateLocks {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
         coordinator::state::coordinator_state_locks(absolute_cwd, &args)?;
         return Ok(());
     }
-    if action_name == "state-set-merge-pending" {
+    if action == CoordinatorAction::StateSetMergePending {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
         coordinator::state::coordinator_state_set_merge_pending(absolute_cwd, &args)?;
         return Ok(());
     }
-    if action_name == "state-set-merge-processed" {
+    if action == CoordinatorAction::StateSetMergeProcessed {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
         coordinator::state::coordinator_state_set_merge_processed(absolute_cwd, &args)?;
         return Ok(());
     }
-    if action_name == "state-increment-retries" {
+    if action == CoordinatorAction::StateIncrementRetries {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
         coordinator::state::coordinator_state_increment_retries(absolute_cwd, &args)?;
         return Ok(());
     }
-    if action_name == "state-upsert-slo-warning" {
+    if action == CoordinatorAction::StateUpsertSloWarning {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
         coordinator::state::coordinator_state_upsert_slo_warning(absolute_cwd, &args)?;
         return Ok(());
     }
-    if action_name == "state-slo-metric" {
+    if action == CoordinatorAction::StateSloMetric {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
         coordinator::state::coordinator_state_slo_metric(absolute_cwd, &args)?;
         return Ok(());
     }
 
-    let paths = ensure_initialized_paths(absolute_cwd)?;
-    let canonical = load_canonical_config(&paths.config_path)?;
-    let coordinator_cfg = canonical.automation.coordinator.clone();
+    let context = ProjectContext::load(absolute_cwd)?;
+    let paths = context.paths;
+    let canonical = context.canonical;
+    let coordinator_cfg = context.coordinator_cfg;
 
-    if action_name == "run" && !input.no_tui {
+    if action == CoordinatorAction::Run && !input.no_tui {
         return macc_tui::run_tui_with_launch(macc_tui::LaunchMode::CoordinatorRun).map_err(|e| {
             MaccError::Io {
                 path: "tui".into(),
@@ -166,11 +291,11 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         };
         std::env::set_var("COORDINATOR_STORAGE_MODE", mode_raw);
     }
-    if action_emits_runtime_events(action_name) {
+    if action.emits_runtime_events() {
         ensure_coordinator_run_id();
     }
 
-    if action_name == "control-plane-run" {
+    if action == CoordinatorAction::ControlPlaneRun {
         run_coordinator_control_plane_rust(
             &paths.root,
             &canonical,
@@ -180,7 +305,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         return Ok(());
     }
 
-    if action_name == "stop" {
+    if action == CoordinatorAction::Stop {
         let coordinator_path = paths.automation_coordinator_path();
         let stopped = stop_coordinator_process_groups(&paths.root, &coordinator_path, input.graceful)?;
         println!("Coordinator process groups signaled: {}", stopped);
@@ -193,7 +318,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
             macc_core::prune_worktrees(&paths.root)?;
             println!("Pruned git worktrees.");
         }
-    } else if action_name == "run" {
+    } else if action == CoordinatorAction::Run {
         if !input.extra_args.is_empty() {
             return Err(MaccError::Validation(
                 "Action 'run' does not accept extra args after '--'.".into(),
@@ -205,7 +330,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
             coordinator_cfg.as_ref(),
             &input.env_cfg,
         )?;
-    } else if action_name == "dispatch" {
+    } else if action == CoordinatorAction::Dispatch {
         if !input.extra_args.is_empty() {
             return Err(MaccError::Validation(
                 "Action 'dispatch' does not accept extra args in native mode.".into(),
@@ -278,7 +403,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
             }
             Result::<()>::Ok(())
         })?;
-    } else if action_name == "advance" {
+    } else if action == CoordinatorAction::Advance {
         if !input.extra_args.is_empty() {
             return Err(MaccError::Validation(
                 "Action 'advance' does not accept extra args in native mode.".into(),
@@ -327,7 +452,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
                 task_id, reason
             )));
         }
-    } else if action_name == "resume" {
+    } else if action == CoordinatorAction::Resume {
         if !input.extra_args.is_empty() {
             return Err(MaccError::Validation(
                 "Action 'resume' does not accept extra args in native mode.".into(),
@@ -347,7 +472,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         } else {
             println!("Coordinator is not paused.");
         }
-    } else if action_name == "sync" {
+    } else if action == CoordinatorAction::Sync {
         if !input.extra_args.is_empty() {
             return Err(MaccError::Validation(
                 "Action 'sync' does not accept extra args in native mode.".into(),
@@ -393,7 +518,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
                 coordinator_storage_export_sqlite_to_json(&storage_paths)?;
             }
         }
-    } else if action_name == "reconcile" {
+    } else if action == CoordinatorAction::Reconcile {
         if !input.extra_args.is_empty() {
             return Err(MaccError::Validation(
                 "Action 'reconcile' does not accept extra args in native mode.".into(),
@@ -404,7 +529,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         let _ = logger.note("- Reconcile start");
         reconcile_registry_native(&paths.root)?;
         let _ = logger.note("- Reconcile complete");
-    } else if action_name == "cleanup" {
+    } else if action == CoordinatorAction::Cleanup {
         if !input.extra_args.is_empty() {
             return Err(MaccError::Validation(
                 "Action 'cleanup' does not accept extra args in native mode.".into(),
@@ -415,14 +540,14 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         let _ = logger.note("- Cleanup start");
         cleanup_registry_native(&paths.root)?;
         let _ = logger.note("- Cleanup complete");
-    } else if action_name == "status" {
+    } else if action == CoordinatorAction::Status {
         if !input.extra_args.is_empty() {
             return Err(MaccError::Validation(
                 "Action 'status' does not accept extra args in native mode.".into(),
             ));
         }
         print_status_summary_native(&paths.root, &input.env_cfg)?;
-    } else if action_name == "unlock" {
+    } else if action == CoordinatorAction::Unlock {
         let (task_id, resource, clear_all, unlock_state) =
             parse_unlock_args(&input.extra_args)?;
         if let Some(task_id) = task_id {
@@ -430,7 +555,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         } else {
             unlock_resource_locks_native(&paths.root, &input.env_cfg, resource, clear_all, &unlock_state)?;
         }
-    } else if action_name == "retry-phase" {
+    } else if action == CoordinatorAction::RetryPhase {
         handle_retry_phase_native(
             &paths.root,
             &canonical,
@@ -438,35 +563,16 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
             &input.env_cfg,
             &input.extra_args,
         )?;
-    } else if action_name == "cutover-gate" {
+    } else if action == CoordinatorAction::CutoverGate {
         if !input.extra_args.is_empty() {
             return Err(MaccError::Validation(
                 "Action 'cutover-gate' does not accept extra args in native mode.".into(),
             ));
         }
         run_cutover_gate_native(&paths.root)?;
-    } else {
-        return Err(MaccError::Validation(format!(
-            "Unsupported coordinator action in native mode: {}",
-            action_name
-        )));
     }
 
     Ok(())
-}
-
-fn action_emits_runtime_events(action: &str) -> bool {
-    matches!(
-        action,
-        "run"
-            | "control-plane-run"
-            | "dispatch"
-            | "advance"
-            | "reconcile"
-            | "cleanup"
-            | "sync"
-            | "retry-phase"
-    )
 }
 
 fn ensure_coordinator_run_id() -> String {

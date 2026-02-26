@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
+use commands::Command;
 use macc_adapter_shared::catalog::{remote_search, SearchKind as RemoteSearchKind};
 use macc_core::catalog::{
     load_effective_mcp_catalog, load_effective_skills_catalog, McpCatalog, McpEntry, Selector,
@@ -25,6 +26,7 @@ use macc_core::{load_canonical_config, MaccError, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::process::exit;
 
+mod commands;
 mod coordinator;
 
 #[derive(Parser)]
@@ -620,12 +622,13 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             json,
             explain,
         }) => {
-            let paths = macc_core::find_project_root(&absolute_cwd)?;
-            let canonical = load_canonical_config(&paths.config_path)?;
-
-            let (descriptors, diagnostics) = engine.list_tools(&paths);
+            let project_ctx = commands::ProjectContext::load(&absolute_cwd, &engine)?;
+            let paths = project_ctx.paths.clone();
+            let canonical = project_ctx.canonical.clone();
+            let descriptors = project_ctx.descriptors.clone();
+            let (_, diagnostics) = engine.list_tools(&paths);
             report_diagnostics(&diagnostics);
-            let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
+            let allowed_tools = project_ctx.allowed_tools.clone();
 
             let migration =
                 macc_core::migrate::migrate_with_known_tools(canonical.clone(), &allowed_tools);
@@ -678,12 +681,13 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             json,
             explain,
         }) => {
-            let paths = macc_core::find_project_root(&absolute_cwd)?;
-            let canonical = load_canonical_config(&paths.config_path)?;
-
-            let (descriptors, diagnostics) = engine.list_tools(&paths);
+            let project_ctx = commands::ProjectContext::load(&absolute_cwd, &engine)?;
+            let paths = project_ctx.paths.clone();
+            let canonical = project_ctx.canonical.clone();
+            let descriptors = project_ctx.descriptors.clone();
+            let (_, diagnostics) = engine.list_tools(&paths);
             report_diagnostics(&diagnostics);
-            let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
+            let allowed_tools = project_ctx.allowed_tools.clone();
 
             let migration =
                 macc_core::migrate::migrate_with_known_tools(canonical.clone(), &allowed_tools);
@@ -1466,7 +1470,7 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             stale_action,
             storage_mode,
             extra_args,
-        }) => coordinator::command::handle(
+        }) => commands::coordinator::CoordinatorCommand::new(
             &absolute_cwd,
             coordinator::command::CoordinatorCommandInput {
                 action: action.clone(),
@@ -1497,7 +1501,8 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
                 },
                 extra_args: extra_args.clone(),
             },
-        ),
+        )
+        .run(),
         None => {
             let paths = ensure_initialized_paths(&absolute_cwd)?;
             std::env::set_current_dir(&paths.root).map_err(|e| MaccError::Io {
