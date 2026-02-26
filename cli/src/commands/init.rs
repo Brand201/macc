@@ -1,28 +1,21 @@
 use crate::commands::Command;
-use macc_core::engine::Engine;
+use crate::commands::AppContext;
 use macc_core::Result;
-use std::path::PathBuf;
 
-pub struct InitCommand<'a, E: Engine> {
-    cwd: PathBuf,
-    engine: &'a E,
+pub struct InitCommand {
+    app: AppContext,
     force: bool,
     wizard: bool,
 }
 
-impl<'a, E: Engine> InitCommand<'a, E> {
-    pub fn new(cwd: PathBuf, engine: &'a E, force: bool, wizard: bool) -> Self {
-        Self {
-            cwd,
-            engine,
-            force,
-            wizard,
-        }
+impl InitCommand {
+    pub fn new(app: AppContext, force: bool, wizard: bool) -> Self {
+        Self { app, force, wizard }
     }
 }
 
-impl<'a, E: Engine> Command for InitCommand<'a, E> {
+impl Command for InitCommand {
     fn run(&self) -> Result<()> {
-        crate::services::lifecycle::init(&self.cwd, self.engine, self.force, self.wizard)
+        crate::services::lifecycle::init(&self.app, self.force, self.wizard)
     }
 }

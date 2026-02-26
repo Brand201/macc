@@ -3,11 +3,11 @@ use macc_core::catalog::{
     load_effective_mcp_catalog, load_effective_skills_catalog, McpCatalog, McpEntry, Selector,
     SkillEntry, SkillsCatalog, Source, SourceKind,
 };
-use macc_core::engine::Engine;
 use macc_core::plan::builders::{plan_mcp_install, plan_skill_install};
 use macc_core::plan::ActionPlan;
 use macc_core::resolve::{FetchUnit, Selection, SelectionKind};
 use macc_core::{MaccError, Result};
+use crate::services::engine_provider::SharedEngine;
 
 pub fn run_remote_search(
     paths: &macc_core::ProjectPaths,
@@ -349,11 +349,11 @@ pub fn remove_mcp(paths: &macc_core::ProjectPaths, catalog: &mut McpCatalog, id:
     Ok(())
 }
 
-pub fn install_skill<E: Engine>(
+pub fn install_skill(
     paths: &macc_core::ProjectPaths,
     tool: &str,
     id: &str,
-    engine: &E,
+    engine: &SharedEngine,
 ) -> Result<()> {
     let catalog = load_effective_skills_catalog(paths)?;
     let entry = catalog
@@ -399,7 +399,11 @@ pub fn install_skill<E: Engine>(
     Ok(())
 }
 
-pub fn install_mcp<E: Engine>(paths: &macc_core::ProjectPaths, id: &str, engine: &E) -> Result<()> {
+pub fn install_mcp(
+    paths: &macc_core::ProjectPaths,
+    id: &str,
+    engine: &SharedEngine,
+) -> Result<()> {
     let catalog = load_effective_mcp_catalog(paths)?;
     let entry = catalog
         .entries

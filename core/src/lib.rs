@@ -32,8 +32,11 @@ use thiserror::Error;
 pub use tool::{FieldKind, ToolAdapter, ToolDescriptor, ToolField, ToolRegistry};
 pub use user_backup::{find_user_home, UserBackupEntry, UserBackupManager, UserBackupReport};
 pub use worktree::{
+    collect_context_targets,
     create_worktrees, current_worktree, list_worktrees, prune_worktrees, read_worktree_metadata,
-    remove_worktree, WorktreeCreateResult, WorktreeCreateSpec, WorktreeEntry, WorktreeMetadata,
+    remove_worktree, resolve_worktree_task_context, write_tool_json,
+    sync_context_files_from_root, ensure_performer, WorktreeCreateResult, WorktreeCreateSpec,
+    WorktreeEntry, WorktreeMetadata,
 };
 
 #[derive(Error, Debug)]

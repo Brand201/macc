@@ -1,4 +1,3 @@
-use macc_core::engine::Engine;
 use macc_core::{MaccError, Result};
 use std::collections::BTreeMap;
 
@@ -180,43 +179,7 @@ pub fn write_tool_json(
     worktree_path: &std::path::Path,
     tool_id: &str,
 ) -> Result<std::path::PathBuf> {
-    let search_paths = macc_core::tool::ToolSpecLoader::default_search_paths(repo_root);
-    let loader = macc_core::tool::ToolSpecLoader::new(search_paths);
-    let (specs, diagnostics) = loader.load_all_with_embedded();
-    crate::services::project::report_diagnostics(&diagnostics);
-
-    let spec = specs
-        .into_iter()
-        .find(|spec| spec.id == tool_id)
-        .ok_or_else(|| MaccError::Validation(format!("Tool spec not found: {}", tool_id)))?;
-    let mut runtime = spec.to_runtime_config().ok_or_else(|| {
-        MaccError::Validation(format!("Tool spec missing performer section: {}", tool_id))
-    })?;
-
-    let worktree_paths = macc_core::ProjectPaths::from_root(worktree_path);
-    let _ = macc_core::ensure_embedded_automation_scripts(&worktree_paths)?;
-    if let Some(runner_path) =
-        macc_core::embedded_runner_path_for_ref(&worktree_paths, &runtime.performer.runner)?
-    {
-        runtime.performer.runner = runner_path.to_string_lossy().into_owned();
-    }
-
-    let macc_dir = worktree_path.join(".macc");
-    std::fs::create_dir_all(&macc_dir).map_err(|e| MaccError::Io {
-        path: macc_dir.to_string_lossy().into(),
-        action: "create .macc directory".into(),
-        source: e,
-    })?;
-
-    let tool_json_path = macc_dir.join("tool.json");
-    let content = serde_json::to_string_pretty(&runtime)
-        .map_err(|e| MaccError::Validation(format!("Failed to serialize tool.json: {}", e)))?;
-    std::fs::write(&tool_json_path, content).map_err(|e| MaccError::Io {
-        path: tool_json_path.to_string_lossy().into(),
-        action: "write tool.json".into(),
-        source: e,
-    })?;
-    Ok(tool_json_path)
+    macc_core::write_tool_json(repo_root, worktree_path, tool_id)
 }
 
 pub fn ensure_tool_json(
@@ -232,40 +195,7 @@ pub fn ensure_tool_json(
 }
 
 pub fn ensure_performer(worktree_path: &std::path::Path) -> Result<std::path::PathBuf> {
-    let target = worktree_path.join("performer.sh");
-    if target.exists() {
-        return Ok(target);
-    }
-
-    let worktree_paths = macc_core::ProjectPaths::from_root(worktree_path);
-    let _ = macc_core::ensure_embedded_automation_scripts(&worktree_paths)?;
-    let source = worktree_paths.automation_performer_path();
-
-    std::fs::copy(&source, &target).map_err(|e| MaccError::Io {
-        path: target.to_string_lossy().into(),
-        action: "copy performer.sh".into(),
-        source: e,
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&target)
-            .map_err(|e| MaccError::Io {
-                path: target.to_string_lossy().into(),
-                action: "read performer permissions".into(),
-                source: e,
-            })?
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&target, perms).map_err(|e| MaccError::Io {
-            path: target.to_string_lossy().into(),
-            action: "set performer permissions".into(),
-            source: e,
-        })?;
-    }
-
-    Ok(target)
+    macc_core::ensure_performer(worktree_path)
 }
 
 pub fn resolve_worktree_task_context(
@@ -273,47 +203,16 @@ pub fn resolve_worktree_task_context(
     worktree_path: &std::path::Path,
     fallback_id: &str,
 ) -> Result<(String, std::path::PathBuf)> {
-    let prd_path = worktree_path.join("worktree.prd.json");
-    if prd_path.exists() {
-        let content = std::fs::read_to_string(&prd_path).map_err(|e| MaccError::Io {
-            path: prd_path.to_string_lossy().into(),
-            action: "read worktree.prd.json".into(),
-            source: e,
-        })?;
-        let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-            MaccError::Validation(format!("Failed to parse worktree.prd.json: {}", e))
-        })?;
-        let task_id = json
-            .get("tasks")
-            .and_then(|tasks| tasks.get(0))
-            .and_then(|task| task.get("id"))
-            .and_then(|id| match id {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                MaccError::Validation("worktree.prd.json is missing tasks[0].id".into())
-            })?;
-        return Ok((task_id, prd_path));
-    }
-
-    let fallback_prd = repo_root.join("prd.json");
-    if !fallback_prd.exists() {
-        return Err(MaccError::Validation(
-            "Missing worktree.prd.json and prd.json".into(),
-        ));
-    }
-    Ok((fallback_id.to_string(), fallback_prd))
+    macc_core::resolve_worktree_task_context(repo_root, worktree_path, fallback_id)
 }
 
-pub fn apply_worktree<E: Engine>(
-    engine: &E,
+pub fn apply_worktree(
+    engine: &crate::services::engine_provider::SharedEngine,
     repo_root: &std::path::Path,
     worktree_root: &std::path::Path,
     allow_user_scope: bool,
 ) -> Result<()> {
-    crate::apply_worktree(engine, repo_root, worktree_root, allow_user_scope)
+    crate::apply_worktree(engine.as_ref(), repo_root, worktree_root, allow_user_scope)
 }
 
 pub fn open_in_editor(path: &std::path::Path, command: &str) -> Result<()> {

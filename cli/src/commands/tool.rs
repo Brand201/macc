@@ -1,22 +1,21 @@
 use crate::commands::Command;
+use crate::commands::AppContext;
 use crate::ToolCommands;
 use macc_core::Result;
-use std::path::{Path, PathBuf};
-
 pub struct ToolCommand<'a> {
-    cwd: PathBuf,
+    app: AppContext,
     command: &'a ToolCommands,
 }
 
 impl<'a> ToolCommand<'a> {
-    pub fn new(cwd: &Path, command: &'a ToolCommands) -> Self {
-        Self { cwd: cwd.to_path_buf(), command }
+    pub fn new(app: AppContext, command: &'a ToolCommands) -> Self {
+        Self { app, command }
     }
 }
 
 impl<'a> Command for ToolCommand<'a> {
     fn run(&self) -> Result<()> {
-        let paths = crate::services::project::ensure_initialized_paths(&self.cwd)?;
+        let paths = self.app.ensure_initialized_paths()?;
         match self.command {
             ToolCommands::Install { tool_id, yes } => crate::services::tooling::install_tool(&paths, tool_id, *yes),
             ToolCommands::Update {

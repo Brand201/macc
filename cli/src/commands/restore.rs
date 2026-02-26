@@ -1,9 +1,8 @@
 use crate::commands::Command;
+use crate::commands::AppContext;
 use macc_core::Result;
-use std::path::{Path, PathBuf};
-
 pub struct RestoreCommand<'a> {
-    cwd: PathBuf,
+    app: AppContext,
     latest: bool,
     user: bool,
     backup: Option<&'a str>,
@@ -13,20 +12,20 @@ pub struct RestoreCommand<'a> {
 
 impl<'a> RestoreCommand<'a> {
     pub fn new(
-        cwd: &Path,
+        app: AppContext,
         latest: bool,
         user: bool,
         backup: Option<&'a str>,
         dry_run: bool,
         yes: bool,
     ) -> Self {
-        Self { cwd: cwd.to_path_buf(), latest, user, backup, dry_run, yes }
+        Self { app, latest, user, backup, dry_run, yes }
     }
 }
 
 impl<'a> Command for RestoreCommand<'a> {
     fn run(&self) -> Result<()> {
-        let paths = macc_core::find_project_root(&self.cwd)?;
+        let paths = self.app.project_paths()?;
         if !self.latest && self.backup.is_none() {
             return Err(macc_core::MaccError::Validation(
                 "restore requires --latest or --backup <id>".into(),

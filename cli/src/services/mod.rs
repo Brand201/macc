@@ -1,4 +1,5 @@
 pub mod backups;
+pub mod engine_provider;
 pub mod logs;
 pub mod lifecycle;
 pub mod project;

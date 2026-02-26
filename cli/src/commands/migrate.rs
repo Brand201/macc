@@ -1,26 +1,24 @@
 use crate::commands::Command;
-use macc_core::engine::Engine;
+use crate::commands::AppContext;
 use macc_core::Result;
-use std::path::{Path, PathBuf};
 
-pub struct MigrateCommand<'a, E: Engine> {
-    cwd: PathBuf,
-    engine: &'a E,
+pub struct MigrateCommand {
+    app: AppContext,
     apply: bool,
 }
 
-impl<'a, E: Engine> MigrateCommand<'a, E> {
-    pub fn new(cwd: &Path, engine: &'a E, apply: bool) -> Self {
-        Self { cwd: cwd.to_path_buf(), engine, apply }
+impl MigrateCommand {
+    pub fn new(app: AppContext, apply: bool) -> Self {
+        Self { app, apply }
     }
 }
 
-impl<'a, E: Engine> Command for MigrateCommand<'a, E> {
+impl Command for MigrateCommand {
     fn run(&self) -> Result<()> {
-        let paths = macc_core::find_project_root(&self.cwd)?;
+        let paths = self.app.project_paths()?;
         let canonical = macc_core::load_canonical_config(&paths.config_path)?;
 
-        let (descriptors, diagnostics) = self.engine.list_tools(&paths);
+        let (descriptors, diagnostics) = self.app.engine.list_tools(&paths);
         crate::services::project::report_diagnostics(&diagnostics);
         let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
         let result = macc_core::migrate::migrate_with_known_tools(canonical, &allowed_tools);

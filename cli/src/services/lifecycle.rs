@@ -1,38 +1,36 @@
-use macc_core::engine::Engine;
 use macc_core::resolve::{resolve, resolve_fetch_units, CliOverrides};
 use macc_core::{load_canonical_config, MaccError, Result};
 use std::io::{self, Write};
-use std::path::Path;
+use crate::commands::AppContext;
+use crate::services::engine_provider::SharedEngine;
 
-pub fn init<E: Engine>(
-    absolute_cwd: &Path,
-    engine: &E,
+pub fn init(
+    app: &AppContext,
     force: bool,
     wizard: bool,
 ) -> Result<()> {
-    let paths = macc_core::find_project_root(absolute_cwd)
-        .unwrap_or_else(|_| macc_core::ProjectPaths::from_root(absolute_cwd));
+    let paths = macc_core::find_project_root(&app.cwd)
+        .unwrap_or_else(|_| macc_core::ProjectPaths::from_root(&app.cwd));
     macc_core::init(&paths, force)?;
     if wizard {
-        run_init_wizard(&paths, engine)?;
+        run_init_wizard(&paths, &app.engine)?;
     }
-    let checks = engine.doctor(&paths);
+    let checks = app.engine.doctor(&paths);
     crate::services::tooling::print_checks(&checks);
     Ok(())
 }
 
-pub fn plan<E: Engine>(
-    absolute_cwd: &Path,
-    engine: &E,
+pub fn plan(
+    app: &AppContext,
     tools: Option<&str>,
     json: bool,
     explain: bool,
 ) -> Result<()> {
-    let project_ctx = crate::commands::ProjectContext::load(absolute_cwd, engine)?;
+    let project_ctx = crate::commands::ProjectContext::load(app)?;
     let paths = project_ctx.paths.clone();
     let canonical = project_ctx.canonical.clone();
     let descriptors = project_ctx.descriptors.clone();
-    let (_, diagnostics) = engine.list_tools(&paths);
+    let (_, diagnostics) = app.engine.list_tools(&paths);
     crate::services::project::report_diagnostics(&diagnostics);
     let allowed_tools = project_ctx.allowed_tools.clone();
 
@@ -73,26 +71,25 @@ pub fn plan<E: Engine>(
     let fetch_units = resolve_fetch_units(&paths, &resolved)?;
     let materialized_units = macc_adapter_shared::fetch::materialize_fetch_units(&paths, fetch_units)?;
 
-    let plan = engine.plan(&paths, &canonical, &materialized_units, &overrides)?;
-    let ops = engine.plan_operations(&paths, &plan);
+    let plan = app.engine.plan(&paths, &canonical, &materialized_units, &overrides)?;
+    let ops = app.engine.plan_operations(&paths, &plan);
     crate::render_plan_preview(&paths, &plan, &ops, json, explain)?;
     Ok(())
 }
 
-pub fn apply<E: Engine>(
-    absolute_cwd: &Path,
-    engine: &E,
+pub fn apply(
+    app: &AppContext,
     tools: Option<&str>,
     dry_run: bool,
     allow_user_scope: bool,
     json: bool,
     explain: bool,
 ) -> Result<()> {
-    let project_ctx = crate::commands::ProjectContext::load(absolute_cwd, engine)?;
+    let project_ctx = crate::commands::ProjectContext::load(app)?;
     let paths = project_ctx.paths.clone();
     let canonical = project_ctx.canonical.clone();
     let descriptors = project_ctx.descriptors.clone();
-    let (_, diagnostics) = engine.list_tools(&paths);
+    let (_, diagnostics) = app.engine.list_tools(&paths);
     crate::services::project::report_diagnostics(&diagnostics);
     let allowed_tools = project_ctx.allowed_tools.clone();
 
@@ -132,8 +129,8 @@ pub fn apply<E: Engine>(
                 enabled_titles
             );
         }
-        let plan = engine.plan(&paths, &canonical, &materialized_units, &overrides)?;
-        let ops = engine.plan_operations(&paths, &plan);
+        let plan = app.engine.plan(&paths, &canonical, &materialized_units, &overrides)?;
+        let ops = app.engine.plan_operations(&paths, &plan);
         crate::render_plan_preview(&paths, &plan, &ops, json, explain)?;
         return Ok(());
     }
@@ -143,8 +140,8 @@ pub fn apply<E: Engine>(
         paths.root.display(),
         enabled_titles
     );
-    let mut plan = engine.plan(&paths, &canonical, &materialized_units, &overrides)?;
-    let ops = engine.plan_operations(&paths, &plan);
+    let mut plan = app.engine.plan(&paths, &canonical, &materialized_units, &overrides)?;
+    let ops = app.engine.plan_operations(&paths, &plan);
     if !json {
         crate::print_pre_apply_summary(&paths, &plan, &ops);
         if explain {
@@ -155,21 +152,20 @@ pub fn apply<E: Engine>(
         crate::confirm_user_scope_apply(&paths, &ops)?;
     }
 
-    let report = engine.apply(&paths, &mut plan, allow_user_scope)?;
+    let report = app.engine.apply(&paths, &mut plan, allow_user_scope)?;
     println!("{}", report.render_cli());
     crate::mark_apply_completed(&paths)?;
     Ok(())
 }
 
-pub fn quickstart<E: Engine>(
-    absolute_cwd: &Path,
-    engine: &E,
+pub fn quickstart(
+    app: &AppContext,
     assume_yes: bool,
     apply: bool,
     no_tui: bool,
 ) -> Result<()> {
-    let paths = macc_core::find_project_root(absolute_cwd)
-        .unwrap_or_else(|_| macc_core::ProjectPaths::from_root(absolute_cwd));
+    let paths = macc_core::find_project_root(&app.cwd)
+        .unwrap_or_else(|_| macc_core::ProjectPaths::from_root(&app.cwd));
 
     let mut missing = Vec::new();
     for cmd in ["git", "curl", "jq"] {
@@ -207,7 +203,7 @@ pub fn quickstart<E: Engine>(
     );
 
     if apply {
-        run_plan_then_optional_apply(engine, &paths, assume_yes)?;
+        run_plan_then_optional_apply(&app.engine, &paths, assume_yes)?;
         return Ok(());
     }
 
@@ -230,8 +226,8 @@ pub fn quickstart<E: Engine>(
     })
 }
 
-fn run_plan_then_optional_apply<E: Engine>(
-    engine: &E,
+fn run_plan_then_optional_apply(
+    engine: &SharedEngine,
     paths: &macc_core::ProjectPaths,
     assume_yes: bool,
 ) -> Result<()> {
@@ -266,7 +262,10 @@ fn run_plan_then_optional_apply<E: Engine>(
     Ok(())
 }
 
-fn run_init_wizard<E: Engine>(paths: &macc_core::ProjectPaths, engine: &E) -> Result<()> {
+fn run_init_wizard(
+    paths: &macc_core::ProjectPaths,
+    engine: &SharedEngine,
+) -> Result<()> {
     println!("Init wizard (3 questions)");
     let mut config = load_canonical_config(&paths.config_path)?;
     let (descriptors, diagnostics) = engine.list_tools(paths);

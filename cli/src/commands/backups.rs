@@ -1,22 +1,21 @@
 use crate::commands::Command;
+use crate::commands::AppContext;
 use crate::BackupsCommands;
 use macc_core::Result;
-use std::path::{Path, PathBuf};
-
 pub struct BackupsCommand<'a> {
-    cwd: PathBuf,
+    app: AppContext,
     command: &'a BackupsCommands,
 }
 
 impl<'a> BackupsCommand<'a> {
-    pub fn new(cwd: &Path, command: &'a BackupsCommands) -> Self {
-        Self { cwd: cwd.to_path_buf(), command }
+    pub fn new(app: AppContext, command: &'a BackupsCommands) -> Self {
+        Self { app, command }
     }
 }
 
 impl<'a> Command for BackupsCommand<'a> {
     fn run(&self) -> Result<()> {
-        let paths = macc_core::find_project_root(&self.cwd)?;
+        let paths = self.app.project_paths()?;
         match self.command {
             BackupsCommands::List { user } => crate::services::backups::list(&paths, *user),
             BackupsCommands::Open {

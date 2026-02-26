@@ -1,9 +1,9 @@
 use crate::commands::Command;
+use crate::commands::AppContext;
 use macc_core::Result;
-use std::path::{Path, PathBuf};
 
 pub struct ContextCommand<'a> {
-    cwd: PathBuf,
+    app: AppContext,
     tool: Option<&'a str>,
     from_files: &'a [String],
     dry_run: bool,
@@ -12,19 +12,19 @@ pub struct ContextCommand<'a> {
 
 impl<'a> ContextCommand<'a> {
     pub fn new(
-        cwd: &Path,
+        app: AppContext,
         tool: Option<&'a str>,
         from_files: &'a [String],
         dry_run: bool,
         print_prompt: bool,
     ) -> Self {
-        Self { cwd: cwd.to_path_buf(), tool, from_files, dry_run, print_prompt }
+        Self { app, tool, from_files, dry_run, print_prompt }
     }
 }
 
 impl<'a> Command for ContextCommand<'a> {
     fn run(&self) -> Result<()> {
-        let paths = crate::services::project::ensure_initialized_paths(&self.cwd)?;
+        let paths = self.app.ensure_initialized_paths()?;
         crate::services::context::run_generation(
             &paths,
             self.tool,

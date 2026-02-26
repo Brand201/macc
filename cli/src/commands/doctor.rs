@@ -1,23 +1,21 @@
 use crate::commands::Command;
-use macc_core::engine::Engine;
+use crate::commands::AppContext;
 use macc_core::Result;
-use std::path::{Path, PathBuf};
 
-pub struct DoctorCommand<'a, E: Engine> {
-    cwd: PathBuf,
-    engine: &'a E,
+pub struct DoctorCommand {
+    app: AppContext,
     fix: bool,
 }
 
-impl<'a, E: Engine> DoctorCommand<'a, E> {
-    pub fn new(cwd: &Path, engine: &'a E, fix: bool) -> Self {
-        Self { cwd: cwd.to_path_buf(), engine, fix }
+impl DoctorCommand {
+    pub fn new(app: AppContext, fix: bool) -> Self {
+        Self { app, fix }
     }
 }
 
-impl<'a, E: Engine> Command for DoctorCommand<'a, E> {
+impl Command for DoctorCommand {
     fn run(&self) -> Result<()> {
-        let paths = macc_core::find_project_root(&self.cwd)?;
-        crate::services::project::run_doctor(&paths, self.engine, self.fix)
+        let paths = self.app.project_paths()?;
+        crate::services::project::run_doctor(&paths, &self.app.engine, self.fix)
     }
 }

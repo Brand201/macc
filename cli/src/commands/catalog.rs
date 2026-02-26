@@ -1,25 +1,24 @@
 use crate::commands::Command;
+use crate::commands::AppContext;
 use crate::CatalogCommands;
 use macc_core::catalog::{
     load_effective_mcp_catalog, load_effective_skills_catalog, McpCatalog, SkillsCatalog,
 };
 use macc_core::Result;
-use std::path::{Path, PathBuf};
-
 pub struct CatalogCommand<'a> {
-    cwd: PathBuf,
+    app: AppContext,
     command: &'a CatalogCommands,
 }
 
 impl<'a> CatalogCommand<'a> {
-    pub fn new(cwd: &Path, command: &'a CatalogCommands) -> Self {
-        Self { cwd: cwd.to_path_buf(), command }
+    pub fn new(app: AppContext, command: &'a CatalogCommands) -> Self {
+        Self { app, command }
     }
 }
 
 impl<'a> Command for CatalogCommand<'a> {
     fn run(&self) -> Result<()> {
-        let paths = macc_core::find_project_root(&self.cwd)?;
+        let paths = self.app.project_paths()?;
         match self.command {
             CatalogCommands::Skills { skills_command } => match skills_command {
                 crate::CatalogSubCommands::List => {

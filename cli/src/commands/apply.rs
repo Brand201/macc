@@ -1,11 +1,9 @@
 use crate::commands::Command;
-use macc_core::engine::Engine;
+use crate::commands::AppContext;
 use macc_core::Result;
-use std::path::PathBuf;
 
-pub struct ApplyCommand<'a, E: Engine> {
-    cwd: PathBuf,
-    engine: &'a E,
+pub struct ApplyCommand {
+    app: AppContext,
     tools: Option<String>,
     dry_run: bool,
     allow_user_scope: bool,
@@ -13,10 +11,9 @@ pub struct ApplyCommand<'a, E: Engine> {
     explain: bool,
 }
 
-impl<'a, E: Engine> ApplyCommand<'a, E> {
+impl ApplyCommand {
     pub fn new(
-        cwd: PathBuf,
-        engine: &'a E,
+        app: AppContext,
         tools: Option<String>,
         dry_run: bool,
         allow_user_scope: bool,
@@ -24,8 +21,7 @@ impl<'a, E: Engine> ApplyCommand<'a, E> {
         explain: bool,
     ) -> Self {
         Self {
-            cwd,
-            engine,
+            app,
             tools,
             dry_run,
             allow_user_scope,
@@ -35,11 +31,10 @@ impl<'a, E: Engine> ApplyCommand<'a, E> {
     }
 }
 
-impl<'a, E: Engine> Command for ApplyCommand<'a, E> {
+impl Command for ApplyCommand {
     fn run(&self) -> Result<()> {
         crate::services::lifecycle::apply(
-            &self.cwd,
-            self.engine,
+            &self.app,
             self.tools.as_deref(),
             self.dry_run,
             self.allow_user_scope,

@@ -572,8 +572,9 @@ fn main() {
 
     // Initialize the real engine with default registry
     let engine = MaccEngine::new(macc_registry::default_registry());
+    let provider = services::engine_provider::EngineProvider::new(engine);
 
-    if let Err(e) = run_with_engine(cli, engine) {
+    if let Err(e) = run_with_engine_provider(cli, provider) {
         eprintln!("Error: {}", e);
         exit(get_exit_code(&e));
     }
@@ -592,7 +593,16 @@ fn get_exit_code(err: &MaccError) -> i32 {
     }
 }
 
-fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
+#[cfg(test)]
+fn run_with_engine<E: Engine + Send + Sync + 'static>(cli: Cli, engine: E) -> Result<()> {
+    let provider = services::engine_provider::EngineProvider::new(engine);
+    run_with_engine_provider(cli, provider)
+}
+
+fn run_with_engine_provider(
+    cli: Cli,
+    provider: services::engine_provider::EngineProvider,
+) -> Result<()> {
     let cwd = std::path::PathBuf::from(&cli.cwd);
     let absolute_cwd = if cwd.is_absolute() {
         cwd
@@ -608,19 +618,15 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
 
     // Try to canonicalize to resolve .. and symlinks if it exists
     let absolute_cwd = absolute_cwd.canonicalize().unwrap_or(absolute_cwd);
+    let engine = provider.shared();
+    let app = commands::AppContext::new(absolute_cwd.clone(), engine.clone());
 
     match &cli.command {
-        Some(Commands::Init { force, wizard }) => commands::init::InitCommand::new(
-            absolute_cwd.clone(),
-            &engine,
-            *force,
-            *wizard,
-        )
-        .run(),
+        Some(Commands::Init { force, wizard }) =>
+            commands::init::InitCommand::new(app.clone(), *force, *wizard).run(),
         Some(Commands::Quickstart { yes, apply, no_tui }) => {
             commands::quickstart::QuickstartCommand::new(
-                absolute_cwd.clone(),
-                &engine,
+                app.clone(),
                 *yes,
                 *apply,
                 *no_tui,
@@ -631,14 +637,7 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             tools,
             json,
             explain,
-        }) => commands::plan::PlanCommand::new(
-            absolute_cwd.clone(),
-            &engine,
-            tools.clone(),
-            *json,
-            *explain,
-        )
-        .run(),
+        }) => commands::plan::PlanCommand::new(app.clone(), tools.clone(), *json, *explain).run(),
         Some(Commands::Apply {
             tools,
             dry_run,
@@ -646,8 +645,7 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             json,
             explain,
         }) => commands::apply::ApplyCommand::new(
-            absolute_cwd.clone(),
-            &engine,
+            app.clone(),
             tools.clone(),
             *dry_run,
             *allow_user_scope,
@@ -656,12 +654,11 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
         )
         .run(),
         Some(Commands::Catalog { catalog_command }) => {
-            commands::catalog::CatalogCommand::new(&absolute_cwd, catalog_command).run()
+            commands::catalog::CatalogCommand::new(app.clone(), catalog_command).run()
         }
         Some(Commands::Install { install_command }) => commands::install::InstallCommand::new(
-            &absolute_cwd,
+            app.clone(),
             install_command,
-            &engine,
         )
         .run(),
         Some(Commands::Tui) => {
@@ -678,11 +675,11 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             })
         }
         Some(Commands::Tool { tool_command }) => {
-            commands::tool::ToolCommand::new(&absolute_cwd, tool_command).run()
+            commands::tool::ToolCommand::new(app.clone(), tool_command).run()
         }
         Some(Commands::Context { tool, from_files, dry_run, print_prompt }) => {
             commands::context::ContextCommand::new(
-                &absolute_cwd,
+                app.clone(),
                 tool.as_deref(),
                 from_files,
                 *dry_run,
@@ -691,17 +688,17 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             .run()
         }
         Some(Commands::Doctor { fix }) => {
-            commands::doctor::DoctorCommand::new(&absolute_cwd, &engine, *fix).run()
+            commands::doctor::DoctorCommand::new(app.clone(), *fix).run()
         }
         Some(Commands::Migrate { apply }) => {
-            commands::migrate::MigrateCommand::new(&absolute_cwd, &engine, *apply).run()
+            commands::migrate::MigrateCommand::new(app.clone(), *apply).run()
         }
         Some(Commands::Backups { backups_command }) => {
-            commands::backups::BackupsCommand::new(&absolute_cwd, backups_command).run()
+            commands::backups::BackupsCommand::new(app.clone(), backups_command).run()
         }
         Some(Commands::Restore { latest, user, backup, dry_run, yes }) => {
             commands::restore::RestoreCommand::new(
-                &absolute_cwd,
+                app.clone(),
                 *latest,
                 *user,
                 backup.as_deref(),
@@ -710,12 +707,12 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             )
             .run()
         }
-        Some(Commands::Clear) => commands::clear::ClearCommand::new(&absolute_cwd).run(),
+        Some(Commands::Clear) => commands::clear::ClearCommand::new(app.clone()).run(),
         Some(Commands::Worktree { worktree_command }) => {
-            commands::worktree::WorktreeCommand::new(&absolute_cwd, worktree_command, &engine).run()
+            commands::worktree::WorktreeCommand::new(app.clone(), worktree_command).run()
         }
         Some(Commands::Logs { logs_command }) => {
-            commands::logs::LogsCommand::new(&absolute_cwd, logs_command).run()
+            commands::logs::LogsCommand::new(app.clone(), logs_command).run()
         }
         Some(Commands::Coordinator {
             action,
@@ -740,7 +737,7 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             storage_mode,
             extra_args,
         }) => commands::coordinator::CoordinatorCommand::new(
-            &absolute_cwd,
+            app.clone(),
             coordinator::command::CoordinatorCommandInput {
                 action: action.clone(),
                 no_tui: *no_tui,
@@ -1622,7 +1619,7 @@ impl coordinator_engine::ControlPlaneBackend for NativeControlPlaneBackend<'_> {
         let _ = self.storage_mode;
         let _ = &self.storage_paths;
 
-        let _ = coordinator::logs::aggregate_performer_logs(self.repo_root);
+        let _ = coordinator::logs::aggregate_performer_logs_async(self.repo_root).await;
         let paths = macc_core::ProjectPaths::from_root(self.repo_root);
         let counts = read_coordinator_counts(&paths)?;
         let counts_changed = self.last_logged_counts != Some(counts);
@@ -3158,8 +3155,8 @@ fn collect_files_recursive(root: &std::path::Path) -> Result<Vec<std::path::Path
     Ok(files)
 }
 
-fn apply_worktree<E: Engine>(
-    engine: &E,
+fn apply_worktree(
+    engine: &dyn Engine,
     repo_root: &std::path::Path,
     worktree_root: &std::path::Path,
     allow_user_scope: bool,
@@ -3181,138 +3178,8 @@ fn apply_worktree<E: Engine>(
 
     let mut plan = engine.plan(&paths, &canonical, &materialized_units, &overrides)?;
     let _ = engine.apply(&paths, &mut plan, allow_user_scope)?;
-    sync_context_files_from_root(repo_root, worktree_root, &canonical)?;
+    macc_core::sync_context_files_from_root(repo_root, worktree_root, &canonical)?;
     Ok(())
-}
-
-fn sync_context_files_from_root(
-    repo_root: &std::path::Path,
-    worktree_root: &std::path::Path,
-    canonical: &macc_core::config::CanonicalConfig,
-) -> Result<()> {
-    let targets = collect_context_targets(repo_root, canonical);
-    for rel in targets {
-        let src = repo_root.join(&rel);
-        if !src.is_file() {
-            continue;
-        }
-
-        let dest = worktree_root.join(&rel);
-        if src == dest {
-            continue;
-        }
-
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
-                path: parent.to_string_lossy().into(),
-                action: "create context file parent directory in worktree".into(),
-                source: e,
-            })?;
-        }
-
-        std::fs::copy(&src, &dest).map_err(|e| MaccError::Io {
-            path: dest.to_string_lossy().into(),
-            action: "synchronize context file into worktree".into(),
-            source: e,
-        })?;
-    }
-    Ok(())
-}
-
-fn collect_context_targets(
-    repo_root: &std::path::Path,
-    canonical: &macc_core::config::CanonicalConfig,
-) -> Vec<String> {
-    let search_paths = macc_core::tool::ToolSpecLoader::default_search_paths(repo_root);
-    let loader = macc_core::tool::ToolSpecLoader::new(search_paths);
-    let (specs, _) = loader.load_all_with_embedded();
-    let by_id: std::collections::BTreeMap<String, ToolSpec> = specs
-        .into_iter()
-        .map(|spec| (spec.id.clone(), spec))
-        .collect();
-
-    let mut targets = std::collections::BTreeSet::new();
-    for tool_id in &canonical.tools.enabled {
-        let from_settings = context_targets_from_tool_settings(canonical, tool_id);
-        if from_settings.is_empty() {
-            if let Some(spec) = by_id.get(tool_id) {
-                for rel in spec.gitignore.iter().filter(|entry| {
-                    std::path::Path::new(entry)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-                }) {
-                    if let Some(normalized) = normalize_context_target(rel) {
-                        targets.insert(normalized);
-                    }
-                }
-            }
-        } else {
-            for rel in from_settings {
-                if let Some(normalized) = normalize_context_target(&rel) {
-                    targets.insert(normalized);
-                }
-            }
-        }
-
-        if !targets
-            .iter()
-            .any(|p| p == &format!("{}.md", tool_id.to_ascii_uppercase().replace('-', "_")))
-        {
-            let fallback = format!("{}.md", tool_id.to_ascii_uppercase().replace('-', "_"));
-            if let Some(normalized) = normalize_context_target(&fallback) {
-                targets.insert(normalized);
-            }
-        }
-    }
-    targets.into_iter().collect()
-}
-
-fn context_targets_from_tool_settings(
-    canonical: &macc_core::config::CanonicalConfig,
-    tool_id: &str,
-) -> Vec<String> {
-    let mut targets = Vec::new();
-    let config_map_entry = canonical.tools.config.get(tool_id);
-    let legacy_entry = canonical.tools.settings.get(tool_id);
-    for entry in [config_map_entry, legacy_entry].into_iter().flatten() {
-        targets.extend(extract_context_file_names_from_json(entry));
-    }
-    targets
-}
-
-fn extract_context_file_names_from_json(value: &serde_json::Value) -> Vec<String> {
-    let Some(context) = value.get("context") else {
-        return Vec::new();
-    };
-    let Some(file_name) = context.get("fileName") else {
-        return Vec::new();
-    };
-    match file_name {
-        serde_json::Value::String(s) => vec![s.clone()],
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(|item| item.as_str().map(|s| s.to_string()))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn normalize_context_target(value: &str) -> Option<String> {
-    let normalized = value.replace('\\', "/").trim().to_string();
-    if normalized.is_empty() {
-        return None;
-    }
-    if normalized.starts_with('/') {
-        return None;
-    }
-    if normalized
-        .split('/')
-        .any(|part| part.is_empty() || part == "." || part == "..")
-    {
-        return None;
-    }
-    Some(normalized)
 }
 
 // ... existing catalog functions (run_remote_search, list_skills, etc) ...

@@ -1,20 +1,19 @@
 use crate::commands::Command;
+use crate::commands::AppContext;
 use macc_core::Result;
-use std::path::{Path, PathBuf};
-
 pub struct ClearCommand {
-    cwd: PathBuf,
+    app: AppContext,
 }
 
 impl ClearCommand {
-    pub fn new(cwd: &Path) -> Self {
-        Self { cwd: cwd.to_path_buf() }
+    pub fn new(app: AppContext) -> Self {
+        Self { app }
     }
 }
 
 impl Command for ClearCommand {
     fn run(&self) -> Result<()> {
-        let paths = macc_core::find_project_root(&self.cwd)?;
+        let paths = self.app.project_paths()?;
         println!("This will:");
         println!("  1) Remove all non-root worktrees (equivalent to: macc worktree remove --all --force)");
         println!("  2) Remove MACC-managed files/directories in this project (macc clear)");

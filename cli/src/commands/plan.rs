@@ -1,27 +1,23 @@
 use crate::commands::Command;
-use macc_core::engine::Engine;
+use crate::commands::AppContext;
 use macc_core::Result;
-use std::path::PathBuf;
 
-pub struct PlanCommand<'a, E: Engine> {
-    cwd: PathBuf,
-    engine: &'a E,
+pub struct PlanCommand {
+    app: AppContext,
     tools: Option<String>,
     json: bool,
     explain: bool,
 }
 
-impl<'a, E: Engine> PlanCommand<'a, E> {
+impl PlanCommand {
     pub fn new(
-        cwd: PathBuf,
-        engine: &'a E,
+        app: AppContext,
         tools: Option<String>,
         json: bool,
         explain: bool,
     ) -> Self {
         Self {
-            cwd,
-            engine,
+            app,
             tools,
             json,
             explain,
@@ -29,11 +25,10 @@ impl<'a, E: Engine> PlanCommand<'a, E> {
     }
 }
 
-impl<'a, E: Engine> Command for PlanCommand<'a, E> {
+impl Command for PlanCommand {
     fn run(&self) -> Result<()> {
         crate::services::lifecycle::plan(
-            &self.cwd,
-            self.engine,
+            &self.app,
             self.tools.as_deref(),
             self.json,
             self.explain,

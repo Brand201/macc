@@ -1,27 +1,28 @@
 use crate::commands::Command;
+use crate::commands::AppContext;
 use crate::InstallCommands;
-use macc_core::engine::Engine;
 use macc_core::Result;
-use std::path::{Path, PathBuf};
 
-pub struct InstallCommand<'a, E: Engine> {
-    cwd: PathBuf,
+pub struct InstallCommand<'a> {
+    app: AppContext,
     command: &'a InstallCommands,
-    engine: &'a E,
 }
 
-impl<'a, E: Engine> InstallCommand<'a, E> {
-    pub fn new(cwd: &Path, command: &'a InstallCommands, engine: &'a E) -> Self {
-        Self { cwd: cwd.to_path_buf(), command, engine }
+impl<'a> InstallCommand<'a> {
+    pub fn new(
+        app: AppContext,
+        command: &'a InstallCommands,
+    ) -> Self {
+        Self { app, command }
     }
 }
 
-impl<'a, E: Engine> Command for InstallCommand<'a, E> {
+impl<'a> Command for InstallCommand<'a> {
     fn run(&self) -> Result<()> {
-        let paths = macc_core::find_project_root(&self.cwd)?;
+        let paths = self.app.project_paths()?;
         match self.command {
-            InstallCommands::Skill { tool, id } => crate::services::catalog::install_skill(&paths, tool, id, self.engine),
-            InstallCommands::Mcp { id } => crate::services::catalog::install_mcp(&paths, id, self.engine),
+            InstallCommands::Skill { tool, id } => crate::services::catalog::install_skill(&paths, tool, id, &self.app.engine),
+            InstallCommands::Mcp { id } => crate::services::catalog::install_mcp(&paths, id, &self.app.engine),
         }
     }
 }

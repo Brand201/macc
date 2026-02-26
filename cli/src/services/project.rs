@@ -1,4 +1,3 @@
-use macc_core::engine::Engine;
 use macc_core::tool::spec::CheckSeverity;
 use macc_core::{MaccError, Result};
 
@@ -9,9 +8,9 @@ pub fn ensure_initialized_paths(start_dir: &std::path::Path) -> Result<macc_core
     Ok(paths)
 }
 
-pub fn run_doctor<E: Engine>(
+pub fn run_doctor(
     paths: &macc_core::ProjectPaths,
-    engine: &E,
+    engine: &crate::services::engine_provider::SharedEngine,
     fix: bool,
 ) -> Result<()> {
     let checks = engine.doctor(paths);

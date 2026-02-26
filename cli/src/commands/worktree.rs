@@ -1,22 +1,20 @@
 use crate::commands::Command;
+use crate::commands::AppContext;
 use crate::WorktreeCommands;
-use macc_core::engine::Engine;
 use macc_core::Result;
-use std::path::{Path, PathBuf};
 
-pub struct WorktreeCommand<'a, E: Engine> {
-    cwd: PathBuf,
+pub struct WorktreeCommand<'a> {
+    app: AppContext,
     command: &'a WorktreeCommands,
-    engine: &'a E,
 }
 
-impl<'a, E: Engine> WorktreeCommand<'a, E> {
-    pub fn new(cwd: &Path, command: &'a WorktreeCommands, engine: &'a E) -> Self {
-        Self { cwd: cwd.to_path_buf(), command, engine }
+impl<'a> WorktreeCommand<'a> {
+    pub fn new(app: AppContext, command: &'a WorktreeCommands) -> Self {
+        Self { app, command }
     }
 }
 
-impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
+impl<'a> Command for WorktreeCommand<'a> {
     fn run(&self) -> Result<()> {
         match self.command {
             WorktreeCommands::Create {
@@ -29,7 +27,7 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                 skip_apply,
                 allow_user_scope,
             } => {
-                let paths = macc_core::find_project_root(&self.cwd)?;
+                let paths = self.app.project_paths()?;
                 let canonical = macc_core::load_canonical_config(&paths.config_path)?;
 
                 let spec = macc_core::WorktreeCreateSpec {
@@ -43,7 +41,7 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                 };
                 let created = macc_core::create_worktrees(&paths.root, &spec)?;
 
-                let (descriptors, diagnostics) = self.engine.list_tools(&paths);
+                let (descriptors, diagnostics) = self.app.engine.list_tools(&paths);
                 crate::services::project::report_diagnostics(&diagnostics);
                 let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
                 let overrides = macc_core::resolve::CliOverrides::from_tools_csv(
@@ -77,14 +75,14 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                                 &worktree_paths,
                                 fetch_units,
                             )?;
-                        let mut plan = self.engine.plan(
+                        let mut plan = self.app.engine.plan(
                             &worktree_paths,
                             &canonical,
                             &materialized_units,
                             &overrides,
                         )?;
                         let _ = self
-                            .engine
+                            .app.engine
                             .apply(&worktree_paths, &mut plan, *allow_user_scope)?;
                     }
                 }
@@ -105,8 +103,8 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                 Ok(())
             }
             WorktreeCommands::Status => {
-                let entries = macc_core::list_worktrees(&self.cwd)?;
-                let current = macc_core::current_worktree(&self.cwd, &entries);
+                let entries = macc_core::list_worktrees(&self.app.cwd)?;
+                let current = macc_core::current_worktree(&self.app.cwd, &entries);
                 println!("Worktree status:");
                 if let Some(entry) = current {
                     println!("  Path: {}", entry.path.display());
@@ -125,12 +123,12 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                 Ok(())
             }
             WorktreeCommands::List => {
-                let entries = macc_core::list_worktrees(&self.cwd)?;
+                let entries = macc_core::list_worktrees(&self.app.cwd)?;
                 if entries.is_empty() {
                     println!("No git worktrees found.");
                     return Ok(());
                 }
-                let project_paths = macc_core::find_project_root(&self.cwd)
+                let project_paths = macc_core::find_project_root(&self.app.cwd)
                     .map(|root| macc_core::ProjectPaths::from_root(&root.root))
                     .ok();
                 let session_map = crate::services::worktree::load_worktree_session_labels(project_paths.as_ref())?;
@@ -189,7 +187,7 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                 editor,
                 terminal,
             } => {
-                let paths = macc_core::find_project_root(&self.cwd)?;
+                let paths = self.app.project_paths()?;
                 let worktree_path = crate::services::worktree::resolve_worktree_path(&paths.root, id)?;
                 if !worktree_path.exists() {
                     return Err(macc_core::MaccError::Validation(format!(
@@ -215,7 +213,7 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                 all,
                 allow_user_scope,
             } => {
-                let paths = macc_core::find_project_root(&self.cwd)?;
+                let paths = self.app.project_paths()?;
                 if *all {
                     let entries = macc_core::list_worktrees(&paths.root)?;
                     let root = paths.root.canonicalize().unwrap_or(paths.root.clone());
@@ -224,7 +222,7 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                         if entry.path == root {
                             continue;
                         }
-                        crate::services::worktree::apply_worktree(self.engine, &paths.root, &entry.path, *allow_user_scope)?;
+                        crate::services::worktree::apply_worktree(&self.app.engine, &paths.root, &entry.path, *allow_user_scope)?;
                         applied += 1;
                     }
                     println!("Applied {} worktree(s).", applied);
@@ -237,12 +235,12 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                     )
                 })?;
                 let worktree_path = crate::services::worktree::resolve_worktree_path(&paths.root, id)?;
-                crate::services::worktree::apply_worktree(self.engine, &paths.root, &worktree_path, *allow_user_scope)?;
+                crate::services::worktree::apply_worktree(&self.app.engine, &paths.root, &worktree_path, *allow_user_scope)?;
                 println!("Applied worktree: {}", worktree_path.display());
                 Ok(())
             }
             WorktreeCommands::Doctor { id } => {
-                let paths = macc_core::find_project_root(&self.cwd)?;
+                let paths = self.app.project_paths()?;
                 let worktree_path = crate::services::worktree::resolve_worktree_path(&paths.root, id)?;
                 if !worktree_path.exists() {
                     return Err(macc_core::MaccError::Validation(format!(
@@ -251,12 +249,12 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                     )));
                 }
                 let worktree_paths = macc_core::ProjectPaths::from_root(&worktree_path);
-                let checks = self.engine.doctor(&worktree_paths);
+                let checks = self.app.engine.doctor(&worktree_paths);
                 crate::services::tooling::print_checks(&checks);
                 Ok(())
             }
             WorktreeCommands::Run { id } => {
-                let paths = macc_core::find_project_root(&self.cwd)?;
+                let paths = self.app.project_paths()?;
                 let worktree_path = crate::services::worktree::resolve_worktree_path(&paths.root, id)?;
                 if !worktree_path.exists() {
                     return Err(macc_core::MaccError::Validation(format!(
@@ -326,7 +324,7 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                 Ok(())
             }
             WorktreeCommands::Exec { id, cmd } => {
-                let paths = macc_core::find_project_root(&self.cwd)?;
+                let paths = self.app.project_paths()?;
                 let worktree_path = crate::services::worktree::resolve_worktree_path(&paths.root, id)?;
                 if !worktree_path.exists() {
                     return Err(macc_core::MaccError::Validation(format!(
@@ -366,7 +364,7 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                 all,
                 remove_branch,
             } => {
-                let paths = macc_core::find_project_root(&self.cwd)?;
+                let paths = self.app.project_paths()?;
                 if *all {
                     let entries = macc_core::list_worktrees(&paths.root)?;
                     let root = paths.root.canonicalize().unwrap_or(paths.root.clone());
@@ -413,7 +411,7 @@ impl<'a, E: Engine> Command for WorktreeCommand<'a, E> {
                 Ok(())
             }
             WorktreeCommands::Prune => {
-                let paths = macc_core::find_project_root(&self.cwd)?;
+                let paths = self.app.project_paths()?;
                 macc_core::prune_worktrees(&paths.root)?;
                 println!("Pruned git worktrees.");
                 Ok(())
