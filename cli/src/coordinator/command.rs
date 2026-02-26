@@ -1,15 +1,22 @@
 use crate::{
-    cleanup_registry_native, clear_coordinator_pause_file, coordinator,
+    coordinator,
     coordinator_runtime_status_from_event_action, coordinator_select_ready_task_action,
-    coordinator_storage_sync_action, load_canonical_config,
-    parse_coordinator_extra_kv_args, read_coordinator_pause_file, reconcile_registry_native,
-    remove_all_worktrees, resolve_coordinator_storage_mode, resume_paused_task_integrate,
-    run_coordinator_control_plane_rust, set_task_paused_for_integrate,
-    stop_coordinator_process_groups, validate_coordinator_runtime_transition_action,
-    validate_coordinator_transition_action, write_coordinator_pause_file, CoordinatorEnvConfig,
+    coordinator_storage_sync_action, load_canonical_config, remove_all_worktrees,
+    resolve_coordinator_storage_mode, run_coordinator_control_plane_rust,
+    stop_coordinator_process_groups,
+    validate_coordinator_runtime_transition_action, validate_coordinator_transition_action,
     CoordinatorRunState, NativeCoordinatorLogger,
 };
+use crate::coordinator::args::parse_coordinator_extra_kv_args;
+use crate::coordinator::types::CoordinatorEnvConfig;
+use crate::coordinator::helpers::now_iso_coordinator;
+use crate::coordinator::state_runtime::{
+    cleanup_registry_native, clear_coordinator_pause_file, read_coordinator_pause_file,
+    reconcile_registry_native, resume_paused_task_integrate, set_task_paused_for_integrate,
+    write_coordinator_pause_file,
+};
 use macc_core::coordinator::engine as coordinator_engine;
+use macc_core::coordinator::runtime as coordinator_runtime;
 use macc_core::coordinator::WorkflowState;
 use macc_core::coordinator_storage::{
     coordinator_storage_export_sqlite_to_json, coordinator_storage_import_json_to_sqlite,
@@ -813,7 +820,7 @@ fn handle_retry_phase_native(
         task["state"] = serde_json::Value::String("todo".to_string());
         coordinator::state::reset_runtime_to_idle(task);
         snapshot.registry["updated_at"] =
-            serde_json::Value::String(crate::now_iso_coordinator());
+            serde_json::Value::String(now_iso_coordinator());
         coordinator::state::coordinator_state_save_snapshot(repo_root, &state_args, &snapshot)?;
         println!("Skipped phase '{}' for task {}; task moved back to todo.", phase, task_id);
         return Ok(());
@@ -938,7 +945,11 @@ fn retry_dev_phase_native(
     let mut state = CoordinatorRunState::new();
     let logger = NativeCoordinatorLogger::new(repo_root, "retry-phase")?;
     println!("Coordinator log file: {}", logger.file.display());
-    let pid = crate::spawn_performer_job_native(
+    let current_exe = std::env::current_exe().map_err(|e| {
+        MaccError::Validation(format!("Failed to resolve current executable path: {}", e))
+    })?;
+    let pid = coordinator_runtime::spawn_performer_job(
+        &current_exe,
         repo_root,
         task_id,
         &worktree,
@@ -948,7 +959,7 @@ fn retry_dev_phase_native(
     )?;
     state.active_jobs.insert(
         task_id.to_string(),
-        crate::CoordinatorJob {
+        coordinator_runtime::CoordinatorJob {
             tool: task
                 .get("tool")
                 .and_then(serde_json::Value::as_str)
@@ -1029,7 +1040,7 @@ fn retry_tool_phase_native(
                 coordinator_engine::apply_review_phase_success(
                     find_task_mut(&mut snapshot.registry, task_id)?,
                     v,
-                    &crate::now_iso_coordinator(),
+                    &now_iso_coordinator(),
                 )?;
             }
             Err(reason) => {
@@ -1037,7 +1048,7 @@ fn retry_tool_phase_native(
                     find_task_mut(&mut snapshot.registry, task_id)?,
                     "review",
                     &reason,
-                    &crate::now_iso_coordinator(),
+                    &now_iso_coordinator(),
                 )?;
                 return Err(MaccError::Validation(reason));
             }
@@ -1070,7 +1081,7 @@ fn retry_tool_phase_native(
             coordinator_engine::apply_phase_success(
                 find_task_mut(&mut snapshot.registry, task_id)?,
                 transition,
-                &crate::now_iso_coordinator(),
+                &now_iso_coordinator(),
             )?;
         }
         Err(reason) => {
@@ -1089,7 +1100,7 @@ fn retry_tool_phase_native(
                 find_task_mut(&mut snapshot.registry, task_id)?,
                 phase_static,
                 &reason,
-                &crate::now_iso_coordinator(),
+                &now_iso_coordinator(),
             )?;
             return Err(MaccError::Validation(reason));
         }

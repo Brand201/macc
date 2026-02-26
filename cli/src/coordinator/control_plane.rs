@@ -1,12 +1,10 @@
-use crate::{
+use crate::{CoordinatorMergeJob, CoordinatorRunState, NativeCoordinatorLogger};
+use crate::coordinator::helpers::{
     append_coordinator_event, append_coordinator_event_with_severity, build_non_task_worker_slug,
-    build_phase_prompt_native, cleanup_merged_local_branch, count_pool_worktrees,
-    find_reusable_worktree_native, now_iso_coordinator,
-    recompute_resource_locks_from_tasks, report_branch_cleanup_outcome, resolve_phase_runner_native,
-    set_registry_updated_at, spawn_merge_job_native, spawn_performer_job_native, summarize_output,
-    write_worktree_prd_for_task, CoordinatorEnvConfig, CoordinatorMergeJob, CoordinatorRunState,
-    NativeCoordinatorLogger,
+    count_pool_worktrees, find_reusable_worktree_native, now_iso_coordinator,
+    recompute_resource_locks_from_tasks, set_registry_updated_at, write_worktree_prd_for_task,
 };
+use crate::coordinator::types::CoordinatorEnvConfig;
 use macc_core::coordinator::{engine as coordinator_engine, runtime as coordinator_runtime};
 use macc_core::{MaccError, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -428,7 +426,7 @@ impl coordinator_runtime::PhaseExecutor for NativePhaseExecutor<'_> {
             )));
         }
         let Some(runner_path) =
-            resolve_phase_runner_native(self.repo_root, &worktree, &phase_tool)?
+            coordinator_runtime::resolve_phase_runner(self.repo_root, &worktree, &phase_tool)?
         else {
             return Ok(Err(format!(
                 "phase '{}' cannot run for task {}: missing runner for tool '{}'",
@@ -443,7 +441,7 @@ impl coordinator_runtime::PhaseExecutor for NativePhaseExecutor<'_> {
                 runner_path.display()
             )));
         }
-        let prompt = build_phase_prompt_native(mode, task_id, &phase_tool, task)?;
+        let prompt = coordinator_runtime::build_phase_prompt(mode, task_id, &phase_tool, task)?;
         let prompt_dir = worktree.join(".macc").join("tmp");
         std::fs::create_dir_all(&prompt_dir).map_err(|e| MaccError::Io {
             path: prompt_dir.to_string_lossy().into(),
@@ -537,8 +535,8 @@ impl coordinator_runtime::PhaseExecutor for NativePhaseExecutor<'_> {
                 attempt,
                 attempts,
                 out.status,
-                summarize_output(&String::from_utf8_lossy(&out.stdout)),
-                summarize_output(&String::from_utf8_lossy(&out.stderr))
+                coordinator_runtime::summarize_output(&String::from_utf8_lossy(&out.stdout)),
+                coordinator_runtime::summarize_output(&String::from_utf8_lossy(&out.stderr))
             );
         }
         let _ = std::fs::remove_file(&prompt_path);
@@ -702,14 +700,34 @@ pub async fn advance_tasks_native(
                         task_id, branch, base
                     ));
                 }
-                spawn_merge_job_native(
-                    repo_root,
+                let repo = repo_root.to_path_buf();
+                let task_for_worker = task_id.clone();
+                let branch_for_worker = branch.clone();
+                let base_for_worker = base.clone();
+                coordinator_runtime::spawn_merge_job(
                     &task_id,
-                    &branch,
-                    &base,
                     &state.merge_event_tx,
                     &mut state.merge_join_set,
                     resolve_merge_timeout_seconds(),
+                    move || {
+                        coordinator_runtime::merge_task_with_policy_native(
+                            &repo,
+                            &task_for_worker,
+                            &branch_for_worker,
+                            &base_for_worker,
+                            |event_type, task_id, phase, status, message, severity| {
+                                let _ = append_coordinator_event_with_severity(
+                                    &repo,
+                                    event_type,
+                                    task_id,
+                                    phase,
+                                    status,
+                                    message,
+                                    severity,
+                                );
+                            },
+                        )
+                    },
                 )
                 .await?;
                 state.active_merge_jobs.insert(
@@ -815,7 +833,14 @@ pub async fn monitor_active_jobs_native(
                     }
                 } else if completion.should_retry {
                     let task_id = evt.task_id.clone();
-                    let retry_pid = spawn_performer_job_native(
+                    let current_exe = std::env::current_exe().map_err(|e| {
+                        MaccError::Validation(format!(
+                            "Failed to resolve current executable path: {}",
+                            e
+                        ))
+                    })?;
+                    let retry_pid = coordinator_runtime::spawn_performer_job(
+                        &current_exe,
                         repo_root,
                         &task_id,
                         &job.worktree_path,
@@ -1331,14 +1356,28 @@ pub async fn monitor_merge_jobs_native(
                             })
                             .unwrap_or("master");
                         if !branch.is_empty() && branch != base {
-                            report_branch_cleanup_outcome(
+                            coordinator_runtime::report_branch_cleanup_outcome(
                                 repo_root,
                                 Some(&evt.task_id),
                                 "integrate",
                                 branch,
                                 base,
                                 "merge_success_post_switch",
-                                cleanup_merged_local_branch(repo_root, branch, base),
+                                coordinator_runtime::cleanup_merged_local_branch(
+                                    repo_root, branch, base,
+                                ),
+                                |event_type, task_id, phase, status, message, severity| {
+                                    let _ = append_coordinator_event_with_severity(
+                                        repo_root,
+                                        event_type,
+                                        task_id,
+                                        phase,
+                                        status,
+                                        message,
+                                        severity,
+                                    );
+                                },
+                                |msg| eprintln!("{}", msg),
                             );
                         }
                     }
@@ -1944,8 +1983,8 @@ pub async fn dispatch_ready_tasks_native(
         if !apply_output.status.success() {
             let detail = format!(
                 "stdout=\"{}\" stderr=\"{}\"",
-                summarize_output(&String::from_utf8_lossy(&apply_output.stdout)),
-                summarize_output(&String::from_utf8_lossy(&apply_output.stderr))
+                coordinator_runtime::summarize_output(&String::from_utf8_lossy(&apply_output.stdout)),
+                coordinator_runtime::summarize_output(&String::from_utf8_lossy(&apply_output.stderr))
             );
             let msg = format!(
                 "dispatch failed for task {}: worktree apply failed status={} {}",
@@ -1992,7 +2031,11 @@ pub async fn dispatch_ready_tasks_native(
             .stale_in_progress_seconds
             .or_else(|| coordinator.and_then(|c| c.stale_in_progress_seconds))
             .unwrap_or(0);
-        let pid = match spawn_performer_job_native(
+        let current_exe = std::env::current_exe().map_err(|e| {
+            MaccError::Validation(format!("Failed to resolve current executable path: {}", e))
+        })?;
+        let pid = match coordinator_runtime::spawn_performer_job(
+            &current_exe,
             repo_root,
             &selected.id,
             &worktree_path,

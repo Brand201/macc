@@ -25,6 +25,12 @@ impl<'a, E: Engine> QuickstartCommand<'a, E> {
 
 impl<'a, E: Engine> Command for QuickstartCommand<'a, E> {
     fn run(&self) -> Result<()> {
-        crate::services::ops::run_quickstart(&self.cwd, self.engine, self.yes, self.apply, self.no_tui)
+        crate::services::lifecycle::quickstart(
+            &self.cwd,
+            self.engine,
+            self.yes,
+            self.apply,
+            self.no_tui,
+        )
     }
 }

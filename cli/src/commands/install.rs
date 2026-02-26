@@ -20,8 +20,8 @@ impl<'a, E: Engine> Command for InstallCommand<'a, E> {
     fn run(&self) -> Result<()> {
         let paths = macc_core::find_project_root(&self.cwd)?;
         match self.command {
-            InstallCommands::Skill { tool, id } => crate::services::ops::install_skill(&paths, tool, id, self.engine),
-            InstallCommands::Mcp { id } => crate::services::ops::install_mcp(&paths, id, self.engine),
+            InstallCommands::Skill { tool, id } => crate::services::catalog::install_skill(&paths, tool, id, self.engine),
+            InstallCommands::Mcp { id } => crate::services::catalog::install_mcp(&paths, id, self.engine),
         }
     }
 }

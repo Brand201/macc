@@ -156,6 +156,25 @@ pub fn delete_branch(root: &std::path::Path, branch: Option<&str>, force: bool) 
     Ok(())
 }
 
+pub fn remove_all_worktrees(root: &std::path::Path, remove_branches: bool) -> Result<usize> {
+    let entries = macc_core::list_worktrees(root)?;
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut removed = 0usize;
+
+    for entry in entries {
+        if entry.path == root_canon {
+            continue;
+        }
+        let branch = entry.branch.clone();
+        macc_core::remove_worktree(root, &entry.path, true)?;
+        if remove_branches {
+            delete_branch(root, branch.as_deref(), true)?;
+        }
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 pub fn write_tool_json(
     repo_root: &std::path::Path,
     worktree_path: &std::path::Path,

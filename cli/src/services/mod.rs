@@ -1,4 +1,8 @@
+pub mod backups;
 pub mod logs;
-pub mod ops;
+pub mod lifecycle;
 pub mod project;
+pub mod catalog;
+pub mod context;
+pub mod tooling;
 pub mod worktree;

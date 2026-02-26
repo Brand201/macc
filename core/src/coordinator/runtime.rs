@@ -1,6 +1,8 @@
 use crate::coordinator::engine::ReviewVerdict;
 use crate::{MaccError, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -235,6 +237,75 @@ pub fn run_review_phase<E: PhaseExecutor>(
         )));
     };
     Ok(Ok(verdict))
+}
+
+pub fn resolve_phase_runner(
+    repo_root: &Path,
+    worktree_path: &Path,
+    tool: &str,
+) -> Result<Option<PathBuf>> {
+    let explicit = worktree_path
+        .join(".macc")
+        .join("automation")
+        .join("runners")
+        .join(format!("{}.performer.sh", tool));
+    if explicit.exists() {
+        return Ok(Some(explicit));
+    }
+    let tool_json_path = worktree_path.join(".macc").join("tool.json");
+    if !tool_json_path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&tool_json_path).map_err(|e| MaccError::Io {
+        path: tool_json_path.to_string_lossy().into(),
+        action: "read tool.json for phase runner".into(),
+        source: e,
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        MaccError::Validation(format!(
+            "Failed to parse tool.json for phase runner {}: {}",
+            tool_json_path.display(),
+            e
+        ))
+    })?;
+    let runner = value
+        .get("performer")
+        .and_then(|v| v.get("runner"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if runner.is_empty() {
+        return Ok(None);
+    }
+    let path = if Path::new(runner).is_absolute() {
+        PathBuf::from(runner)
+    } else {
+        repo_root.join(runner)
+    };
+    Ok(Some(path))
+}
+
+pub fn build_phase_prompt(
+    mode: &str,
+    task_id: &str,
+    tool: &str,
+    task_json: &serde_json::Value,
+) -> Result<String> {
+    let task_payload = serde_json::to_string(task_json).map_err(|e| {
+        MaccError::Validation(format!(
+            "Failed to serialize task payload for '{}' phase prompt (task={}): {}",
+            mode, task_id, e
+        ))
+    })?;
+    if mode == "review" {
+        return Ok(format!(
+            "You are the assigned {} performer running inside a MACC worktree.\n\nMode: {}\nTask ID: {}\n\nTask registry entry (JSON):\n{}\n\nInstructions:\n1) Execute the review phase only.\n2) Review the already committed task changes and produce a verdict.\n3) Do not modify files, do not create commits, and do not modify task registry state.\n4) Return exactly one final verdict line at the end of your response:\n   - REVIEW_VERDICT: OK\n   - REVIEW_VERDICT: CHANGES_REQUESTED\n",
+            tool, mode, task_id, task_payload
+        ));
+    }
+    Ok(format!(
+        "You are the assigned {} performer running inside a MACC worktree.\n\nMode: {}\nTask ID: {}\n\nTask registry entry (JSON):\n{}\n\nInstructions:\n1) Execute the {} phase only.\n2) Keep changes minimal and focused on this task.\n3) Update code/tests/docs as needed for this phase.\n4) Do not modify task registry state directly.\n",
+        tool, mode, task_id, task_payload, mode
+    ))
 }
 
 pub fn spawn_performer_job(
@@ -528,4 +599,691 @@ pub fn terminate_active_jobs(state: &CoordinatorRunState) -> Vec<(String, i64)> 
         terminated.push((task_id.clone(), pid));
     }
     terminated
+}
+
+pub fn summarize_output(text: &str) -> String {
+    let normalized = text.replace('\n', " ").replace('\r', " ");
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() > 1000 {
+        format!("{}...", &collapsed[..1000])
+    } else {
+        collapsed
+    }
+}
+
+fn coordinator_log_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".macc").join("log").join("coordinator")
+}
+
+fn coordinator_merge_fix_hook(repo_root: &Path) -> Option<PathBuf> {
+    if let Ok(v) = std::env::var("COORDINATOR_MERGE_FIX_HOOK") {
+        if !v.trim().is_empty() {
+            let p = PathBuf::from(v);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    let default = repo_root
+        .join("automat")
+        .join("hooks")
+        .join("ai-merge-fix.sh");
+    if default.exists() {
+        Some(default)
+    } else {
+        None
+    }
+}
+
+fn is_truthy_env(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
+enum HookRunResult {
+    Completed { output: String, timed_out: bool },
+}
+
+fn run_merge_hook_with_timeout(
+    repo_root: &Path,
+    hook: &Path,
+    task_id: &str,
+    branch: &str,
+    base: &str,
+    conflicts: &str,
+    timeout_seconds: u64,
+) -> Result<HookRunResult> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(hook)
+        .current_dir(repo_root)
+        .arg("--repo")
+        .arg(repo_root)
+        .arg("--task-id")
+        .arg(task_id)
+        .arg("--branch")
+        .arg(branch)
+        .arg("--base-branch")
+        .arg(base)
+        .arg("--failure-step")
+        .arg("merge")
+        .arg("--failure-reason")
+        .arg("git merge reported conflicts")
+        .arg("--conflicts")
+        .arg(conflicts)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| MaccError::Io {
+            path: hook.to_string_lossy().into(),
+            action: "spawn merge-fix hook".into(),
+            source: e,
+        })?;
+    let started = std::time::Instant::now();
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if timeout_seconds > 0 && started.elapsed().as_secs() >= timeout_seconds {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(MaccError::Validation(format!(
+                    "merge-fix hook wait error: {}",
+                    e
+                )));
+            }
+        }
+    }
+
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut out);
+    }
+    let mut err = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut err);
+    }
+    Ok(HookRunResult::Completed {
+        output: format!("{}\n{}", out, err),
+        timed_out,
+    })
+}
+
+pub fn merge_task_with_policy_native<FE>(
+    repo_root: &Path,
+    task_id: &str,
+    branch: &str,
+    base: &str,
+    mut emit_event: FE,
+) -> Result<std::result::Result<(), String>>
+where
+    FE: FnMut(&str, &str, &str, &str, &str, &str),
+{
+    let log_dir = coordinator_log_dir(repo_root);
+    std::fs::create_dir_all(&log_dir).map_err(|e| MaccError::Io {
+        path: log_dir.to_string_lossy().into(),
+        action: "create coordinator log dir".into(),
+        source: e,
+    })?;
+    let suggestion = format!("git checkout {} && git merge {}", base, branch);
+
+    let verify_branch = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "--verify", branch])
+        .output();
+    if !verify_branch
+        .as_ref()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok(Err(format!(
+            "failure:local_merge step=verify_branch branch={} base={} suggestion=\"{}\"",
+            branch, base, suggestion
+        )));
+    }
+    let verify_base = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "--verify", base])
+        .output();
+    if !verify_base
+        .as_ref()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok(Err(format!(
+            "failure:local_merge step=verify_base branch={} base={} suggestion=\"{}\"",
+            branch, base, suggestion
+        )));
+    }
+
+    let clean = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|e| MaccError::Io {
+            path: repo_root.to_string_lossy().into(),
+            action: "check git status".into(),
+            source: e,
+        })?;
+    if !String::from_utf8_lossy(&clean.stdout).trim().is_empty() {
+        return Ok(Err(format!(
+            "failure:local_merge step=precheck_clean branch={} base={} suggestion=\"{}\"",
+            branch, base, suggestion
+        )));
+    }
+
+    let _ = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["checkout", base])
+        .status();
+    let merge_msg = format!("macc: merge task {}", task_id);
+    let merge = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["merge", "--no-ff", "-m", &merge_msg, branch])
+        .output()
+        .map_err(|e| MaccError::Io {
+            path: repo_root.to_string_lossy().into(),
+            action: "run local merge".into(),
+            source: e,
+        })?;
+    if merge.status.success() {
+        return Ok(Ok(()));
+    }
+
+    let merge_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&merge.stdout),
+        String::from_utf8_lossy(&merge.stderr)
+    );
+    let conflicts = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().replace('\n', ","))
+        .unwrap_or_default();
+
+    let mut hook_output = String::new();
+    let allow_ai_fix = is_truthy_env("COORDINATOR_MERGE_AI_FIX", false);
+    if allow_ai_fix {
+        if let Some(hook) = coordinator_merge_fix_hook(repo_root) {
+            let hook_timeout_seconds = std::env::var("COORDINATOR_MERGE_HOOK_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .unwrap_or(90);
+            let hook_started = std::time::Instant::now();
+            emit_event(
+                "merge_hook",
+                task_id,
+                "integrate",
+                "started",
+                &format!(
+                    "merge-fix hook started task={} timeout_s={}",
+                    task_id, hook_timeout_seconds
+                ),
+                "info",
+            );
+            let hook_result = run_merge_hook_with_timeout(
+                repo_root,
+                &hook,
+                task_id,
+                branch,
+                base,
+                &conflicts,
+                hook_timeout_seconds,
+            );
+            let hook_elapsed = hook_started.elapsed().as_secs();
+            match hook_result {
+                Ok(HookRunResult::Completed { output, timed_out }) => {
+                    hook_output = output;
+                    emit_event(
+                        "merge_hook",
+                        task_id,
+                        "integrate",
+                        if timed_out { "timeout" } else { "done" },
+                        &format!(
+                            "merge-fix hook completed task={} elapsed={}s timeout={}",
+                            task_id, hook_elapsed, timed_out
+                        ),
+                        if timed_out { "warning" } else { "info" },
+                    );
+                }
+                Err(err) => {
+                    hook_output = format!("merge-fix hook execution error: {}", err);
+                    emit_event(
+                        "merge_hook",
+                        task_id,
+                        "integrate",
+                        "failed",
+                        &format!(
+                            "merge-fix hook failed task={} elapsed={}s error={}",
+                            task_id, hook_elapsed, err
+                        ),
+                        "warning",
+                    );
+                }
+            }
+            let unresolved = std::process::Command::new("git")
+                .current_dir(repo_root)
+                .args(["diff", "--name-only", "--diff-filter=U"])
+                .output()
+                .ok()
+                .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+                .unwrap_or(true);
+            let in_merge = std::process::Command::new("git")
+                .current_dir(repo_root)
+                .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !unresolved && !in_merge {
+                return Ok(Ok(()));
+            }
+        }
+    }
+
+    let in_merge = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if in_merge {
+        let _ = std::process::Command::new("git")
+            .current_dir(repo_root)
+            .args(["merge", "--abort"])
+            .status();
+    }
+
+    let report_file = log_dir.join(format!(
+        "merge-fail-{}-{}.md",
+        task_id,
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+    ));
+    let report = format!(
+        "# Local merge failure report\n\n- Task: {}\n- Branch: {}\n- Base: {}\n- UTC: {}\n\n## Conflicts\n\n{}\n\n## Suggested manual command\n\n`cd \"{}\" && {}`\n\n## Merge stdout/stderr\n\n```text\n{}\n```\n\n## Merge-fix hook output\n\n```text\n{}\n```\n",
+        task_id,
+        branch,
+        base,
+        chrono::Utc::now().to_rfc3339(),
+        if conflicts.is_empty() { "none" } else { &conflicts },
+        repo_root.display(),
+        suggestion,
+        merge_output,
+        hook_output
+    );
+    let _ = std::fs::write(&report_file, report);
+    let err = format!(
+        "failure:local_merge step=merge branch={} base={} conflicts=[{}] git_output=\"{}\" suggestion=\"{}\" report=\"{}\"",
+        branch,
+        base,
+        if conflicts.is_empty() { "none" } else { &conflicts },
+        summarize_output(&merge_output),
+        suggestion,
+        report_file.display()
+    );
+    Ok(Err(err))
+}
+
+#[derive(Debug, Clone)]
+pub enum BranchCleanupResult {
+    Deleted,
+    Skipped { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchCleanupQueueEntry {
+    task_id: String,
+    phase: String,
+    branch: String,
+    base: String,
+    context: String,
+    reason: String,
+    attempts: usize,
+}
+
+fn delete_local_branch(repo_root: &Path, branch: &str) -> Result<()> {
+    let status = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["branch", "-d", branch])
+        .status()
+        .map_err(|e| MaccError::Io {
+            path: repo_root.to_string_lossy().into(),
+            action: "delete branch".into(),
+            source: e,
+        })?;
+    if status.success() {
+        return Ok(());
+    }
+    let force = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["branch", "-D", branch])
+        .status()
+        .map_err(|e| MaccError::Io {
+            path: repo_root.to_string_lossy().into(),
+            action: "force delete branch".into(),
+            source: e,
+        })?;
+    if !force.success() {
+        return Err(MaccError::Validation(format!(
+            "git branch delete failed for '{}'",
+            branch
+        )));
+    }
+    Ok(())
+}
+
+pub fn cleanup_merged_local_branch(
+    repo_root: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<BranchCleanupResult> {
+    if branch.is_empty() || branch == base {
+        return Ok(BranchCleanupResult::Skipped {
+            reason: "empty_or_base_branch".to_string(),
+        });
+    }
+    if let Some(in_use_path) = find_worktree_using_branch(repo_root, branch)? {
+        return Ok(BranchCleanupResult::Skipped {
+            reason: format!("branch_in_use_by_worktree:{}", in_use_path.display()),
+        });
+    }
+    delete_local_branch(repo_root, branch)?;
+    Ok(BranchCleanupResult::Deleted)
+}
+
+fn branch_cleanup_queue_path(repo_root: &Path) -> PathBuf {
+    repo_root
+        .join(".macc")
+        .join("tmp")
+        .join("branch-cleanup-queue.jsonl")
+}
+
+fn append_branch_cleanup_queue_entry(
+    repo_root: &Path,
+    entry: &BranchCleanupQueueEntry,
+) -> Result<()> {
+    let path = branch_cleanup_queue_path(repo_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
+            path: parent.to_string_lossy().into(),
+            action: "create branch cleanup queue dir".into(),
+            source: e,
+        })?;
+    }
+    let line = serde_json::to_string(entry).map_err(|e| {
+        MaccError::Validation(format!("Failed to serialize branch cleanup queue entry: {}", e))
+    })?;
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| MaccError::Io {
+            path: path.to_string_lossy().into(),
+            action: "open branch cleanup queue".into(),
+            source: e,
+        })?;
+    file.write_all(line.as_bytes()).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "append branch cleanup queue entry".into(),
+        source: e,
+    })?;
+    file.write_all(b"\n").map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "write branch cleanup queue newline".into(),
+        source: e,
+    })?;
+    Ok(())
+}
+
+fn load_branch_cleanup_queue(repo_root: &Path) -> Result<Vec<BranchCleanupQueueEntry>> {
+    let path = branch_cleanup_queue_path(repo_root);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "read branch cleanup queue".into(),
+        source: e,
+    })?;
+    let mut entries = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<BranchCleanupQueueEntry>(trimmed) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn save_branch_cleanup_queue(repo_root: &Path, entries: &[BranchCleanupQueueEntry]) -> Result<()> {
+    let path = branch_cleanup_queue_path(repo_root);
+    if entries.is_empty() {
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
+            path: parent.to_string_lossy().into(),
+            action: "create branch cleanup queue dir".into(),
+            source: e,
+        })?;
+    }
+    let mut out = String::new();
+    for entry in entries {
+        let line = serde_json::to_string(entry).map_err(|e| {
+            MaccError::Validation(format!("Failed to serialize branch cleanup queue entry: {}", e))
+        })?;
+        out.push_str(&line);
+        out.push('\n');
+    }
+    std::fs::write(&path, out).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "write branch cleanup queue".into(),
+        source: e,
+    })?;
+    Ok(())
+}
+
+pub fn process_branch_cleanup_queue<FE, FL>(
+    repo_root: &Path,
+    mut emit_event: FE,
+    mut log_note: Option<FL>,
+) -> Result<usize>
+where
+    FE: FnMut(&str, &str, &str, &str, &str, &str),
+    FL: FnMut(String),
+{
+    let mut queue = load_branch_cleanup_queue(repo_root)?;
+    if queue.is_empty() {
+        return Ok(0);
+    }
+    let mut remaining = Vec::new();
+    let mut processed = 0usize;
+    for mut item in queue.drain(..) {
+        match cleanup_merged_local_branch(repo_root, &item.branch, &item.base) {
+            Ok(BranchCleanupResult::Deleted) => {
+                processed += 1;
+                let msg = format!(
+                    "branch cleanup success context={} task={} branch={} base={} mode=maintenance",
+                    item.context, item.task_id, item.branch, item.base
+                );
+                emit_event(
+                    "branch_cleanup",
+                    &item.task_id,
+                    &item.phase,
+                    "success",
+                    &msg,
+                    "info",
+                );
+            }
+            Ok(BranchCleanupResult::Skipped { reason }) => {
+                processed += 1;
+                let msg = format!(
+                    "branch cleanup skipped context={} task={} branch={} base={} reason={} mode=maintenance",
+                    item.context, item.task_id, item.branch, item.base, reason
+                );
+                emit_event(
+                    "branch_cleanup",
+                    &item.task_id,
+                    &item.phase,
+                    "skipped",
+                    &msg,
+                    "warning",
+                );
+            }
+            Err(err) => {
+                item.attempts += 1;
+                if item.attempts >= 5 {
+                    let msg = format!(
+                        "branch cleanup dropped after retries context={} task={} branch={} base={} error={}",
+                        item.context, item.task_id, item.branch, item.base, err
+                    );
+                    emit_event(
+                        "branch_cleanup",
+                        &item.task_id,
+                        &item.phase,
+                        "failed",
+                        &msg,
+                        "warning",
+                    );
+                } else {
+                    remaining.push(item);
+                }
+            }
+        }
+    }
+    save_branch_cleanup_queue(repo_root, &remaining)?;
+    if let Some(note) = log_note.as_mut() {
+        if processed > 0 {
+            note(format!(
+                "- Maintenance branch-cleanup processed={} remaining={}",
+                processed,
+                remaining.len()
+            ));
+        }
+    }
+    Ok(processed)
+}
+
+fn find_worktree_using_branch(repo_root: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    let output = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .map_err(|e| MaccError::Io {
+            path: repo_root.to_string_lossy().into(),
+            action: "list git worktrees".into(),
+            source: e,
+        })?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let mut current_path: Option<PathBuf> = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let trimmed = line.trim();
+        if let Some(path) = trimmed.strip_prefix("worktree ") {
+            current_path = Some(PathBuf::from(path));
+            continue;
+        }
+        if let Some(found_branch) = trimmed.strip_prefix("branch ") {
+            let normalized = found_branch.strip_prefix("refs/heads/").unwrap_or(found_branch);
+            if normalized == branch {
+                return Ok(current_path);
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub fn report_branch_cleanup_outcome<FE, FW>(
+    repo_root: &Path,
+    task_id: Option<&str>,
+    phase: &str,
+    branch: &str,
+    base: &str,
+    context: &str,
+    cleanup_result: std::result::Result<BranchCleanupResult, MaccError>,
+    mut emit_event: FE,
+    mut warn: FW,
+) where
+    FE: FnMut(&str, &str, &str, &str, &str, &str),
+    FW: FnMut(String),
+{
+    let task_ref = task_id.unwrap_or("unknown");
+    match cleanup_result {
+        Ok(BranchCleanupResult::Deleted) => {
+            let msg = format!(
+                "branch cleanup success context={} task={} branch={} base={}",
+                context, task_ref, branch, base
+            );
+            emit_event(
+                "branch_cleanup",
+                task_ref,
+                phase,
+                "success",
+                &msg,
+                "info",
+            );
+        }
+        Ok(BranchCleanupResult::Skipped { reason }) => {
+            let msg = format!(
+                "branch cleanup skipped context={} task={} branch={} base={} reason={}",
+                context, task_ref, branch, base, reason
+            );
+            warn(format!("warning: {}", msg));
+            emit_event(
+                "branch_cleanup",
+                task_ref,
+                phase,
+                "skipped",
+                &msg,
+                "warning",
+            );
+        }
+        Err(err) => {
+            let msg = format!(
+                "branch cleanup deferred context={} task={} branch={} base={} error={}",
+                context, task_ref, branch, base, err
+            );
+            warn(format!("warning: {}", msg));
+            emit_event(
+                "branch_cleanup",
+                task_ref,
+                phase,
+                "deferred",
+                &msg,
+                "warning",
+            );
+            let _ = append_branch_cleanup_queue_entry(
+                repo_root,
+                &BranchCleanupQueueEntry {
+                    task_id: task_ref.to_string(),
+                    phase: phase.to_string(),
+                    branch: branch.to_string(),
+                    base: base.to_string(),
+                    context: context.to_string(),
+                    reason: err.to_string(),
+                    attempts: 0,
+                },
+            );
+        }
+    }
 }

@@ -18,7 +18,7 @@ impl<'a> Command for ToolCommand<'a> {
     fn run(&self) -> Result<()> {
         let paths = crate::services::project::ensure_initialized_paths(&self.cwd)?;
         match self.command {
-            ToolCommands::Install { tool_id, yes } => crate::services::ops::install_tool(&paths, tool_id, *yes),
+            ToolCommands::Install { tool_id, yes } => crate::services::tooling::install_tool(&paths, tool_id, *yes),
             ToolCommands::Update {
                 tool_id,
                 all,
@@ -27,17 +27,19 @@ impl<'a> Command for ToolCommand<'a> {
                 yes,
                 force,
                 rollback_on_fail,
-            } => crate::services::ops::update_tools(
+            } => crate::services::tooling::update_tools(
                 &paths,
-                tool_id.as_deref(),
-                *all,
-                only.as_deref(),
-                *check,
-                *yes,
-                *force,
-                *rollback_on_fail,
+                crate::services::tooling::ToolUpdateCommandOptions {
+                    tool_id: tool_id.as_deref(),
+                    all: *all,
+                    only: only.as_deref(),
+                    check: *check,
+                    assume_yes: *yes,
+                    force: *force,
+                    rollback_on_fail: *rollback_on_fail,
+                },
             ),
-            ToolCommands::Outdated { only } => crate::services::ops::show_outdated_tools(&paths, only.as_deref()),
+            ToolCommands::Outdated { only } => crate::services::tooling::show_outdated_tools(&paths, only.as_deref()),
         }
     }
 }

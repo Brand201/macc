@@ -23,6 +23,6 @@ impl<'a, E: Engine> InitCommand<'a, E> {
 
 impl<'a, E: Engine> Command for InitCommand<'a, E> {
     fn run(&self) -> Result<()> {
-        crate::services::ops::handle_init_command(&self.cwd, self.engine, self.force, self.wizard)
+        crate::services::lifecycle::init(&self.cwd, self.engine, self.force, self.wizard)
     }
 }

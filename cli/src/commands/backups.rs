@@ -18,13 +18,19 @@ impl<'a> Command for BackupsCommand<'a> {
     fn run(&self) -> Result<()> {
         let paths = macc_core::find_project_root(&self.cwd)?;
         match self.command {
-            BackupsCommands::List { user } => crate::services::ops::list_backup_sets_command(&paths, *user),
+            BackupsCommands::List { user } => crate::services::backups::list(&paths, *user),
             BackupsCommands::Open {
                 id,
                 latest,
                 user,
                 editor,
-            } => crate::services::ops::open_backup_set_command(&paths, id.as_deref(), *latest, *user, editor),
+            } => crate::services::backups::open(
+                &paths,
+                id.as_deref(),
+                *latest,
+                *user,
+                editor,
+            ),
         }
     }
 }

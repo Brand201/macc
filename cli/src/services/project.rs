@@ -85,3 +85,41 @@ pub fn report_diagnostics(diagnostics: &[macc_core::tool::ToolDiagnostic]) {
         }
     }
 }
+
+pub fn confirm_yes_no(prompt: &str) -> Result<bool> {
+    use std::io::{self, Write};
+
+    print!("{}", prompt);
+    io::stdout().flush().map_err(|e| MaccError::Io {
+        path: "stdout".into(),
+        action: "flush prompt".into(),
+        source: e,
+    })?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| MaccError::Io {
+            path: "stdin".into(),
+            action: "read confirmation".into(),
+            source: e,
+        })?;
+    let value = input.trim().to_ascii_lowercase();
+    Ok(value == "y" || value == "yes")
+}
+
+pub fn ensure_coordinator_run_id() -> String {
+    if let Ok(existing) = std::env::var("COORDINATOR_RUN_ID") {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let generated = format!(
+        "run-{}-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        std::process::id()
+    );
+    std::env::set_var("COORDINATOR_RUN_ID", &generated);
+    generated
+}

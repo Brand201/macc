@@ -32,7 +32,7 @@ impl<'a> Command for RestoreCommand<'a> {
                 "restore requires --latest or --backup <id>".into(),
             ));
         }
-        crate::services::ops::restore_backup_set_command(
+        crate::services::backups::restore(
             &paths,
             self.user,
             self.backup,

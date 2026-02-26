@@ -31,7 +31,7 @@ impl<'a, E: Engine> PlanCommand<'a, E> {
 
 impl<'a, E: Engine> Command for PlanCommand<'a, E> {
     fn run(&self) -> Result<()> {
-        crate::services::ops::handle_plan_command(
+        crate::services::lifecycle::plan(
             &self.cwd,
             self.engine,
             self.tools.as_deref(),

@@ -37,7 +37,7 @@ impl<'a, E: Engine> ApplyCommand<'a, E> {
 
 impl<'a, E: Engine> Command for ApplyCommand<'a, E> {
     fn run(&self) -> Result<()> {
-        crate::services::ops::handle_apply_command(
+        crate::services::lifecycle::apply(
             &self.cwd,
             self.engine,
             self.tools.as_deref(),

@@ -25,7 +25,7 @@ impl<'a> ContextCommand<'a> {
 impl<'a> Command for ContextCommand<'a> {
     fn run(&self) -> Result<()> {
         let paths = crate::services::project::ensure_initialized_paths(&self.cwd)?;
-        crate::services::ops::run_context_generation(
+        crate::services::context::run_generation(
             &paths,
             self.tool,
             self.from_files,
