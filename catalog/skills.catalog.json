@@ -4,6 +4,63 @@
   "updated_at": "2026-01-30",
   "entries": [
     {
+      "id": "macc-code-reviewer",
+      "name": "macc code reviewer",
+      "description": "AI code reviewer for MACC tasks, providing feedback and validation against project standards.",
+      "tags": [
+        "macc",
+        "review",
+        "quality"
+      ],
+      "selector": {
+        "subpath": "skills/macc-code-reviewer"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/mod-one/skills.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "macc-performer",
+      "name": "macc performer",
+      "description": "Core implementation agent for MACC tasks, following the implement-act-observe cycle.",
+      "tags": [
+        "macc",
+        "performer",
+        "implementation"
+      ],
+      "selector": {
+        "subpath": "skills/macc-performer"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/mod-one/skills.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "macc-prd-planner",
+      "name": "macc prd planner",
+      "description": "High-level project planner for MACC, generating PRDs and task registries.",
+      "tags": [
+        "macc",
+        "planning",
+        "prd"
+      ],
+      "selector": {
+        "subpath": "skills/macc-prd-planner"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/mod-one/skills.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
       "id": "dfigma-implement-designc",
       "name": "figma implement design",
       "description": "This skill provides a structured workflow for translating Figma designs into production-ready code with pixel-perfect accuracy.",
@@ -246,63 +303,6 @@
       "source": {
         "kind": "git",
         "url": "https://github.com/wshobson/agents.git",
-        "ref": "main",
-        "checksum": null
-      }
-    },
-    {
-      "id": "macc-code-reviewer",
-      "name": "macc code reviewer",
-      "description": "AI code reviewer for MACC tasks, providing feedback and validation against project standards.",
-      "tags": [
-        "macc",
-        "review",
-        "quality"
-      ],
-      "selector": {
-        "subpath": "skills/macc-code-reviewer"
-      },
-      "source": {
-        "kind": "git",
-        "url": "https://github.com/mod-one/skills.git",
-        "ref": "main",
-        "checksum": null
-      }
-    },
-    {
-      "id": "macc-performer",
-      "name": "macc performer",
-      "description": "Core implementation agent for MACC tasks, following the implement-act-observe cycle.",
-      "tags": [
-        "macc",
-        "performer",
-        "implementation"
-      ],
-      "selector": {
-        "subpath": "skills/macc-performer"
-      },
-      "source": {
-        "kind": "git",
-        "url": "https://github.com/mod-one/skills.git",
-        "ref": "main",
-        "checksum": null
-      }
-    },
-    {
-      "id": "macc-prd-planner",
-      "name": "macc prd planner",
-      "description": "High-level project planner for MACC, generating PRDs and task registries.",
-      "tags": [
-        "macc",
-        "planning",
-        "prd"
-      ],
-      "selector": {
-        "subpath": "skills/macc-prd-planner"
-      },
-      "source": {
-        "kind": "git",
-        "url": "https://github.com/mod-one/skills.git",
         "ref": "main",
         "checksum": null
       }

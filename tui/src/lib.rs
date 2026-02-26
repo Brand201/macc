@@ -390,11 +390,13 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
                 .map(|index| {
                     let skill = &state.skills[*index];
                     let is_enabled = selected_skills.contains(&skill.id.to_string());
+                    let is_required = macc_core::is_required_skill(&skill.id);
                     let enabled_marker = if is_enabled { "[x]" } else { "[ ]" };
+                    let required_badge = if is_required { " [required]" } else { "" };
                     ListItem::new(Line::from(vec![
                         Span::raw(enabled_marker),
                         Span::raw(" "),
-                        Span::raw(skill.name.clone()),
+                        Span::raw(format!("{}{}", skill.name, required_badge)),
                     ]))
                 })
                 .collect();
@@ -427,6 +429,9 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
                 let mut desc_text = format!("ID: {}\n\n", current_skill.id);
                 desc_text.push_str("Description:\n");
                 desc_text.push_str(&current_skill.description);
+                if macc_core::is_required_skill(&current_skill.id) {
+                    desc_text.push_str("\n\nRequired skill: always enabled (read-only toggle).");
+                }
                 desc_text.push_str("\n\n---\nShortcuts:\n'a' - Select All\n'n' - Select None");
 
                 let desc_para = Paragraph::new(desc_text).block(panel("Details"));

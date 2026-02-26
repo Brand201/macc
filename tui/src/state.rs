@@ -2785,7 +2785,13 @@ impl AppState {
         let Some(path) = self.skill_target_path.as_deref() else {
             return Vec::new();
         };
-        self.read_string_list_at(path)
+        let mut selected = self.read_string_list_at(path);
+        for required in macc_core::required_skills() {
+            selected.push((*required).to_string());
+        }
+        selected.sort();
+        selected.dedup();
+        selected
     }
 
     pub fn selected_agents(&self) -> Vec<String> {
@@ -2920,7 +2926,15 @@ impl AppState {
     }
 
     fn set_string_list_at(&mut self, pointer: &str, values: Vec<String>) {
-        let array = values.into_iter().map(Value::String).collect();
+        let mut normalized = values;
+        if self.skill_target_path.as_deref() == Some(pointer) {
+            for required in macc_core::required_skills() {
+                normalized.push((*required).to_string());
+            }
+            normalized.sort();
+            normalized.dedup();
+        }
+        let array = normalized.into_iter().map(Value::String).collect();
         let _ = self.set_value_at(pointer, Value::Array(array));
     }
 
@@ -3015,6 +3029,14 @@ impl AppState {
             .unwrap_or(self.skill_selection_index);
         self.ensure_working_copy();
         let skill_id = self.skills[selected_index].id.to_string();
+        if macc_core::is_required_skill(&skill_id) {
+            self.set_status(
+                UiStatusLevel::Warning,
+                format!("cannot disable required skill '{}'", skill_id),
+                Some(Duration::from_secs(4)),
+            );
+            return;
+        }
         let mut skills = self.read_string_list_at(&path);
         skills = toggle_vec_item(skills, skill_id);
         self.set_string_list_at(&path, skills);
@@ -3036,7 +3058,16 @@ impl AppState {
             return;
         };
         self.ensure_working_copy();
-        self.set_string_list_at(&path, Vec::new());
+        let required = macc_core::required_skills()
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect();
+        self.set_string_list_at(&path, required);
+        self.set_status(
+            UiStatusLevel::Info,
+            "required skills remain enabled",
+            Some(Duration::from_secs(4)),
+        );
     }
 
     pub fn next_agent(&mut self) {
@@ -3175,6 +3206,7 @@ impl AppState {
         }
 
         self.apply_tool_defaults();
+        self.ensure_required_skills_selected();
 
         let yaml = match self
             .working_copy
@@ -3259,6 +3291,20 @@ impl AppState {
         }
 
         self.apply_tool_normalizations();
+    }
+
+    fn ensure_required_skills_selected(&mut self) {
+        let Some(ref mut wc) = self.working_copy else {
+            return;
+        };
+        let selections = wc
+            .selections
+            .get_or_insert_with(macc_core::config::SelectionsConfig::default);
+        for required in macc_core::required_skills() {
+            selections.skills.push((*required).to_string());
+        }
+        selections.skills.sort();
+        selections.skills.dedup();
     }
 
     fn apply_tool_normalizations(&mut self) {
@@ -4244,7 +4290,10 @@ mod tests {
                 .clone(),
         )
         .unwrap();
-        assert_eq!(current_skills, vec!["mock-skill-one"]);
+        assert!(current_skills.contains(&"mock-skill-one".to_string()));
+        for required in macc_core::required_skills() {
+            assert!(current_skills.contains(&required.to_string()));
+        }
 
         // Move to next skill
         state.next_skill();
@@ -4266,7 +4315,11 @@ mod tests {
                 .clone(),
         )
         .unwrap();
-        assert_eq!(current_skills, vec!["mock-skill-one", "mock-skill-two"]);
+        assert!(current_skills.contains(&"mock-skill-one".to_string()));
+        assert!(current_skills.contains(&"mock-skill-two".to_string()));
+        for required in macc_core::required_skills() {
+            assert!(current_skills.contains(&required.to_string()));
+        }
 
         // Select none
         state.select_no_skills();
@@ -4284,7 +4337,9 @@ mod tests {
                 .clone(),
         )
         .unwrap();
-        assert!(current_skills.is_empty());
+        for required in macc_core::required_skills() {
+            assert!(current_skills.contains(&required.to_string()));
+        }
 
         // Select all
         state.select_all_skills();
@@ -4302,9 +4357,12 @@ mod tests {
                 .clone(),
         )
         .unwrap();
-        assert_eq!(current_skills.len(), 2);
+        assert!(current_skills.len() >= 2);
         assert!(current_skills.contains(&"mock-skill-one".to_string()));
         assert!(current_skills.contains(&"mock-skill-two".to_string()));
+        for required in macc_core::required_skills() {
+            assert!(current_skills.contains(&required.to_string()));
+        }
     }
 
     #[test]

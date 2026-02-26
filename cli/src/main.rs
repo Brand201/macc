@@ -8189,6 +8189,12 @@ fn remove_skill(
     catalog: &mut SkillsCatalog,
     id: String,
 ) -> Result<()> {
+    if macc_core::is_required_skill(&id) {
+        return Err(MaccError::Validation(format!(
+            "cannot disable required skill '{}'",
+            id
+        )));
+    }
     if catalog.delete_skill_entry(&id) {
         catalog.save_atomically(paths, &paths.skills_catalog_path())?;
         println!("Skill '{}' removed successfully.", id);
