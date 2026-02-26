@@ -203,7 +203,7 @@ pub fn quickstart(
     );
 
     if apply {
-        run_plan_then_optional_apply(&app.engine, &paths, assume_yes)?;
+        run_plan_then_optional_apply(app, &paths, assume_yes)?;
         return Ok(());
     }
 
@@ -227,12 +227,12 @@ pub fn quickstart(
 }
 
 fn run_plan_then_optional_apply(
-    engine: &SharedEngine,
+    app: &AppContext,
     paths: &macc_core::ProjectPaths,
     assume_yes: bool,
 ) -> Result<()> {
-    let canonical = load_canonical_config(&paths.config_path)?;
-    let (_descriptors, diagnostics) = engine.list_tools(paths);
+    let canonical = app.canonical_config()?;
+    let (_descriptors, diagnostics) = app.engine.list_tools(paths);
     crate::services::project::report_diagnostics(&diagnostics);
     let overrides = CliOverrides::default();
     let resolved = resolve(&canonical, &overrides);
@@ -240,7 +240,9 @@ fn run_plan_then_optional_apply(
     let materialized_units =
         macc_adapter_shared::fetch::materialize_fetch_units(paths, fetch_units)?;
 
-    let plan = engine.plan(paths, &canonical, &materialized_units, &overrides)?;
+    let plan = app
+        .engine
+        .plan(paths, &canonical, &materialized_units, &overrides)?;
     macc_core::preview_plan(&plan, paths)?;
     println!("Core: Total actions planned: {}", plan.actions.len());
 
@@ -249,14 +251,15 @@ fn run_plan_then_optional_apply(
         return Ok(());
     }
 
-    let canonical = load_canonical_config(&paths.config_path)?;
     let overrides = CliOverrides::default();
     let resolved = resolve(&canonical, &overrides);
     let fetch_units = resolve_fetch_units(paths, &resolved)?;
     let materialized_units =
         macc_adapter_shared::fetch::materialize_fetch_units(paths, fetch_units)?;
-    let mut apply_plan = engine.plan(paths, &canonical, &materialized_units, &overrides)?;
-    let report = engine.apply(paths, &mut apply_plan, false)?;
+    let mut apply_plan = app
+        .engine
+        .plan(paths, &canonical, &materialized_units, &overrides)?;
+    let report = app.engine.apply(paths, &mut apply_plan, false)?;
     println!("{}", report.render_cli());
     crate::mark_apply_completed(paths)?;
     Ok(())

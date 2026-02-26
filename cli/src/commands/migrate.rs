@@ -16,7 +16,7 @@ impl MigrateCommand {
 impl Command for MigrateCommand {
     fn run(&self) -> Result<()> {
         let paths = self.app.project_paths()?;
-        let canonical = macc_core::load_canonical_config(&paths.config_path)?;
+        let canonical = self.app.canonical_config()?;
 
         let (descriptors, diagnostics) = self.app.engine.list_tools(&paths);
         crate::services::project::report_diagnostics(&diagnostics);

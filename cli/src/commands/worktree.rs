@@ -28,7 +28,7 @@ impl<'a> Command for WorktreeCommand<'a> {
                 allow_user_scope,
             } => {
                 let paths = self.app.project_paths()?;
-                let canonical = macc_core::load_canonical_config(&paths.config_path)?;
+                let canonical = self.app.canonical_config()?;
 
                 let spec = macc_core::WorktreeCreateSpec {
                     slug: slug.clone(),
