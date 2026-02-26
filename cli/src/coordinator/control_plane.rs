@@ -1,7 +1,7 @@
 use crate::{
     append_coordinator_event, append_coordinator_event_with_severity, build_non_task_worker_slug,
     build_phase_prompt_native, cleanup_merged_local_branch, count_pool_worktrees,
-    ensure_tool_json, find_reusable_worktree_native, now_iso_coordinator,
+    find_reusable_worktree_native, now_iso_coordinator,
     recompute_resource_locks_from_tasks, report_branch_cleanup_outcome, resolve_phase_runner_native,
     set_registry_updated_at, spawn_merge_job_native, spawn_performer_job_native, summarize_output,
     write_worktree_prd_for_task, CoordinatorEnvConfig, CoordinatorMergeJob, CoordinatorRunState,
@@ -1810,7 +1810,7 @@ pub async fn dispatch_ready_tasks_native(
             dispatch_failed_this_cycle.insert(selected.id.clone());
             break;
         }
-        if let Err(err) = ensure_tool_json(repo_root, &worktree_path, &selected.tool) {
+        if let Err(err) = crate::services::worktree::ensure_tool_json(repo_root, &worktree_path, &selected.tool) {
             let msg = format!(
                 "dispatch failed for task {}: ensure tool.json failed ({})",
                 selected.id, err

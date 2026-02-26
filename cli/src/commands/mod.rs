@@ -4,6 +4,21 @@ use macc_core::{load_canonical_config, ProjectPaths, Result, ToolDescriptor};
 use std::path::Path;
 
 pub mod coordinator;
+pub mod init;
+pub mod plan;
+pub mod apply;
+pub mod quickstart;
+pub mod catalog;
+pub mod install;
+pub mod tool;
+pub mod context;
+pub mod doctor;
+pub mod migrate;
+pub mod backups;
+pub mod restore;
+pub mod clear;
+pub mod worktree;
+pub mod logs;
 
 pub trait Command {
     fn run(&self) -> Result<()>;

@@ -1,7 +1,7 @@
 use crate::{
     cleanup_registry_native, clear_coordinator_pause_file, coordinator,
     coordinator_runtime_status_from_event_action, coordinator_select_ready_task_action,
-    coordinator_storage_sync_action, ensure_initialized_paths, load_canonical_config,
+    coordinator_storage_sync_action, load_canonical_config,
     parse_coordinator_extra_kv_args, read_coordinator_pause_file, reconcile_registry_native,
     remove_all_worktrees, resolve_coordinator_storage_mode, resume_paused_task_integrate,
     run_coordinator_control_plane_rust, set_task_paused_for_integrate,
@@ -18,6 +18,8 @@ use macc_core::coordinator_storage::{
 use macc_core::{MaccError, Result};
 use std::path::Path;
 use std::str::FromStr;
+
+use crate::services::project::ensure_initialized_paths;
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorCommandInput {
