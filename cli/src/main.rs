@@ -6082,20 +6082,36 @@ fn build_context_prompt(
     );
     prompt.push_str("7. Synthesis: produce a context file that is immediately usable.\n\n");
 
+    prompt.push_str("Mandatory skill-routing section (must be present in the generated context file)\n");
+    prompt.push_str("Add a dedicated `# Project Mandates` section and keep it deterministic.\n");
+    prompt.push_str("Separate clearly:\n");
+    prompt.push_str("- Global mandates (always valid)\n");
+    prompt.push_str("- Mode-specific mandates (active only for the current phase)\n");
+    prompt.push_str("Use repository-relative paths only (no absolute paths):\n");
+    prompt.push_str("- planning -> `skills/macc-prd-planner/SKILL.md`\n");
+    prompt.push_str("- execution -> `skills/macc-performer/SKILL.md`\n");
+    prompt.push_str("- review -> `skills/macc-code-reviewer/SKILL.md`\n");
+    prompt.push_str("Fallback rule (explicit and mandatory): if a required skill file is absent or inaccessible, stop and report the error.\n");
+    prompt.push_str("Add a `## Path validation` subsection with a short checklist that verifies these files exist.\n");
+    prompt.push_str("Add `## Architecture Source of Truth` with repository-relative references:\n");
+    prompt.push_str("- `skills/macc-performer/docs/ERRORS.md`\n");
+    prompt.push_str("- `skills/macc-performer/docs/adr/0000-template.md`\n\n");
+
     prompt.push_str("Deliverable: write the target file with this exact outline\n");
-    prompt.push_str("0. TL;DR (max 10 lines)\n");
-    prompt.push_str("1. Project identity card\n");
-    prompt.push_str("2. Stack & tooling (with sources)\n");
-    prompt.push_str("3. Architecture & components\n");
-    prompt.push_str("4. Reproducible local setup\n");
-    prompt.push_str("5. Essential commands (copy/paste)\n");
-    prompt.push_str("6. Developer standards (Do / Don't)\n");
-    prompt.push_str("7. Test & quality strategy\n");
-    prompt.push_str("8. Productivity playbooks (typical tasks)\n");
-    prompt.push_str("9. Security (priority)\n");
-    prompt.push_str("10. Compliance & governance\n");
-    prompt.push_str("11. \"Where to find what\" (agent FAQ)\n");
-    prompt.push_str("12. Unknowns & documentation debt\n\n");
+    prompt.push_str("0. Project Mandates (global + mode-specific + path validation)\n");
+    prompt.push_str("1. TL;DR (max 10 lines)\n");
+    prompt.push_str("2. Project identity card\n");
+    prompt.push_str("3. Stack & tooling (with sources)\n");
+    prompt.push_str("4. Architecture & components\n");
+    prompt.push_str("5. Reproducible local setup\n");
+    prompt.push_str("6. Essential commands (copy/paste)\n");
+    prompt.push_str("7. Developer standards (Do / Don't)\n");
+    prompt.push_str("8. Test & quality strategy\n");
+    prompt.push_str("9. Productivity playbooks (typical tasks)\n");
+    prompt.push_str("10. Security (priority)\n");
+    prompt.push_str("11. Compliance & governance\n");
+    prompt.push_str("12. \"Where to find what\" (agent FAQ)\n");
+    prompt.push_str("13. Unknowns & documentation debt\n\n");
 
     prompt.push_str("Output rules\n");
     prompt.push_str(&format!(
