@@ -56,6 +56,14 @@ fn run_git_status(current_dir: &Path, args: &[&str], action: &str) -> Result<Exi
         })
 }
 
+pub fn run_git_output_mapped(
+    current_dir: &Path,
+    args: &[&str],
+    action: &str,
+) -> Result<Output> {
+    run_git_output(current_dir, args, action)
+}
+
 pub fn worktree_list_porcelain(repo_root: &Path) -> Result<String> {
     let output = run_git_output(
         repo_root,
@@ -255,6 +263,69 @@ pub fn merge_ff_only(repo_or_worktree: &Path, reference: &str) -> Result<bool> {
         "run git merge --ff-only",
     )?
     .success())
+}
+
+pub fn head_commit(repo_or_worktree: &Path) -> Result<String> {
+    let output = run_git_output(repo_or_worktree, &["rev-parse", "HEAD"], "read git head")?;
+    if !output.status.success() {
+        return Err(MaccError::Validation(format!(
+            "Failed to resolve HEAD in {}",
+            repo_or_worktree.display()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn current_branch(repo_or_worktree: &Path) -> Result<String> {
+    let output = run_git_output(
+        repo_or_worktree,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        "read git current branch",
+    )?;
+    if !output.status.success() {
+        return Err(MaccError::Validation(format!(
+            "Failed to resolve current branch in {}",
+            repo_or_worktree.display()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn rev_parse_verify(repo_or_worktree: &Path, reference: &str) -> Result<bool> {
+    Ok(
+        run_git_status(
+            repo_or_worktree,
+            &["rev-parse", "--verify", reference],
+            "run git rev-parse --verify",
+        )?
+        .success(),
+    )
+}
+
+pub fn merge_base_is_ancestor(repo_or_worktree: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    Ok(
+        run_git_status(
+            repo_or_worktree,
+            &["merge-base", "--is-ancestor", ancestor, descendant],
+            "run git merge-base --is-ancestor",
+        )?
+        .success(),
+    )
+}
+
+pub fn checkout_new_branch_from_base(
+    repo_or_worktree: &Path,
+    branch: &str,
+    base_branch: &str,
+) -> Result<bool> {
+    Ok(
+        run_git_status(
+            repo_or_worktree,
+            &["checkout", "-B", branch, base_branch],
+            "create branch from base",
+        )?
+        .success(),
+    )
 }
 
 pub async fn merge_ff_only_async(repo_or_worktree: &Path, reference: &str) -> Result<bool> {

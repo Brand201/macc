@@ -94,16 +94,7 @@ fn sanitize_slug(input: &str) -> String {
 }
 
 fn is_worktree_clean(worktree_path: &Path) -> Result<bool> {
-    let output = std::process::Command::new("git")
-        .current_dir(worktree_path)
-        .args(["status", "--porcelain"])
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: worktree_path.to_string_lossy().into(),
-            action: "check worktree clean status".into(),
-            source: e,
-        })?;
-    Ok(output.status.success() && String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    Ok(!macc_core::git::is_dirty(worktree_path)?)
 }
 
 fn active_task_worktree_paths(registry: &serde_json::Value) -> HashSet<String> {
@@ -237,85 +228,31 @@ fn build_reuse_branch_name(tool: &str, worktree_path: &Path) -> String {
 }
 
 fn git_current_branch_name(worktree_path: &Path) -> Option<String> {
-    std::process::Command::new("git")
-        .current_dir(worktree_path)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })
+    macc_core::git::current_branch(worktree_path).ok()
 }
 
 fn prepare_reused_worktree_base(worktree_path: &Path, base_branch: &str) -> Result<(bool, bool)> {
-    fn run_git_status_ok(worktree_path: &Path, action: &str, args: &[&str]) -> Result<bool> {
-        let status = std::process::Command::new("git")
-            .current_dir(worktree_path)
-            .args(args)
-            .status()
-            .map_err(|e| MaccError::Io {
-                path: worktree_path.to_string_lossy().into(),
-                action: action.to_string(),
-                source: e,
-            })?;
-        Ok(status.success())
-    }
-
-    if !run_git_status_ok(
-        worktree_path,
-        "reset reused worktree tracked changes",
-        &["reset", "--hard", "HEAD"],
-    )? {
+    if !macc_core::git::reset_hard(worktree_path, "HEAD")? {
         return Ok((false, false));
     }
-    if !run_git_status_ok(
-        worktree_path,
-        "clean reused worktree artifacts",
-        &["clean", "-fd"],
-    )? {
+    if !macc_core::git::clean_fd(worktree_path)? {
         return Ok((false, false));
     }
-    if !run_git_status_ok(
-        worktree_path,
-        "checkout base branch in reused worktree",
-        &["checkout", base_branch],
-    )? && !run_git_status_ok(
-        worktree_path,
-        "checkout reset base branch in reused worktree",
-        &["checkout", "-B", base_branch, base_branch],
-    )? {
+    if !macc_core::git::checkout(worktree_path, base_branch, false)?
+        && !macc_core::git::checkout_reset_branch(worktree_path, base_branch, false)?
+    {
         return Ok((false, false));
     }
-    if !run_git_status_ok(
-        worktree_path,
-        "fetch origin refs in reused worktree",
-        &["fetch", "origin"],
-    )? {
+    if !macc_core::git::fetch(worktree_path, "origin")? {
         return Ok((false, false));
     }
-    if !run_git_status_ok(
-        worktree_path,
-        "force reset reused worktree to base branch",
-        &["reset", "--hard", base_branch],
-    )? {
+    if !macc_core::git::reset_hard(worktree_path, base_branch)? {
         return Ok((false, false));
     }
-    if !run_git_status_ok(
-        worktree_path,
-        "reset reused worktree to refreshed base branch",
-        &["reset", "--hard", "HEAD"],
-    )? {
+    if !macc_core::git::reset_hard(worktree_path, "HEAD")? {
         return Ok((false, false));
     }
-    if !run_git_status_ok(
-        worktree_path,
-        "clean reused worktree artifacts",
-        &["clean", "-fd"],
-    )? {
+    if !macc_core::git::clean_fd(worktree_path)? {
         return Ok((false, false));
     }
     Ok((true, false))
@@ -325,21 +262,11 @@ fn is_branch_merged_into_base(worktree_path: &Path, branch: &str, base_branch: &
     if branch.is_empty() || branch == base_branch {
         return true;
     }
-    let exists = std::process::Command::new("git")
-        .current_dir(worktree_path)
-        .args(["rev-parse", "--verify", branch])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let exists = macc_core::git::rev_parse_verify(worktree_path, branch).unwrap_or(false);
     if !exists {
         return true;
     }
-    std::process::Command::new("git")
-        .current_dir(worktree_path)
-        .args(["merge-base", "--is-ancestor", branch, base_branch])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    macc_core::git::merge_base_is_ancestor(worktree_path, branch, base_branch).unwrap_or(false)
 }
 
 pub(crate) fn find_reusable_worktree_native(
@@ -377,11 +304,7 @@ pub(crate) fn find_reusable_worktree_native(
             ));
             continue;
         }
-        let merge_head = std::process::Command::new("git")
-            .current_dir(&entry.path)
-            .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
-            .status()
-            .map(|s| s.success())
+        let merge_head = macc_core::git::rev_parse_verify(&entry.path, "MERGE_HEAD")
             .unwrap_or(false);
         if merge_head {
             last_prepare_error = Some((
@@ -390,12 +313,7 @@ pub(crate) fn find_reusable_worktree_native(
             ));
             continue;
         }
-        let base_ok = std::process::Command::new("git")
-            .current_dir(&entry.path)
-            .args(["rev-parse", "--verify", base_branch])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let base_ok = macc_core::git::rev_parse_verify(&entry.path, base_branch).unwrap_or(false);
         if !base_ok {
             last_prepare_error = Some((
                 "base_branch_missing".to_string(),
@@ -445,28 +363,14 @@ pub(crate) fn find_reusable_worktree_native(
         let mut branch = build_reuse_branch_name(tool, &entry.path);
         let mut i = 0usize;
         loop {
-            let exists = std::process::Command::new("git")
-                .current_dir(repo_root)
-                .args(["rev-parse", "--verify", &branch])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let exists = macc_core::git::rev_parse_verify(repo_root, &branch).unwrap_or(false);
             if !exists {
                 break;
             }
             i += 1;
             branch = format!("{}-{}", build_reuse_branch_name(tool, &entry.path), i);
         }
-        let status = std::process::Command::new("git")
-            .current_dir(&entry.path)
-            .args(["checkout", "-B", &branch, base_branch])
-            .status()
-            .map_err(|e| MaccError::Io {
-                path: entry.path.to_string_lossy().into(),
-                action: "create branch in reused worktree".into(),
-                source: e,
-            })?;
-        if !status.success() {
+        if !macc_core::git::checkout_new_branch_from_base(&entry.path, &branch, base_branch)? {
             last_prepare_error = Some((
                 "checkout_new_branch_failed".to_string(),
                 format!(
@@ -499,13 +403,7 @@ pub(crate) fn find_reusable_worktree_native(
                 |msg| tracing::warn!("{}", msg),
             );
         }
-        let last_commit = std::process::Command::new("git")
-            .current_dir(&entry.path)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
+        let last_commit = macc_core::git::head_commit(&entry.path).unwrap_or_default();
 
         let existing = macc_core::read_worktree_metadata(&entry.path)?.unwrap_or(
             macc_core::WorktreeMetadata {

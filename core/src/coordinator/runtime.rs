@@ -1,5 +1,6 @@
 use crate::coordinator::engine::ReviewVerdict;
 use crate::{MaccError, Result};
+use crate::git;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
@@ -105,48 +106,20 @@ pub fn parse_review_verdict(output: &str) -> Option<ReviewVerdict> {
 }
 
 fn git_status_clean(worktree: &Path) -> Result<bool> {
-    let output = std::process::Command::new("git")
-        .current_dir(worktree)
-        .args(["status", "--porcelain"])
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: worktree.to_string_lossy().into(),
-            action: "check git status for review pre/post check".into(),
-            source: e,
-        })?;
-    Ok(output.status.success() && String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    Ok(git::status_porcelain(worktree)?.trim().is_empty())
 }
 
 fn git_head_commit(worktree: &Path) -> Result<String> {
-    let output = std::process::Command::new("git")
-        .current_dir(worktree)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: worktree.to_string_lossy().into(),
-            action: "read git head for review checks".into(),
-            source: e,
-        })?;
-    if !output.status.success() {
-        return Err(MaccError::Validation(format!(
-            "Failed to resolve HEAD for review checks in {}",
-            worktree.display()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    git::head_commit(worktree)
 }
 
 fn git_ahead_count(worktree: &Path, base: &str) -> Result<usize> {
     let range = format!("{}..HEAD", base);
-    let output = std::process::Command::new("git")
-        .current_dir(worktree)
-        .args(["rev-list", "--count", &range])
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: worktree.to_string_lossy().into(),
-            action: "count ahead commits for review checks".into(),
-            source: e,
-        })?;
+    let output = git::run_git_output_mapped(
+        worktree,
+        &["rev-list", "--count", &range],
+        "count ahead commits for review checks",
+    )?;
     if !output.status.success() {
         return Ok(0);
     }
@@ -738,65 +711,33 @@ where
     })?;
     let suggestion = format!("git checkout {} && git merge {}", base, branch);
 
-    let verify_branch = std::process::Command::new("git")
-        .current_dir(repo_root)
-        .args(["rev-parse", "--verify", branch])
-        .output();
-    if !verify_branch
-        .as_ref()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
+    if !git::rev_parse_verify(repo_root, branch).unwrap_or(false) {
         return Ok(Err(format!(
             "failure:local_merge step=verify_branch branch={} base={} suggestion=\"{}\"",
             branch, base, suggestion
         )));
     }
-    let verify_base = std::process::Command::new("git")
-        .current_dir(repo_root)
-        .args(["rev-parse", "--verify", base])
-        .output();
-    if !verify_base
-        .as_ref()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
+    if !git::rev_parse_verify(repo_root, base).unwrap_or(false) {
         return Ok(Err(format!(
             "failure:local_merge step=verify_base branch={} base={} suggestion=\"{}\"",
             branch, base, suggestion
         )));
     }
 
-    let clean = std::process::Command::new("git")
-        .current_dir(repo_root)
-        .args(["status", "--porcelain"])
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: repo_root.to_string_lossy().into(),
-            action: "check git status".into(),
-            source: e,
-        })?;
-    if !String::from_utf8_lossy(&clean.stdout).trim().is_empty() {
+    if !git::status_porcelain(repo_root)?.trim().is_empty() {
         return Ok(Err(format!(
             "failure:local_merge step=precheck_clean branch={} base={} suggestion=\"{}\"",
             branch, base, suggestion
         )));
     }
 
-    let _ = std::process::Command::new("git")
-        .current_dir(repo_root)
-        .args(["checkout", base])
-        .status();
+    let _ = git::checkout(repo_root, base, false);
     let merge_msg = format!("macc: merge task {}", task_id);
-    let merge = std::process::Command::new("git")
-        .current_dir(repo_root)
-        .args(["merge", "--no-ff", "-m", &merge_msg, branch])
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: repo_root.to_string_lossy().into(),
-            action: "run local merge".into(),
-            source: e,
-        })?;
+    let merge = git::run_git_output_mapped(
+        repo_root,
+        &["merge", "--no-ff", "-m", &merge_msg, branch],
+        "run local merge",
+    )?;
     if merge.status.success() {
         return Ok(Ok(()));
     }
@@ -806,10 +747,11 @@ where
         String::from_utf8_lossy(&merge.stdout),
         String::from_utf8_lossy(&merge.stderr)
     );
-    let conflicts = std::process::Command::new("git")
-        .current_dir(repo_root)
-        .args(["diff", "--name-only", "--diff-filter=U"])
-        .output()
+    let conflicts = git::run_git_output_mapped(
+        repo_root,
+        &["diff", "--name-only", "--diff-filter=U"],
+        "list merge conflict files",
+    )
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().replace('\n', ","))
         .unwrap_or_default();
@@ -874,36 +816,29 @@ where
                     );
                 }
             }
-            let unresolved = std::process::Command::new("git")
-                .current_dir(repo_root)
-                .args(["diff", "--name-only", "--diff-filter=U"])
-                .output()
+            let unresolved = git::run_git_output_mapped(
+                repo_root,
+                &["diff", "--name-only", "--diff-filter=U"],
+                "list unresolved merge conflict files",
+            )
                 .ok()
                 .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
                 .unwrap_or(true);
-            let in_merge = std::process::Command::new("git")
-                .current_dir(repo_root)
-                .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let in_merge =
+                git::rev_parse_verify(repo_root, "MERGE_HEAD").unwrap_or(false);
             if !unresolved && !in_merge {
                 return Ok(Ok(()));
             }
         }
     }
 
-    let in_merge = std::process::Command::new("git")
-        .current_dir(repo_root)
-        .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let in_merge = git::rev_parse_verify(repo_root, "MERGE_HEAD").unwrap_or(false);
     if in_merge {
-        let _ = std::process::Command::new("git")
-            .current_dir(repo_root)
-            .args(["merge", "--abort"])
-            .status();
+        let _ = git::run_git_output_mapped(
+            repo_root,
+            &["merge", "--abort"],
+            "abort conflicted merge",
+        );
     }
 
     let report_file = log_dir.join(format!(
@@ -954,34 +889,10 @@ pub struct BranchCleanupQueueEntry {
 }
 
 fn delete_local_branch(repo_root: &Path, branch: &str) -> Result<()> {
-    let status = std::process::Command::new("git")
-        .current_dir(repo_root)
-        .args(["branch", "-d", branch])
-        .status()
-        .map_err(|e| MaccError::Io {
-            path: repo_root.to_string_lossy().into(),
-            action: "delete branch".into(),
-            source: e,
-        })?;
-    if status.success() {
-        return Ok(());
+    match git::delete_local_branch(repo_root, branch, false) {
+        Ok(()) => Ok(()),
+        Err(_) => git::delete_local_branch(repo_root, branch, true),
     }
-    let force = std::process::Command::new("git")
-        .current_dir(repo_root)
-        .args(["branch", "-D", branch])
-        .status()
-        .map_err(|e| MaccError::Io {
-            path: repo_root.to_string_lossy().into(),
-            action: "force delete branch".into(),
-            source: e,
-        })?;
-    if !force.success() {
-        return Err(MaccError::Validation(format!(
-            "git branch delete failed for '{}'",
-            branch
-        )));
-    }
-    Ok(())
 }
 
 pub fn cleanup_merged_local_branch(
@@ -1184,20 +1095,12 @@ where
 }
 
 fn find_worktree_using_branch(repo_root: &Path, branch: &str) -> Result<Option<PathBuf>> {
-    let output = std::process::Command::new("git")
-        .current_dir(repo_root)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: repo_root.to_string_lossy().into(),
-            action: "list git worktrees".into(),
-            source: e,
-        })?;
-    if !output.status.success() {
-        return Ok(None);
-    }
+    let output = match git::worktree_list_porcelain(repo_root) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(None),
+    };
     let mut current_path: Option<PathBuf> = None;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in output.lines() {
         let trimmed = line.trim();
         if let Some(path) = trimmed.strip_prefix("worktree ") {
             current_path = Some(PathBuf::from(path));

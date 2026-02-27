@@ -23,6 +23,8 @@ use tracing::{debug, error, info};
 mod commands;
 mod coordinator;
 mod services;
+#[cfg(test)]
+mod test_support;
 
 use crate::coordinator::helpers::now_iso_coordinator;
 use crate::coordinator::types::CoordinatorEnvConfig;
@@ -3303,6 +3305,7 @@ fn apply_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::run_git_ok;
     use macc_core::MaccError;
     use macc_core::TestEngine;
     use std::fs;
@@ -4080,43 +4083,11 @@ fi
         std::fs::create_dir_all(&root).unwrap();
         let ids = fixture_ids();
         std::fs::write(root.join("README.md"), "seed\n").unwrap();
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("init")
-            .status()
-            .unwrap();
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("config")
-            .arg("user.email")
-            .arg("macc-tests@example.com")
-            .status()
-            .unwrap();
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("config")
-            .arg("user.name")
-            .arg("macc-tests")
-            .status()
-            .unwrap();
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("add")
-            .arg("README.md")
-            .status()
-            .unwrap();
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("commit")
-            .arg("-m")
-            .arg("seed")
-            .status()
-            .unwrap();
+        run_git_ok(&root, &["init"]);
+        run_git_ok(&root, &["config", "user.email", "macc-tests@example.com"]);
+        run_git_ok(&root, &["config", "user.name", "macc-tests"]);
+        run_git_ok(&root, &["add", "README.md"]);
+        run_git_ok(&root, &["commit", "-m", "seed"]);
 
         run_with_engine(
             Cli {
@@ -4158,18 +4129,17 @@ fi
 
         let wt_path = root.join(".macc/worktree/stop-test");
         std::fs::create_dir_all(root.join(".macc/worktree")).unwrap();
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("worktree")
-            .arg("add")
-            .arg("-b")
-            .arg("ai/stop-test")
-            .arg(&wt_path)
-            .arg("HEAD")
-            .status()
-            .unwrap();
-        assert!(status.success(), "failed creating test worktree");
+        run_git_ok(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "ai/stop-test",
+                wt_path.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        );
 
         run_with_engine(
             Cli {
@@ -4207,16 +4177,8 @@ fi
             "worktree should be removed by coordinator stop"
         );
 
-        let branch_check = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("rev-parse")
-            .arg("--verify")
-            .arg("ai/stop-test")
-            .status()
-            .unwrap();
         assert!(
-            !branch_check.success(),
+            !macc_core::git::rev_parse_verify(&root, "ai/stop-test").unwrap_or(false),
             "branch should be deleted by coordinator stop --remove-branches"
         );
 
@@ -4556,31 +4518,14 @@ fi
         std::fs::write(skill_source_dir.join("macc.package.json"), manifest).unwrap();
         std::fs::write(skill_source_dir.join("SKILL.md"), "remote content").unwrap();
 
-        std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(&skill_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(&skill_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&skill_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&skill_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(&skill_source_dir)
-            .status()
-            .unwrap();
+        run_git_ok(&skill_source_dir, &["init", "-b", "main"]);
+        run_git_ok(
+            &skill_source_dir,
+            &["config", "user.email", "test@example.com"],
+        );
+        run_git_ok(&skill_source_dir, &["config", "user.name", "Test"]);
+        run_git_ok(&skill_source_dir, &["add", "."]);
+        run_git_ok(&skill_source_dir, &["commit", "-m", "initial"]);
 
         run_with_engine(
             Cli {
@@ -4673,31 +4618,11 @@ fi
         )
         .unwrap();
 
-        std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(&mcp_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(&mcp_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&mcp_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&mcp_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(&mcp_source_dir)
-            .status()
-            .unwrap();
+        run_git_ok(&mcp_source_dir, &["init", "-b", "main"]);
+        run_git_ok(&mcp_source_dir, &["config", "user.email", "test@example.com"]);
+        run_git_ok(&mcp_source_dir, &["config", "user.name", "Test"]);
+        run_git_ok(&mcp_source_dir, &["add", "."]);
+        run_git_ok(&mcp_source_dir, &["commit", "-m", "initial"]);
 
         // 3. Add to catalog
         run_with_engine(
@@ -5090,8 +5015,6 @@ fi
 
     #[test]
     fn test_install_skill_multi_git_cli() -> macc_core::Result<()> {
-        use std::process::Command;
-
         let temp_base =
             std::env::temp_dir().join(format!("macc_install_multi_git_test_{}", uuid_v4_like()));
         std::fs::create_dir_all(&temp_base).unwrap();
@@ -5102,20 +5025,7 @@ fi
         std::fs::create_dir_all(&repo_path).unwrap();
 
         // 1. Initialize a local git repo
-        let run_git = |args: &[&str], dir: &std::path::Path| {
-            let output = Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .expect("Failed to execute git command");
-            if !output.status.success() {
-                panic!(
-                    "git command failed: {:?} -> {}",
-                    args,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        };
+        let run_git = |args: &[&str], dir: &std::path::Path| run_git_ok(dir, args);
 
         run_git(&["init"], &repo_path);
         // Set user info for commits
