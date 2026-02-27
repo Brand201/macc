@@ -27,60 +27,31 @@ fn resolve_merge_timeout_seconds() -> usize {
         .unwrap_or(0)
 }
 
-fn sanitize_worktree_to_base(
+async fn sanitize_worktree_to_base(
     worktree_path: &Path,
     base_branch: &str,
 ) -> Result<bool> {
-    let run_ok = |action: &str, args: &[&str]| -> Result<bool> {
-        let status = std::process::Command::new("git")
-            .current_dir(worktree_path)
-            .args(args)
-            .status()
-            .map_err(|e| MaccError::Io {
-                path: worktree_path.to_string_lossy().into(),
-                action: action.to_string(),
-                source: e,
-            })?;
-        Ok(status.success())
-    };
-
-    if !run_ok(
-        "reset newly created worktree tracked changes",
-        &["reset", "--hard", "HEAD"],
-    )? {
+    if !macc_core::git::reset_hard_async(worktree_path, "HEAD").await? {
         return Ok(false);
     }
-    if !run_ok("clean newly created worktree artifacts", &["clean", "-fd"])? {
+    if !macc_core::git::clean_fd_async(worktree_path).await? {
         return Ok(false);
     }
-    if !run_ok(
-        "checkout base branch in newly created worktree",
-        &["checkout", base_branch],
-    )? && !run_ok(
-        "checkout reset base branch in newly created worktree",
-        &["checkout", "-B", base_branch, base_branch],
-    )? {
+    if !macc_core::git::checkout_async(worktree_path, base_branch, false).await?
+        && !macc_core::git::checkout_reset_branch_async(worktree_path, base_branch, false).await?
+    {
         return Ok(false);
     }
-    if !run_ok(
-        "fetch origin refs in newly created worktree",
-        &["fetch", "origin"],
-    )? {
+    if !macc_core::git::fetch_async(worktree_path, "origin").await? {
         return Ok(false);
     }
-    if !run_ok(
-        "force reset newly created worktree to base branch",
-        &["reset", "--hard", base_branch],
-    )? {
+    if !macc_core::git::reset_hard_async(worktree_path, base_branch).await? {
         return Ok(false);
     }
-    if !run_ok(
-        "final reset newly created worktree state",
-        &["reset", "--hard", "HEAD"],
-    )? {
+    if !macc_core::git::reset_hard_async(worktree_path, "HEAD").await? {
         return Ok(false);
     }
-    if !run_ok("final clean newly created worktree artifacts", &["clean", "-fd"])? {
+    if !macc_core::git::clean_fd_async(worktree_path).await? {
         return Ok(false);
     }
     Ok(true)
@@ -111,7 +82,7 @@ fn emit_dispatch_skipped(
     }
 }
 
-fn switch_worktree_to_base_after_merge(
+async fn switch_worktree_to_base_after_merge(
     repo_root: &Path,
     task: &serde_json::Value,
     logger: Option<&NativeCoordinatorLogger>,
@@ -141,32 +112,12 @@ fn switch_worktree_to_base_after_merge(
         .unwrap_or("master");
 
     let wt = Path::new(worktree_path);
-    let run = |action: &str, args: &[&str]| -> Result<std::process::Output> {
-        std::process::Command::new("git")
-            .current_dir(wt)
-            .args(args)
-            .output()
-            .map_err(|e| MaccError::Io {
-                path: wt.to_string_lossy().into(),
-                action: action.to_string(),
-                source: e,
-            })
-    };
 
     // First action after merge success: force checkout base to release task branch immediately.
-    let checkout = run(
-        "force checkout merged worktree base",
-        &["checkout", "-f", base_branch],
-    )?;
-    let switched = if checkout.status.success() {
+    let switched = if macc_core::git::checkout_async(wt, base_branch, true).await? {
         true
     } else {
-        run(
-            "force checkout reset merged worktree base",
-            &["checkout", "-f", "-B", base_branch, base_branch],
-        )?
-        .status
-        .success()
+        macc_core::git::checkout_reset_branch_async(wt, base_branch, true).await?
     };
     if !switched {
         let msg = format!(
@@ -188,14 +139,10 @@ fn switch_worktree_to_base_after_merge(
         return Ok(());
     }
     // Continue with sanitization now that the worker branch is no longer checked out.
-    let _ = run(
-        "reset merged worktree tracked changes",
-        &["reset", "--hard", "HEAD"],
-    )?;
-    let _ = run("clean merged worktree artifacts", &["clean", "-fd"])?;
+    let _ = macc_core::git::reset_hard_async(wt, "HEAD").await?;
+    let _ = macc_core::git::clean_fd_async(wt).await?;
     // Stateless policy: fetch origin refs then hard reset to base.
-    let fetch = run("fetch merged worktree refs", &["fetch", "origin"])?;
-    if !fetch.status.success() {
+    if !macc_core::git::fetch_async(wt, "origin").await? {
         let msg = format!(
             "worktree switch warning task={} path={} base={} reason=fetch_failed",
             task_id, worktree_path, base_branch
@@ -214,11 +161,7 @@ fn switch_worktree_to_base_after_merge(
         }
         return Ok(());
     }
-    let reset = run(
-        "reset merged worktree to base",
-        &["reset", "--hard", base_branch],
-    )?;
-    if !reset.status.success() {
+    if !macc_core::git::reset_hard_async(wt, base_branch).await? {
         let msg = format!(
             "worktree switch warning task={} path={} base={} reason=reset_hard_failed",
             task_id, worktree_path, base_branch
@@ -1339,7 +1282,8 @@ pub async fn monitor_merge_jobs_native(
                             repo_root,
                             &task_snapshot,
                             logger,
-                        );
+                        )
+                        .await;
                         let branch = task_snapshot
                             .get("worktree")
                             .and_then(|w| w.get("branch"))
@@ -1671,7 +1615,7 @@ pub async fn dispatch_ready_tasks_native(
                 .pop()
                 .ok_or_else(|| MaccError::Validation("No worktree created".into()))?;
             let sanitize_started = Instant::now();
-            if !sanitize_worktree_to_base(&created.path, &selected.base_branch)? {
+            if !sanitize_worktree_to_base(&created.path, &selected.base_branch).await? {
                 let msg = format!(
                     "dispatch failed for task {}: sanitize new worktree failed ({})",
                     selected.id,
@@ -1721,12 +1665,8 @@ pub async fn dispatch_ready_tasks_native(
                 &sanitize_msg,
                 "info",
             );
-            let last_commit = std::process::Command::new("git")
-                .current_dir(&created.path)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            let last_commit = macc_core::git::head_commit_async(&created.path)
+                .await
                 .unwrap_or_default();
             if let Some(log) = logger {
                 let _ = log.note(format!(

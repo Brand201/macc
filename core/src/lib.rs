@@ -5,6 +5,7 @@ pub mod coordinator;
 pub mod coordinator_storage;
 pub mod doctor;
 pub mod engine;
+pub mod git;
 pub use config::migrate;
 pub mod mcp_json;
 pub mod packages;

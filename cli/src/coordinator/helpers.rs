@@ -1,4 +1,5 @@
 use macc_core::coordinator::runtime as coordinator_runtime;
+use macc_core::coordinator::model::TaskRegistry;
 use macc_core::coordinator_storage::append_event_sqlite;
 use macc_core::{MaccError, Result};
 use std::collections::HashSet;
@@ -9,57 +10,69 @@ pub(crate) fn now_iso_coordinator() -> String {
 }
 
 pub(crate) fn set_registry_updated_at(registry: &mut serde_json::Value) {
+    if let Ok(mut typed) = TaskRegistry::from_value(registry) {
+        typed.set_updated_at(now_iso_coordinator());
+        if let Ok(next) = typed.to_value() {
+            *registry = next;
+            return;
+        }
+    }
     registry["updated_at"] = serde_json::Value::String(now_iso_coordinator());
 }
 
 pub(crate) fn recompute_resource_locks_from_tasks(registry: &mut serde_json::Value) {
+    if let Ok(mut typed) = TaskRegistry::from_value(registry) {
+        typed.recompute_resource_locks(&now_iso_coordinator());
+        if let Ok(next) = typed.to_value() {
+            *registry = next;
+            return;
+        }
+    }
+
     let mut locks = serde_json::Map::new();
-    let tasks = registry
-        .get("tasks")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for task in tasks {
-        let state = task
-            .get("state")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("todo");
-        if !matches!(
-            state,
-            "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued"
-        ) {
-            continue;
-        }
-        let task_id = task
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if task_id.is_empty() {
-            continue;
-        }
-        let worktree_path = task
-            .get("worktree")
-            .and_then(|w| w.get("worktree_path"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        for res in task
-            .get("exclusive_resources")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-        {
-            let res_name = res.as_str().unwrap_or_default();
-            if res_name.is_empty() {
+    if let Some(tasks) = registry.get("tasks").and_then(serde_json::Value::as_array) {
+        for task in tasks {
+            let state = task
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("todo");
+            if !matches!(
+                state,
+                "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued"
+            ) {
                 continue;
             }
-            locks.insert(
-                res_name.to_string(),
-                serde_json::json!({
-                    "task_id": task_id,
-                    "worktree_path": worktree_path,
-                    "locked_at": now_iso_coordinator(),
-                }),
-            );
+            let task_id = task
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if task_id.is_empty() {
+                continue;
+            }
+            let worktree_path = task
+                .get("worktree")
+                .and_then(|w| w.get("worktree_path"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            for res in task
+                .get("exclusive_resources")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+            {
+                let res_name = res.as_str().unwrap_or_default();
+                if res_name.is_empty() {
+                    continue;
+                }
+                locks.insert(
+                    res_name.to_string(),
+                    serde_json::json!({
+                        "task_id": task_id,
+                        "worktree_path": worktree_path,
+                        "locked_at": now_iso_coordinator(),
+                    }),
+                );
+            }
         }
     }
     registry["resource_locks"] = serde_json::Value::Object(locks);
@@ -94,6 +107,9 @@ fn is_worktree_clean(worktree_path: &Path) -> Result<bool> {
 }
 
 fn active_task_worktree_paths(registry: &serde_json::Value) -> HashSet<String> {
+    if let Ok(typed) = TaskRegistry::from_value(registry) {
+        return typed.active_task_worktree_paths();
+    }
     let mut out = HashSet::new();
     if let Some(tasks) = registry.get("tasks").and_then(serde_json::Value::as_array) {
         for task in tasks {
@@ -122,6 +138,9 @@ fn active_task_worktree_paths(registry: &serde_json::Value) -> HashSet<String> {
 }
 
 fn can_reuse_worktree_slot(registry: &serde_json::Value, worktree_path: &Path) -> bool {
+    if let Ok(typed) = TaskRegistry::from_value(registry) {
+        return typed.can_reuse_worktree_slot(&worktree_path.to_string_lossy());
+    }
     let key = worktree_path.to_string_lossy().to_string();
     let mut seen = false;
     let mut all_merged = true;
@@ -149,6 +168,9 @@ fn can_reuse_worktree_slot(registry: &serde_json::Value, worktree_path: &Path) -
 }
 
 fn has_in_progress_or_queued_on_worktree(registry: &serde_json::Value, worktree_path: &Path) -> bool {
+    if let Ok(typed) = TaskRegistry::from_value(registry) {
+        return typed.has_in_progress_or_queued_on_worktree(&worktree_path.to_string_lossy());
+    }
     let key = worktree_path.to_string_lossy().to_string();
     registry
         .get("tasks")

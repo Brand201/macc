@@ -1,4 +1,5 @@
 use crate::{MaccError, ProjectPaths, Result};
+use crate::coordinator::model::{ResourceLock, Task, TaskRegistry};
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -527,61 +528,47 @@ impl SqliteStorage {
                 |row| row.get(0),
             )
             .map_err(sql_err)?;
-        let mut task: Value = serde_json::from_str(&task_raw).map_err(|e| {
-            MaccError::Validation(format!(
-                "Failed to parse task payload for '{}': {}",
-                change.task_id, e
-            ))
-        })?;
+        let mut task = parse_task_payload(&change.task_id, &task_raw)?;
 
-        task["state"] = Value::String(change.new_state.clone());
-        task["updated_at"] = Value::String(change.now.clone());
-        task["state_changed_at"] = Value::String(change.now.clone());
+        task.state = change.new_state.clone();
+        task.updated_at = Some(change.now.clone());
+        task.state_changed_at = Some(change.now.clone());
 
         if change.new_state == "pr_open" && !change.pr_url.is_empty() {
-            task["pr_url"] = Value::String(change.pr_url.clone());
+            task.pr_url = Some(change.pr_url.clone());
         }
 
         if change.new_state == "changes_requested" {
-            ensure_object_value(&mut task, "review");
-            task["review"]["changed"] = Value::Bool(true);
-            task["review"]["last_reviewed_at"] = Value::String(change.now.clone());
+            let mut review = task.review.take().unwrap_or_else(|| json!({}));
+            if !review.is_object() {
+                review = json!({});
+            }
+            review["changed"] = Value::Bool(true);
+            review["last_reviewed_at"] = Value::String(change.now.clone());
             if !change.reviewer.is_empty() {
-                task["review"]["reviewer"] = Value::String(change.reviewer.clone());
+                review["reviewer"] = Value::String(change.reviewer.clone());
             }
             if !change.reason.is_empty() {
-                task["review"]["reason"] = Value::String(change.reason.clone());
+                review["reason"] = Value::String(change.reason.clone());
             }
+            task.review = Some(review);
         }
 
         if matches!(change.new_state.as_str(), "merged" | "abandoned" | "todo") {
-            task["assignee"] = Value::Null;
-            task["claimed_at"] = Value::Null;
-            task["worktree"] = Value::Null;
-            ensure_object_value(&mut task, "task_runtime");
-            task["task_runtime"]["status"] = Value::String("idle".to_string());
-            task["task_runtime"]["pid"] = Value::Null;
-            task["task_runtime"]["started_at"] = Value::Null;
-            task["task_runtime"]["current_phase"] = Value::Null;
-            task["task_runtime"]["merge_result_pending"] = Value::Bool(false);
-            task["task_runtime"]["merge_result_file"] = Value::Null;
+            task.assignee = None;
+            task.claimed_at = None;
+            task.worktree = None;
+            task.task_runtime.status = Some("idle".to_string());
+            task.task_runtime.pid = None;
+            task.task_runtime.started_at = None;
+            task.task_runtime.current_phase = None;
+            task.task_runtime.merge_result_pending = Some(false);
+            task.task_runtime.merge_result_file = None;
         }
 
-        let title = task
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let priority = task
-            .get("priority")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let tool = task
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let title = task.title.clone().unwrap_or_default();
+        let priority = task.priority.clone().unwrap_or_default();
+        let tool = task.tool.clone().unwrap_or_default();
         let payload = serde_json::to_string(&task).map_err(|e| {
             MaccError::Validation(format!("Failed to serialize task payload: {}", e))
         })?;
@@ -599,10 +586,7 @@ impl SqliteStorage {
         )
         .map_err(sql_err)?;
 
-        let runtime = task
-            .get("task_runtime")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let runtime = parse_task_runtime_value(&task);
         self.upsert_task_runtime_row(&tx, &change.task_id, &runtime, &change.now)?;
         self.recompute_resource_locks(&tx, &change.now)?;
         if let Some(event) = event {
@@ -632,80 +616,64 @@ impl SqliteStorage {
                 |row| row.get(0),
             )
             .map_err(sql_err)?;
-        let mut task: Value = serde_json::from_str(&task_raw).map_err(|e| {
-            MaccError::Validation(format!(
-                "Failed to parse task payload for '{}': {}",
-                change.task_id, e
-            ))
-        })?;
+        let mut task = parse_task_payload(&change.task_id, &task_raw)?;
 
-        ensure_object_value(&mut task, "task_runtime");
-        ensure_object_value(&mut task["task_runtime"], "metrics");
-        ensure_object_value(&mut task["task_runtime"], "slo_warnings");
+        if task.task_runtime.metrics.is_none() {
+            task.task_runtime.metrics = Some(json!({}));
+        }
+        if task.task_runtime.slo_warnings.is_none() {
+            task.task_runtime.slo_warnings = Some(json!({}));
+        }
 
-        task["task_runtime"]["status"] = Value::String(change.runtime_status.clone());
+        task.task_runtime.status = Some(change.runtime_status.clone());
         if !change.phase.is_empty() {
-            task["task_runtime"]["current_phase"] = Value::String(change.phase.clone());
+            task.task_runtime.current_phase = Some(change.phase.clone());
         }
         match change.pid {
-            Some(pid) => task["task_runtime"]["pid"] = Value::from(pid),
+            Some(pid) => task.task_runtime.pid = Some(pid),
             None => {
                 if matches!(
                     change.runtime_status.as_str(),
                     "idle" | "phase_done" | "failed" | "stale"
                 ) {
-                    task["task_runtime"]["pid"] = Value::Null;
+                    task.task_runtime.pid = None;
                 }
             }
         }
         if !change.last_error.is_empty() {
-            task["task_runtime"]["last_error"] = Value::String(change.last_error.clone());
+            task.task_runtime.last_error = Some(change.last_error.clone());
         }
         if !change.heartbeat_ts.is_empty() {
-            task["task_runtime"]["last_heartbeat"] = Value::String(change.heartbeat_ts.clone());
+            task.task_runtime.last_heartbeat = Some(change.heartbeat_ts.clone());
         }
         if let Some(attempt) = change.attempt {
-            task["task_runtime"]["attempt"] = Value::from(attempt);
+            task.task_runtime.attempt = Some(attempt);
         }
         if change.runtime_status == "running"
-            && task["task_runtime"]["started_at"]
-                .as_str()
+            && task
+                .task_runtime
+                .started_at
+                .as_deref()
                 .unwrap_or_default()
                 .is_empty()
         {
-            task["task_runtime"]["started_at"] = Value::String(change.now.clone());
+            task.task_runtime.started_at = Some(change.now.clone());
         }
         if matches!(
             change.runtime_status.as_str(),
             "idle" | "phase_done" | "failed" | "stale"
         ) {
-            task["task_runtime"]["phase_started_at"] = Value::Null;
+            task.task_runtime.phase_started_at = None;
         } else if change.runtime_status == "running" {
-            task["task_runtime"]["phase_started_at"] = Value::String(change.now.clone());
+            task.task_runtime.phase_started_at = Some(change.now.clone());
         }
 
-        task["updated_at"] = Value::String(change.now.clone());
+        task.updated_at = Some(change.now.clone());
 
-        let state = task
-            .get("state")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let title = task
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let priority = task
-            .get("priority")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let tool = task
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let state = task.state.clone();
+        let title = task.title.clone().unwrap_or_default();
+        let priority = task.priority.clone().unwrap_or_default();
+        let tool = task.tool.clone().unwrap_or_default();
         let payload = serde_json::to_string(&task).map_err(|e| {
             MaccError::Validation(format!("Failed to serialize task payload: {}", e))
         })?;
@@ -715,10 +683,7 @@ impl SqliteStorage {
         )
         .map_err(sql_err)?;
 
-        let runtime = task
-            .get("task_runtime")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let runtime = parse_task_runtime_value(&task);
         self.upsert_task_runtime_row(&tx, &change.task_id, &runtime, &change.now)?;
         if let Some(event) = event {
             self.append_event_in_tx(&tx, event)?;
@@ -739,42 +704,17 @@ impl SqliteStorage {
                 |row| row.get(0),
             )
             .map_err(sql_err)?;
-        let mut task: Value = serde_json::from_str(&task_raw).map_err(|e| {
-            MaccError::Validation(format!(
-                "Failed to parse task payload for '{}': {}",
-                change.task_id, e
-            ))
-        })?;
-        ensure_object_value(&mut task, "task_runtime");
-        task["task_runtime"]["merge_result_pending"] = Value::Bool(true);
-        task["task_runtime"]["merge_result_file"] = Value::String(change.result_file.clone());
-        task["task_runtime"]["merge_worker_pid"] = match change.pid {
-            Some(pid) => Value::from(pid),
-            None => Value::Null,
-        };
-        task["task_runtime"]["merge_result_started_at"] = Value::String(change.now.clone());
-        task["updated_at"] = Value::String(change.now.clone());
+        let mut task = parse_task_payload(&change.task_id, &task_raw)?;
+        task.task_runtime.merge_result_pending = Some(true);
+        task.task_runtime.merge_result_file = Some(change.result_file.clone());
+        task.task_runtime.merge_worker_pid = change.pid;
+        task.task_runtime.merge_result_started_at = Some(change.now.clone());
+        task.updated_at = Some(change.now.clone());
 
-        let state = task
-            .get("state")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let title = task
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let priority = task
-            .get("priority")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let tool = task
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let state = task.state.clone();
+        let title = task.title.clone().unwrap_or_default();
+        let priority = task.priority.clone().unwrap_or_default();
+        let tool = task.tool.clone().unwrap_or_default();
         let payload = serde_json::to_string(&task).map_err(|e| {
             MaccError::Validation(format!("Failed to serialize task payload: {}", e))
         })?;
@@ -784,10 +724,7 @@ impl SqliteStorage {
         )
         .map_err(sql_err)?;
 
-        let runtime = task
-            .get("task_runtime")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let runtime = parse_task_runtime_value(&task);
         self.upsert_task_runtime_row(&tx, &change.task_id, &runtime, &change.now)?;
         tx.commit().map_err(sql_err)?;
         Ok(())
@@ -805,49 +742,26 @@ impl SqliteStorage {
                 |row| row.get(0),
             )
             .map_err(sql_err)?;
-        let mut task: Value = serde_json::from_str(&task_raw).map_err(|e| {
-            MaccError::Validation(format!(
-                "Failed to parse task payload for '{}': {}",
-                change.task_id, e
-            ))
-        })?;
-        ensure_object_value(&mut task, "task_runtime");
-        task["task_runtime"]["merge_result_pending"] = Value::Bool(false);
-        task["task_runtime"]["merge_result_file"] = Value::Null;
-        task["task_runtime"]["merge_worker_pid"] = Value::Null;
+        let mut task = parse_task_payload(&change.task_id, &task_raw)?;
+        task.task_runtime.merge_result_pending = Some(false);
+        task.task_runtime.merge_result_file = None;
+        task.task_runtime.merge_worker_pid = None;
         if !change.result_file.is_empty() {
-            task["task_runtime"]["last_merge_result_file"] =
-                Value::String(change.result_file.clone());
+            task.task_runtime.last_merge_result_file = Some(change.result_file.clone());
         }
         if !change.status.is_empty() {
-            task["task_runtime"]["last_merge_result_status"] = Value::String(change.status.clone());
+            task.task_runtime.last_merge_result_status = Some(change.status.clone());
         }
         if let Some(rc) = change.rc {
-            task["task_runtime"]["last_merge_result_rc"] = Value::from(rc);
+            task.task_runtime.last_merge_result_rc = Some(rc);
         }
-        task["task_runtime"]["last_merge_result_at"] = Value::String(change.now.clone());
-        task["updated_at"] = Value::String(change.now.clone());
+        task.task_runtime.last_merge_result_at = Some(change.now.clone());
+        task.updated_at = Some(change.now.clone());
 
-        let state = task
-            .get("state")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let title = task
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let priority = task
-            .get("priority")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let tool = task
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let state = task.state.clone();
+        let title = task.title.clone().unwrap_or_default();
+        let priority = task.priority.clone().unwrap_or_default();
+        let tool = task.tool.clone().unwrap_or_default();
         let payload = serde_json::to_string(&task).map_err(|e| {
             MaccError::Validation(format!("Failed to serialize task payload: {}", e))
         })?;
@@ -857,10 +771,7 @@ impl SqliteStorage {
         )
         .map_err(sql_err)?;
 
-        let runtime = task
-            .get("task_runtime")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let runtime = parse_task_runtime_value(&task);
         self.upsert_task_runtime_row(&tx, &change.task_id, &runtime, &change.now)?;
         tx.commit().map_err(sql_err)?;
         Ok(())
@@ -878,42 +789,30 @@ impl SqliteStorage {
                 |row| row.get(0),
             )
             .map_err(sql_err)?;
-        let mut task: Value = serde_json::from_str(&task_raw).map_err(|e| {
-            MaccError::Validation(format!(
-                "Failed to parse task payload for '{}': {}",
-                change.task_id, e
-            ))
-        })?;
-        ensure_object_value(&mut task, "task_runtime");
-        ensure_object_value(&mut task["task_runtime"], "metrics");
-        let current = task["task_runtime"]["metrics"]["retries"]
-            .as_i64()
-            .unwrap_or_else(|| task["task_runtime"]["retries"].as_i64().unwrap_or(0));
+        let mut task = parse_task_payload(&change.task_id, &task_raw)?;
+        let mut metrics = task
+            .task_runtime
+            .metrics
+            .take()
+            .unwrap_or_else(|| json!({}));
+        if !metrics.is_object() {
+            metrics = json!({});
+        }
+        let current = metrics
+            .get("retries")
+            .and_then(Value::as_i64)
+            .or(task.task_runtime.retries)
+            .unwrap_or(0);
         let next = current + 1;
-        task["task_runtime"]["metrics"]["retries"] = Value::from(next);
-        task["task_runtime"]["retries"] = Value::from(next);
-        task["updated_at"] = Value::String(change.now.clone());
+        metrics["retries"] = Value::from(next);
+        task.task_runtime.metrics = Some(metrics);
+        task.task_runtime.retries = Some(next);
+        task.updated_at = Some(change.now.clone());
 
-        let state = task
-            .get("state")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let title = task
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let priority = task
-            .get("priority")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let tool = task
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let state = task.state.clone();
+        let title = task.title.clone().unwrap_or_default();
+        let priority = task.priority.clone().unwrap_or_default();
+        let tool = task.tool.clone().unwrap_or_default();
         let payload = serde_json::to_string(&task).map_err(|e| {
             MaccError::Validation(format!("Failed to serialize task payload: {}", e))
         })?;
@@ -922,11 +821,7 @@ impl SqliteStorage {
             params![change.task_id, state, title, priority, tool, payload, change.now],
         )
         .map_err(sql_err)?;
-
-        let runtime = task
-            .get("task_runtime")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let runtime = parse_task_runtime_value(&task);
         self.upsert_task_runtime_row(&tx, &change.task_id, &runtime, &change.now)?;
         tx.commit().map_err(sql_err)?;
         Ok(())
@@ -944,43 +839,29 @@ impl SqliteStorage {
                 |row| row.get(0),
             )
             .map_err(sql_err)?;
-        let mut task: Value = serde_json::from_str(&task_raw).map_err(|e| {
-            MaccError::Validation(format!(
-                "Failed to parse task payload for '{}': {}",
-                change.task_id, e
-            ))
-        })?;
-        ensure_object_value(&mut task, "task_runtime");
-        ensure_object_value(&mut task["task_runtime"], "slo_warnings");
-        task["task_runtime"]["slo_warnings"][&change.metric] = json!({
+        let mut task = parse_task_payload(&change.task_id, &task_raw)?;
+        let mut slo_warnings = task
+            .task_runtime
+            .slo_warnings
+            .take()
+            .unwrap_or_else(|| json!({}));
+        if !slo_warnings.is_object() {
+            slo_warnings = json!({});
+        }
+        slo_warnings[&change.metric] = json!({
             "metric": change.metric,
             "threshold": change.threshold,
             "value": change.value,
             "warned_at": change.now,
             "suggestion": change.suggestion,
         });
-        task["updated_at"] = Value::String(change.now.clone());
+        task.task_runtime.slo_warnings = Some(slo_warnings);
+        task.updated_at = Some(change.now.clone());
 
-        let state = task
-            .get("state")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let title = task
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let priority = task
-            .get("priority")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let tool = task
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let state = task.state.clone();
+        let title = task.title.clone().unwrap_or_default();
+        let priority = task.priority.clone().unwrap_or_default();
+        let tool = task.tool.clone().unwrap_or_default();
         let payload = serde_json::to_string(&task).map_err(|e| {
             MaccError::Validation(format!("Failed to serialize task payload: {}", e))
         })?;
@@ -989,11 +870,7 @@ impl SqliteStorage {
             params![change.task_id, state, title, priority, tool, payload, change.now],
         )
         .map_err(sql_err)?;
-
-        let runtime = task
-            .get("task_runtime")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let runtime = parse_task_runtime_value(&task);
         self.upsert_task_runtime_row(&tx, &change.task_id, &runtime, &change.now)?;
         tx.commit().map_err(sql_err)?;
         Ok(())
@@ -1064,66 +941,75 @@ impl SqliteStorage {
         let mut existing = std::collections::BTreeSet::new();
         for row in rows {
             let raw = row.map_err(sql_err)?;
-            let task: Value = match serde_json::from_str(&raw) {
+            let task: Task = match serde_json::from_str(&raw) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let state = task.get("state").and_then(Value::as_str).unwrap_or("");
-            if !is_active_state(state) {
+            if !is_active_state(&task.state) {
                 continue;
             }
-            if task.get("worktree").is_none() || task.get("worktree").unwrap().is_null() {
+            if task.worktree.is_none() {
                 continue;
             }
-            let task_id = task.get("id").and_then(Value::as_str).unwrap_or("");
-            if task_id.is_empty() {
+            if task.id.is_empty() {
                 continue;
             }
             let worktree_path = task
-                .get("worktree")
-                .and_then(|v| v.get("worktree_path"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+                .worktree
+                .as_ref()
+                .and_then(|v| v.worktree_path.clone())
+                .unwrap_or_default();
             let locked_at = task
-                .get("claimed_at")
-                .and_then(Value::as_str)
+                .claimed_at
+                .as_deref()
                 .filter(|v| !v.is_empty())
-                .unwrap_or(now);
-            if let Some(resources) = task.get("exclusive_resources").and_then(Value::as_array) {
-                for resource in resources {
-                    let Some(resource_name) = resource.as_str() else {
-                        continue;
-                    };
-                    if resource_name.is_empty() || existing.contains(resource_name) {
-                        continue;
-                    }
-                    let payload = json!({
-                        "task_id": task_id,
-                        "worktree_path": if worktree_path.is_empty() { Value::Null } else { Value::String(worktree_path.to_string()) },
-                        "locked_at": locked_at,
-                    });
-                    tx.execute(
-                        "INSERT INTO resource_locks (resource, task_id, worktree_path, locked_at, payload_json, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![
-                            resource_name,
-                            task_id,
-                            worktree_path,
-                            locked_at,
-                            serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()),
-                            now
-                        ],
-                    )
-                    .map_err(sql_err)?;
-                    existing.insert(resource_name.to_string());
+                .unwrap_or(now)
+                .to_string();
+            for resource_name in &task.exclusive_resources {
+                if resource_name.is_empty() || existing.contains(resource_name) {
+                    continue;
                 }
+                let lock = ResourceLock {
+                    task_id: task.id.clone(),
+                    worktree_path: worktree_path.clone(),
+                    locked_at: locked_at.clone(),
+                    extra: Default::default(),
+                };
+                let lock_json = serde_json::to_value(&lock).map_err(|e| {
+                    MaccError::Validation(format!(
+                        "Failed to serialize typed resource lock '{}': {}",
+                        resource_name, e
+                    ))
+                })?;
+                let payload = if worktree_path.is_empty() {
+                    // Keep historical shape where missing worktree_path becomes null in payload.
+                    let mut with_null = lock_json;
+                    with_null["worktree_path"] = Value::Null;
+                    with_null
+                } else {
+                    lock_json
+                };
+                tx.execute(
+                    "INSERT INTO resource_locks (resource, task_id, worktree_path, locked_at, payload_json, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        resource_name,
+                        task.id,
+                        worktree_path,
+                        locked_at,
+                        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()),
+                        now
+                    ],
+                )
+                .map_err(sql_err)?;
+                existing.insert(resource_name.to_string());
             }
         }
         Ok(())
     }
 
     fn load_registry_from_tables(&self, conn: &Connection) -> Result<Value> {
-        let mut tasks = Vec::new();
+        let mut registry = TaskRegistry::default();
         let mut stmt = conn
             .prepare("SELECT payload_json FROM tasks ORDER BY task_id")
             .map_err(sql_err)?;
@@ -1132,12 +1018,11 @@ impl SqliteStorage {
             .map_err(sql_err)?;
         for row in rows {
             let raw = row.map_err(sql_err)?;
-            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                tasks.push(v);
+            if let Ok(task) = serde_json::from_str::<Task>(&raw) {
+                registry.tasks.push(task);
             }
         }
 
-        let mut locks = serde_json::Map::new();
         let mut stmt = conn
             .prepare("SELECT resource, payload_json FROM resource_locks ORDER BY resource")
             .map_err(sql_err)?;
@@ -1150,19 +1035,21 @@ impl SqliteStorage {
             .map_err(sql_err)?;
         for row in rows {
             let (resource, payload) = row.map_err(sql_err)?;
-            if let Ok(v) = serde_json::from_str::<Value>(&payload) {
-                locks.insert(resource, v);
+            if let Ok(lock) = serde_json::from_str::<ResourceLock>(&payload) {
+                registry.resource_locks.insert(resource, lock);
             }
         }
-
-        Ok(json!({
-            "schema_version": 1,
-            "tasks": tasks,
-            "resource_locks": locks,
-            "processed_event_ids": {},
-            "state_mapping": {},
-            "updated_at": now_iso_string(),
-        }))
+        registry.updated_at = Some(now_iso_string());
+        registry.extra.insert("schema_version".into(), Value::from(1));
+        registry
+            .extra
+            .entry("processed_event_ids".into())
+            .or_insert_with(|| json!({}));
+        registry
+            .extra
+            .entry("state_mapping".into())
+            .or_insert_with(|| json!({}));
+        registry.to_value()
     }
 }
 
@@ -1271,154 +1158,122 @@ impl CoordinatorStorage for SqliteStorage {
         )
         .map_err(sql_err)?;
 
-        if let Some(tasks) = snapshot.registry.get("tasks").and_then(|v| v.as_array()) {
-            for task in tasks {
-                let task_id = task
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if task_id.is_empty() {
-                    continue;
-                }
-                let state = task.get("state").and_then(|v| v.as_str()).unwrap_or("");
-                let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                let priority = task.get("priority").and_then(|v| v.as_str()).unwrap_or("");
-                let tool = task.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-                let task_updated = task
-                    .get("updated_at")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| now.as_str());
-                let task_raw = serde_json::to_string(task).map_err(|e| {
-                    MaccError::Validation(format!("Failed to serialize task payload: {}", e))
-                })?;
-                tx.execute(
-                    "INSERT INTO tasks (task_id, state, title, priority, tool, payload_json, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![task_id, state, title, priority, tool, task_raw, task_updated],
-                )
-                .map_err(sql_err)?;
+        let registry = TaskRegistry::from_value(&snapshot.registry)?;
+        for task in &registry.tasks {
+            let task_id = task.id.clone();
+            if task_id.is_empty() {
+                continue;
+            }
+            let state = task.state.clone();
+            let title = task.title.clone().unwrap_or_default();
+            let priority = task.priority.clone().unwrap_or_default();
+            let tool = task.tool.clone().unwrap_or_default();
+            let task_updated = task.updated_at.as_deref().unwrap_or(now.as_str());
+            let task_raw = serde_json::to_string(task).map_err(|e| {
+                MaccError::Validation(format!("Failed to serialize task payload: {}", e))
+            })?;
+            tx.execute(
+                "INSERT INTO tasks (task_id, state, title, priority, tool, payload_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![task_id, state, title, priority, tool, task_raw, task_updated],
+            )
+            .map_err(sql_err)?;
 
-                let runtime = task
-                    .get("task_runtime")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                let runtime_status = runtime.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                let current_phase = runtime
-                    .get("current_phase")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let pid = runtime.get("pid").and_then(|v| v.as_i64());
-                let last_error = runtime
-                    .get("last_error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let last_heartbeat = runtime
-                    .get("last_heartbeat")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let runtime_raw = serde_json::to_string(&runtime).map_err(|e| {
-                    MaccError::Validation(format!(
-                        "Failed to serialize task_runtime payload: {}",
-                        e
-                    ))
-                })?;
-                let runtime_updated = runtime
-                    .get("updated_at")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(task_updated);
+            let runtime = parse_task_runtime_value(task);
+            let runtime_status = runtime.get("status").and_then(Value::as_str).unwrap_or("");
+            let current_phase = runtime
+                .get("current_phase")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let pid = runtime.get("pid").and_then(Value::as_i64);
+            let last_error = runtime
+                .get("last_error")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let last_heartbeat = runtime
+                .get("last_heartbeat")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let runtime_raw = serde_json::to_string(&runtime).map_err(|e| {
+                MaccError::Validation(format!("Failed to serialize task_runtime payload: {}", e))
+            })?;
+            let runtime_updated = runtime
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .unwrap_or(task_updated);
+            tx.execute(
+                "INSERT INTO task_runtime (task_id, status, current_phase, pid, last_error, last_heartbeat, payload_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    task_id,
+                    runtime_status,
+                    current_phase,
+                    pid,
+                    last_error,
+                    last_heartbeat,
+                    runtime_raw,
+                    runtime_updated
+                ],
+            )
+            .map_err(sql_err)?;
+
+            if let Some(pid) = pid {
+                let job_payload = json!({
+                    "task_id": task_id,
+                    "job_type": "performer",
+                    "pid": pid,
+                    "status": runtime_status,
+                });
                 tx.execute(
-                    "INSERT INTO task_runtime (task_id, status, current_phase, pid, last_error, last_heartbeat, payload_json, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO jobs (job_key, task_id, job_type, pid, status, payload_json, updated_at)
+                     VALUES (?1, ?2, 'performer', ?3, ?4, ?5, ?6)",
                     params![
+                        format!("{}:performer", task_id),
                         task_id,
-                        runtime_status,
-                        current_phase,
                         pid,
-                        last_error,
-                        last_heartbeat,
-                        runtime_raw,
+                        runtime_status,
+                        serde_json::to_string(&job_payload).unwrap_or_else(|_| "{}".to_string()),
                         runtime_updated
                     ],
                 )
                 .map_err(sql_err)?;
-
-                if let Some(pid) = pid {
-                    let job_payload = json!({
-                        "task_id": task_id,
-                        "job_type": "performer",
-                        "pid": pid,
-                        "status": runtime_status,
-                    });
-                    tx.execute(
-                        "INSERT INTO jobs (job_key, task_id, job_type, pid, status, payload_json, updated_at)
-                         VALUES (?1, ?2, 'performer', ?3, ?4, ?5, ?6)",
-                        params![
-                            format!("{}:performer", task_id),
-                            task_id,
-                            pid,
-                            runtime_status,
-                            serde_json::to_string(&job_payload).unwrap_or_else(|_| "{}".to_string()),
-                            runtime_updated
-                        ],
-                    )
-                    .map_err(sql_err)?;
-                }
-                if let Some(merge_pid) = runtime.get("merge_worker_pid").and_then(|v| v.as_i64()) {
-                    let job_payload = json!({
-                        "task_id": task_id,
-                        "job_type": "merge_worker",
-                        "pid": merge_pid,
-                        "status": runtime_status,
-                    });
-                    tx.execute(
-                        "INSERT INTO jobs (job_key, task_id, job_type, pid, status, payload_json, updated_at)
-                         VALUES (?1, ?2, 'merge_worker', ?3, ?4, ?5, ?6)",
-                        params![
-                            format!("{}:merge", task_id),
-                            task_id,
-                            merge_pid,
-                            runtime_status,
-                            serde_json::to_string(&job_payload).unwrap_or_else(|_| "{}".to_string()),
-                            runtime_updated
-                        ],
-                    )
-                    .map_err(sql_err)?;
-                }
             }
-        }
-
-        if let Some(locks) = snapshot
-            .registry
-            .get("resource_locks")
-            .and_then(|v| v.as_object())
-        {
-            for (resource, lock_value) in locks {
-                let task_id = lock_value
-                    .get("task_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let worktree_path = lock_value
-                    .get("worktree_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let locked_at = lock_value
-                    .get("locked_at")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let lock_raw = serde_json::to_string(lock_value).map_err(|e| {
-                    MaccError::Validation(format!(
-                        "Failed to serialize resource lock payload: {}",
-                        e
-                    ))
-                })?;
+            if let Some(merge_pid) = runtime.get("merge_worker_pid").and_then(Value::as_i64) {
+                let job_payload = json!({
+                    "task_id": task_id,
+                    "job_type": "merge_worker",
+                    "pid": merge_pid,
+                    "status": runtime_status,
+                });
                 tx.execute(
-                    "INSERT INTO resource_locks (resource, task_id, worktree_path, locked_at, payload_json, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![resource, task_id, worktree_path, locked_at, lock_raw, now],
+                    "INSERT INTO jobs (job_key, task_id, job_type, pid, status, payload_json, updated_at)
+                     VALUES (?1, ?2, 'merge_worker', ?3, ?4, ?5, ?6)",
+                    params![
+                        format!("{}:merge", task_id),
+                        task_id,
+                        merge_pid,
+                        runtime_status,
+                        serde_json::to_string(&job_payload).unwrap_or_else(|_| "{}".to_string()),
+                        runtime_updated
+                    ],
                 )
                 .map_err(sql_err)?;
             }
+        }
+
+        for (resource, lock_value) in &registry.resource_locks {
+            let task_id = lock_value.task_id.as_str();
+            let worktree_path = lock_value.worktree_path.as_str();
+            let locked_at = lock_value.locked_at.as_str();
+            let lock_raw = serde_json::to_string(lock_value).map_err(|e| {
+                MaccError::Validation(format!("Failed to serialize resource lock payload: {}", e))
+            })?;
+            tx.execute(
+                "INSERT INTO resource_locks (resource, task_id, worktree_path, locked_at, payload_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![resource, task_id, worktree_path, locked_at, lock_raw, now],
+            )
+            .map_err(sql_err)?;
         }
 
         for (idx, event) in snapshot.events.iter().enumerate() {
@@ -1687,12 +1542,6 @@ fn now_iso_string() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-fn ensure_object_value(node: &mut Value, key: &str) {
-    if !node.get(key).map(Value::is_object).unwrap_or(false) {
-        node[key] = json!({});
-    }
-}
-
 fn is_active_state(state: &str) -> bool {
     matches!(
         state,
@@ -1709,6 +1558,19 @@ fn default_registry_value() -> Value {
         "state_mapping": {},
         "updated_at": now_iso_string(),
     })
+}
+
+fn parse_task_payload(task_id: &str, raw: &str) -> Result<Task> {
+    serde_json::from_str::<Task>(raw).map_err(|e| {
+        MaccError::Validation(format!(
+            "Failed to parse typed task payload for '{}': {}",
+            task_id, e
+        ))
+    })
+}
+
+fn parse_task_runtime_value(task: &Task) -> Value {
+    serde_json::to_value(&task.task_runtime).unwrap_or_else(|_| json!({}))
 }
 
 fn sql_err(e: rusqlite::Error) -> MaccError {

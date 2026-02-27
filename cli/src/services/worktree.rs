@@ -24,20 +24,7 @@ pub fn truncate_cell(value: &str, max: usize) -> String {
 }
 
 pub fn git_worktree_is_dirty(worktree: &std::path::Path) -> Result<bool> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["status", "--porcelain"])
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: worktree.to_string_lossy().into(),
-            action: "read git worktree status".into(),
-            source: e,
-        })?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    macc_core::git::is_dirty(worktree)
 }
 
 pub fn load_worktree_session_labels(
@@ -124,35 +111,7 @@ pub fn delete_branch(root: &std::path::Path, branch: Option<&str>, force: bool) 
     let Some(branch) = branch else {
         return Ok(());
     };
-    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
-    if branch.is_empty() {
-        return Ok(());
-    }
-
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("branch");
-    if force {
-        cmd.arg("-D");
-    } else {
-        cmd.arg("-d");
-    }
-    let output = cmd
-        .arg(branch)
-        .current_dir(root)
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: root.to_string_lossy().into(),
-            action: "run git branch delete".into(),
-            source: e,
-        })?;
-
-    if !output.status.success() {
-        return Err(MaccError::Validation(format!(
-            "git branch delete failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(())
+    macc_core::git::delete_local_branch(root, branch, force)
 }
 
 pub fn remove_all_worktrees(root: &std::path::Path, remove_branches: bool) -> Result<usize> {

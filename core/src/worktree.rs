@@ -2,7 +2,6 @@ use crate::tool::ToolSpecLoader;
 use crate::{config::CanonicalConfig, MaccError, ProjectPaths, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeEntry {
@@ -43,24 +42,7 @@ pub struct WorktreeMetadata {
 }
 
 pub fn list_worktrees(cwd: &Path) -> Result<Vec<WorktreeEntry>> {
-    let output = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: cwd.to_string_lossy().into(),
-            action: "run git worktree list".into(),
-            source: e,
-        })?;
-
-    if !output.status.success() {
-        return Err(MaccError::Validation(format!(
-            "git worktree list failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = crate::git::worktree_list_porcelain(cwd)?;
     Ok(parse_porcelain(&text))
 }
 
@@ -95,29 +77,7 @@ pub fn create_worktrees(
         let branch = format!("ai/{}/{}", spec.tool, id);
         let path = base_dir.join(&id);
 
-        let output = Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                "-b",
-                &branch,
-                path.to_string_lossy().as_ref(),
-                &spec.base,
-            ])
-            .current_dir(root)
-            .output()
-            .map_err(|e| MaccError::Io {
-                path: root.to_string_lossy().into(),
-                action: "run git worktree add".into(),
-                source: e,
-            })?;
-
-        if !output.status.success() {
-            return Err(MaccError::Validation(format!(
-                "git worktree add failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
+        crate::git::worktree_add(root, &branch, &path, &spec.base)?;
 
         write_worktree_metadata(
             &path,
@@ -147,48 +107,11 @@ pub fn create_worktrees(
 }
 
 pub fn remove_worktree(root: &Path, path: &Path, force: bool) -> Result<()> {
-    let mut cmd = Command::new("git");
-    cmd.args(["worktree", "remove"]);
-    if force {
-        cmd.arg("--force");
-    }
-    let output = cmd
-        .arg(path.to_string_lossy().as_ref())
-        .current_dir(root)
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: root.to_string_lossy().into(),
-            action: "run git worktree remove".into(),
-            source: e,
-        })?;
-
-    if !output.status.success() {
-        return Err(MaccError::Validation(format!(
-            "git worktree remove failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(())
+    crate::git::worktree_remove(root, path, force)
 }
 
 pub fn prune_worktrees(root: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .args(["worktree", "prune"])
-        .current_dir(root)
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: root.to_string_lossy().into(),
-            action: "run git worktree prune".into(),
-            source: e,
-        })?;
-
-    if !output.status.success() {
-        return Err(MaccError::Validation(format!(
-            "git worktree prune failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(())
+    crate::git::worktree_prune(root)
 }
 
 fn parse_porcelain(output: &str) -> Vec<WorktreeEntry> {

@@ -234,6 +234,12 @@ enum Commands {
         /// Override PHASE_RUNNER_MAX_ATTEMPTS
         #[arg(long)]
         phase_runner_max_attempts: Option<usize>,
+        /// Flush coordinator log buffer every N lines (default: 32)
+        #[arg(long)]
+        log_flush_lines: Option<usize>,
+        /// Flush coordinator log buffer every N milliseconds (default: 1000)
+        #[arg(long)]
+        log_flush_ms: Option<u64>,
         /// Override STALE_CLAIMED_SECONDS
         #[arg(long)]
         stale_claimed_seconds: Option<usize>,
@@ -730,6 +736,8 @@ fn run_with_engine_provider(
             max_parallel,
             timeout_seconds,
             phase_runner_max_attempts,
+            log_flush_lines,
+            log_flush_ms,
             stale_claimed_seconds,
             stale_in_progress_seconds,
             stale_changes_requested_seconds,
@@ -755,6 +763,8 @@ fn run_with_engine_provider(
                     max_parallel: *max_parallel,
                     timeout_seconds: *timeout_seconds,
                     phase_runner_max_attempts: *phase_runner_max_attempts,
+                    log_flush_lines: *log_flush_lines,
+                    log_flush_ms: *log_flush_ms,
                     stale_claimed_seconds: *stale_claimed_seconds,
                     stale_in_progress_seconds: *stale_in_progress_seconds,
                     stale_changes_requested_seconds: *stale_changes_requested_seconds,
@@ -795,10 +805,24 @@ pub(crate) type CoordinatorRunState = coordinator_runtime::CoordinatorRunState;
 
 pub(crate) struct NativeCoordinatorLogger {
     pub(crate) file: std::path::PathBuf,
+    state: std::sync::Mutex<NativeCoordinatorLoggerState>,
+    flush_every_lines: usize,
+    flush_every_interval: std::time::Duration,
+}
+
+struct NativeCoordinatorLoggerState {
+    writer: std::io::BufWriter<std::fs::File>,
+    pending_lines: usize,
+    last_flush: std::time::Instant,
 }
 
 impl NativeCoordinatorLogger {
-    pub(crate) fn new(repo_root: &std::path::Path, action: &str) -> Result<Self> {
+    pub(crate) fn new_with_flush(
+        repo_root: &std::path::Path,
+        action: &str,
+        flush_lines_override: Option<usize>,
+        flush_ms_override: Option<u64>,
+    ) -> Result<Self> {
         let dir = repo_root.join(".macc").join("log").join("coordinator");
         std::fs::create_dir_all(&dir).map_err(|e| MaccError::Io {
             path: dir.to_string_lossy().into(),
@@ -818,25 +842,78 @@ impl NativeCoordinatorLogger {
             action: "write coordinator log header".into(),
             source: e,
         })?;
-        Ok(Self { file })
+        let file_handle = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .map_err(|e| MaccError::Io {
+                path: file.to_string_lossy().into(),
+                action: "open coordinator log writer".into(),
+                source: e,
+            })?;
+        let flush_every_lines = flush_lines_override
+            .or_else(|| {
+                std::env::var("COORDINATOR_LOG_FLUSH_LINES")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+            })
+            .filter(|v| *v > 0)
+            .unwrap_or(500);
+        let flush_every_interval = std::time::Duration::from_millis(
+            flush_ms_override
+                .or_else(|| {
+                    std::env::var("COORDINATOR_LOG_FLUSH_MS")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                })
+                .filter(|v| *v > 0)
+                .unwrap_or(60_000),
+        );
+
+        Ok(Self {
+            file,
+            state: std::sync::Mutex::new(NativeCoordinatorLoggerState {
+                writer: std::io::BufWriter::new(file_handle),
+                pending_lines: 0,
+                last_flush: std::time::Instant::now(),
+            }),
+            flush_every_lines,
+            flush_every_interval,
+        })
     }
 
     pub(crate) fn note(&self, msg: impl AsRef<str>) -> Result<()> {
-        let line = format!("{}\n", msg.as_ref());
         use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&self.file)
-            .map_err(|e| MaccError::Io {
-                path: self.file.to_string_lossy().into(),
-                action: "open coordinator log file".into(),
-                source: e,
-            })?;
-        f.write_all(line.as_bytes()).map_err(|e| MaccError::Io {
+        let line = format!("{}\n", msg.as_ref());
+        let mut state = self.state.lock().map_err(|_| {
+            MaccError::Validation("Coordinator logger lock poisoned".to_string())
+        })?;
+        state.writer.write_all(line.as_bytes()).map_err(|e| MaccError::Io {
             path: self.file.to_string_lossy().into(),
             action: "append coordinator log".into(),
             source: e,
-        })
+        })?;
+        state.pending_lines += 1;
+        let should_flush = state.pending_lines >= self.flush_every_lines
+            || state.last_flush.elapsed() >= self.flush_every_interval;
+        if should_flush {
+            state.writer.flush().map_err(|e| MaccError::Io {
+                path: self.file.to_string_lossy().into(),
+                action: "flush coordinator log".into(),
+                source: e,
+            })?;
+            state.pending_lines = 0;
+            state.last_flush = std::time::Instant::now();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NativeCoordinatorLogger {
+    fn drop(&mut self) {
+        use std::io::Write as _;
+        if let Ok(mut state) = self.state.lock() {
+            let _ = state.writer.flush();
+        }
     }
 }
 
@@ -1475,7 +1552,16 @@ impl<'a> NativeControlPlaneBackend<'a> {
         env_cfg: &'a CoordinatorEnvConfig,
         prd_file: std::path::PathBuf,
     ) -> Result<Self> {
-        let logger = NativeCoordinatorLogger::new(repo_root, "run")?;
+        let logger = NativeCoordinatorLogger::new_with_flush(
+            repo_root,
+            "run",
+            env_cfg
+                .log_flush_lines
+                .or_else(|| coordinator.and_then(|c| c.log_flush_lines)),
+            env_cfg
+                .log_flush_ms
+                .or_else(|| coordinator.and_then(|c| c.log_flush_ms)),
+        )?;
         println!("Coordinator log file: {}", logger.file.display());
         let _ = logger.note("- Native Rust control-plane run started");
         let phase_runner_max_attempts = env_cfg

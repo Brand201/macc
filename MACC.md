@@ -577,6 +577,11 @@ Important behavior:
 - Worktrees are reused as worker slots (not task-coupled names): once a task is merged, the slot is reset to reference, moved to a fresh branch, refreshed for the new task, then relaunched.
 - New worker worktrees are created only when no reusable slot is available; pool size is bounded by `max_parallel`.
 - CLI options can override YAML settings (`--max-dispatch`, `--max-parallel`, `--timeout-seconds`, etc.).
+- Coordinator log buffering/flush can be configured without env vars:
+  - CLI: `--log-flush-lines <N>` and `--log-flush-ms <N>`
+  - YAML (`automation.coordinator`): `log_flush_lines`, `log_flush_ms`
+  - TUI (Coordinator Settings): `Log Flush Lines`, `Log Flush Interval (ms)`
+  - Precedence: CLI override -> YAML value -> env (`COORDINATOR_LOG_FLUSH_LINES` / `COORDINATOR_LOG_FLUSH_MS`) -> built-in defaults.
 - Stale heartbeat policy is enforced during control-plane runs via env:
   - `STALE_HEARTBEAT_SECONDS` (0 disables)
   - `STALE_HEARTBEAT_ACTION=retry|block|requeue`

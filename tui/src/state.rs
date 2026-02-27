@@ -206,7 +206,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    const AUTOMATION_FIELD_COUNT: usize = 14;
+    const AUTOMATION_FIELD_COUNT: usize = 16;
     const COORDINATOR_EVENTS_EWMA_ALPHA: f64 = 0.30;
     const COORDINATOR_TASK_REGISTRY_REL_PATH: &'static str =
         ".macc/automation/task/task_registry.json";
@@ -872,6 +872,12 @@ impl AppState {
         }
         if let Some(v) = cfg.phase_runner_max_attempts {
             cmd.env("PHASE_RUNNER_MAX_ATTEMPTS", v.to_string());
+        }
+        if let Some(v) = cfg.log_flush_lines {
+            cmd.env("COORDINATOR_LOG_FLUSH_LINES", v.to_string());
+        }
+        if let Some(v) = cfg.log_flush_ms {
+            cmd.env("COORDINATOR_LOG_FLUSH_MS", v.to_string());
         }
         if let Some(v) = cfg.stale_claimed_seconds {
             cmd.env("STALE_CLAIMED_SECONDS", v.to_string());
@@ -2349,6 +2355,8 @@ impl AppState {
             11 => "Stale In Progress Seconds",
             12 => "Stale Changes Requested Seconds",
             13 => "Stale Action",
+            14 => "Log Flush Lines",
+            15 => "Log Flush Interval (ms)",
             _ => "",
         }
     }
@@ -2369,6 +2377,8 @@ impl AppState {
             11 => "Auto-stale timeout for in_progress tasks in seconds, 0 disables.",
             12 => "Auto-stale timeout for changes_requested tasks in seconds, 0 disables.",
             13 => "Action for stale tasks: abandon, todo, blocked.",
+            14 => "Flush coordinator logs every N lines (0 uses runtime default).",
+            15 => "Flush coordinator logs every N milliseconds (0 uses runtime default).",
             _ => "",
         }
     }
@@ -2434,6 +2444,14 @@ impl AppState {
             13 => coordinator
                 .and_then(|c| c.stale_action.clone())
                 .unwrap_or_else(|| "abandon".to_string()),
+            14 => coordinator
+                .and_then(|c| c.log_flush_lines)
+                .unwrap_or(0)
+                .to_string(),
+            15 => coordinator
+                .and_then(|c| c.log_flush_ms)
+                .unwrap_or(0)
+                .to_string(),
             _ => String::new(),
         }
     }
@@ -2495,9 +2513,16 @@ impl AppState {
             }
             4 => self.set_automation_field_tool_caps(input),
             5 => self.set_automation_field_tool_specializations(input),
-            6..=12 => match input.parse::<usize>() {
+            6..=12 | 14 => match input.parse::<usize>() {
                 Ok(value) => {
                     self.set_automation_field_usize(idx, value);
+                    Ok(())
+                }
+                Err(_) => Err("Invalid integer value.".to_string()),
+            },
+            15 => match input.parse::<u64>() {
+                Ok(value) => {
+                    self.set_automation_field_u64(idx, value);
                     Ok(())
                 }
                 Err(_) => Err("Invalid integer value.".to_string()),
@@ -2564,7 +2589,17 @@ impl AppState {
                 10 => coordinator.stale_claimed_seconds = Some(value),
                 11 => coordinator.stale_in_progress_seconds = Some(value),
                 12 => coordinator.stale_changes_requested_seconds = Some(value),
+                14 => coordinator.log_flush_lines = Some(value),
                 _ => {}
+            }
+        }
+    }
+
+    fn set_automation_field_u64(&mut self, idx: usize, value: u64) {
+        self.snapshot_before_config_change();
+        if let Some(coordinator) = self.coordinator_config_mut() {
+            if idx == 15 {
+                coordinator.log_flush_ms = Some(value);
             }
         }
     }
@@ -3686,8 +3721,15 @@ impl AppState {
             5 => serde_json::from_str::<BTreeMap<String, Vec<String>>>(input)
                 .err()
                 .map(|e| format!("Invalid JSON: {}", e)),
-            6..=12 => {
+            6..=12 | 14 => {
                 if input.parse::<usize>().is_err() {
+                    Some("Invalid integer value.".to_string())
+                } else {
+                    None
+                }
+            }
+            15 => {
+                if input.parse::<u64>().is_err() {
                     Some("Invalid integer value.".to_string())
                 } else {
                     None

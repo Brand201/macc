@@ -28,6 +28,24 @@ use std::str::FromStr;
 
 use crate::services::project::ensure_initialized_paths;
 
+fn build_native_logger(
+    repo_root: &Path,
+    action: &str,
+    env_cfg: &CoordinatorEnvConfig,
+    coordinator_cfg: Option<&macc_core::config::CoordinatorConfig>,
+) -> Result<NativeCoordinatorLogger> {
+    NativeCoordinatorLogger::new_with_flush(
+        repo_root,
+        action,
+        env_cfg
+            .log_flush_lines
+            .or_else(|| coordinator_cfg.and_then(|c| c.log_flush_lines)),
+        env_cfg
+            .log_flush_ms
+            .or_else(|| coordinator_cfg.and_then(|c| c.log_flush_ms)),
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct CoordinatorCommandInput {
     pub action: String,
@@ -365,7 +383,12 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
             .map_err(|e| {
                 MaccError::Validation(format!("Failed to initialize tokio runtime: {}", e))
             })?;
-        let logger = NativeCoordinatorLogger::new(&paths.root, "dispatch")?;
+        let logger = build_native_logger(
+            &paths.root,
+            "dispatch",
+            &input.env_cfg,
+            coordinator_cfg.as_ref(),
+        )?;
         println!("Coordinator log file: {}", logger.file.display());
         runtime.block_on(async {
             let mut state = CoordinatorRunState::new();
@@ -418,7 +441,12 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
                 "Action 'advance' does not accept extra args in native mode.".into(),
             ));
         }
-        let logger = NativeCoordinatorLogger::new(&paths.root, "advance")?;
+        let logger = build_native_logger(
+            &paths.root,
+            "advance",
+            &input.env_cfg,
+            coordinator_cfg.as_ref(),
+        )?;
         println!("Coordinator log file: {}", logger.file.display());
         let coordinator_tool_override = input.env_cfg.coordinator_tool.clone().or_else(|| {
             coordinator_cfg
@@ -499,7 +527,12 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
                     .map(std::path::PathBuf::from)
             })
             .unwrap_or_else(|| paths.root.join("prd.json"));
-        let logger = NativeCoordinatorLogger::new(&paths.root, "sync")?;
+        let logger = build_native_logger(
+            &paths.root,
+            "sync",
+            &input.env_cfg,
+            coordinator_cfg.as_ref(),
+        )?;
         println!("Coordinator log file: {}", logger.file.display());
         let storage_mode =
             resolve_coordinator_storage_mode(&input.env_cfg, coordinator_cfg.as_ref())?;
@@ -533,7 +566,12 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
                 "Action 'reconcile' does not accept extra args in native mode.".into(),
             ));
         }
-        let logger = NativeCoordinatorLogger::new(&paths.root, "reconcile")?;
+        let logger = build_native_logger(
+            &paths.root,
+            "reconcile",
+            &input.env_cfg,
+            coordinator_cfg.as_ref(),
+        )?;
         println!("Coordinator log file: {}", logger.file.display());
         let _ = logger.note("- Reconcile start");
         reconcile_registry_native(&paths.root)?;
@@ -544,7 +582,12 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
                 "Action 'cleanup' does not accept extra args in native mode.".into(),
             ));
         }
-        let logger = NativeCoordinatorLogger::new(&paths.root, "cleanup")?;
+        let logger = build_native_logger(
+            &paths.root,
+            "cleanup",
+            &input.env_cfg,
+            coordinator_cfg.as_ref(),
+        )?;
         println!("Coordinator log file: {}", logger.file.display());
         let _ = logger.note("- Cleanup start");
         cleanup_registry_native(&paths.root)?;
@@ -943,7 +986,8 @@ fn retry_dev_phase_native(
         .ok_or_else(|| MaccError::Validation("retry-phase requires worktree".into()))?;
     let worktree = std::path::PathBuf::from(worktree_path);
     let mut state = CoordinatorRunState::new();
-    let logger = NativeCoordinatorLogger::new(repo_root, "retry-phase")?;
+    let logger =
+        NativeCoordinatorLogger::new_with_flush(repo_root, "retry-phase", env_cfg.log_flush_lines, env_cfg.log_flush_ms)?;
     println!("Coordinator log file: {}", logger.file.display());
     let current_exe = std::env::current_exe().map_err(|e| {
         MaccError::Validation(format!("Failed to resolve current executable path: {}", e))
@@ -1016,7 +1060,7 @@ fn retry_tool_phase_native(
         }))
         .ok_or_else(|| MaccError::Validation("Task missing for retry".into()))?
         .clone();
-    let logger = NativeCoordinatorLogger::new(repo_root, "retry-phase")?;
+    let logger = build_native_logger(repo_root, "retry-phase", env_cfg, coordinator_cfg)?;
     println!("Coordinator log file: {}", logger.file.display());
     let coordinator_tool_override = env_cfg
         .coordinator_tool

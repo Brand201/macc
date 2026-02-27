@@ -10,6 +10,8 @@ pub(crate) struct CoordinatorEnvConfig {
     pub(crate) max_parallel: Option<usize>,
     pub(crate) timeout_seconds: Option<usize>,
     pub(crate) phase_runner_max_attempts: Option<usize>,
+    pub(crate) log_flush_lines: Option<usize>,
+    pub(crate) log_flush_ms: Option<u64>,
     #[allow(dead_code)]
     pub(crate) stale_claimed_seconds: Option<usize>,
     pub(crate) stale_in_progress_seconds: Option<usize>,

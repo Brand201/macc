@@ -3,6 +3,7 @@ use crate::coordinator::helpers::{
     now_iso_coordinator, recompute_resource_locks_from_tasks, set_registry_updated_at,
 };
 use crate::NativeCoordinatorLogger;
+use macc_core::coordinator::model::TaskRegistry;
 use macc_core::coordinator::{engine as coordinator_engine, RuntimeStatus};
 use macc_core::{MaccError, Result};
 use std::collections::BTreeMap;
@@ -364,7 +365,42 @@ pub(crate) fn cleanup_registry_native(repo_root: &Path) -> Result<()> {
     let mut registry =
         coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
     let mut changed = false;
-    if let Some(tasks) = registry
+    if let Ok(mut typed) = TaskRegistry::from_value(&registry) {
+        for task in typed.tasks.iter_mut() {
+            match task.state.as_str() {
+                "abandoned" | "todo" => {
+                    if task.worktree.is_some() {
+                        task.worktree = None;
+                        changed = true;
+                    }
+                    if task.assignee.is_some() {
+                        task.assignee = None;
+                        changed = true;
+                    }
+                    if task.task_runtime.pid.is_some() {
+                        task.task_runtime.pid = None;
+                        changed = true;
+                    }
+                }
+                "merged" => {
+                    if task.assignee.is_some() {
+                        task.assignee = None;
+                        changed = true;
+                    }
+                    if task.task_runtime.pid.is_some() {
+                        task.task_runtime.pid = None;
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if changed {
+            typed.recompute_resource_locks(&now_iso_coordinator());
+            typed.set_updated_at(now_iso_coordinator());
+            registry = typed.to_value()?;
+        }
+    } else if let Some(tasks) = registry
         .get_mut("tasks")
         .and_then(serde_json::Value::as_array_mut)
     {
@@ -401,8 +437,10 @@ pub(crate) fn cleanup_registry_native(repo_root: &Path) -> Result<()> {
         }
     }
     if changed {
-        recompute_resource_locks_from_tasks(&mut registry);
-        set_registry_updated_at(&mut registry);
+        if TaskRegistry::from_value(&registry).is_err() {
+            recompute_resource_locks_from_tasks(&mut registry);
+            set_registry_updated_at(&mut registry);
+        }
         coordinator::state::coordinator_state_registry_save(
             repo_root,
             &BTreeMap::new(),
