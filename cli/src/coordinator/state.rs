@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub fn coordinator_state_apply_transition(
     repo_root: &Path,
@@ -36,9 +38,7 @@ pub fn coordinator_state_apply_transition(
             now,
         };
         apply_transition_sqlite_with_event(&paths, &change, event.as_ref())?;
-        if should_mirror_json(args) {
-            coordinator_storage_export_sqlite_to_json(&paths)?;
-        }
+        maybe_mirror_json(&paths, args)?;
         return Ok(());
     }
 
@@ -134,9 +134,7 @@ pub fn coordinator_state_set_runtime(
             now,
         };
         set_runtime_sqlite_with_event(&paths, &change, event.as_ref())?;
-        if should_mirror_json(args) {
-            coordinator_storage_export_sqlite_to_json(&paths)?;
-        }
+        maybe_mirror_json(&paths, args)?;
         return Ok(());
     }
 
@@ -376,9 +374,7 @@ pub fn coordinator_state_save_snapshot(
         CoordinatorStorageMode::Json => JsonStorage::new(store_paths).save_snapshot(snapshot)?,
         CoordinatorStorageMode::DualWrite | CoordinatorStorageMode::Sqlite => {
             SqliteStorage::new(store_paths.clone()).save_snapshot(snapshot)?;
-            if should_mirror_json(args) {
-                coordinator_storage_export_sqlite_to_json(&project_paths)?;
-            }
+            maybe_mirror_json(&project_paths, args)?;
         }
     }
     Ok(())
@@ -425,9 +421,7 @@ pub fn coordinator_state_set_merge_pending(
         now,
     };
     set_merge_pending_sqlite(&paths, &change)?;
-    if should_mirror_json(args) {
-        coordinator_storage_export_sqlite_to_json(&paths)?;
-    }
+    maybe_mirror_json(&paths, args)?;
     Ok(())
 }
 
@@ -449,9 +443,7 @@ pub fn coordinator_state_set_merge_processed(
         now,
     };
     set_merge_processed_sqlite(&paths, &change)?;
-    if should_mirror_json(args) {
-        coordinator_storage_export_sqlite_to_json(&paths)?;
-    }
+    maybe_mirror_json(&paths, args)?;
     Ok(())
 }
 
@@ -464,9 +456,7 @@ pub fn coordinator_state_increment_retries(
     let paths = ProjectPaths::from_root(repo_root);
     let change = RetryIncrementMutation { task_id, now };
     increment_retries_sqlite(&paths, &change)?;
-    if should_mirror_json(args) {
-        coordinator_storage_export_sqlite_to_json(&paths)?;
-    }
+    maybe_mirror_json(&paths, args)?;
     Ok(())
 }
 
@@ -494,9 +484,7 @@ pub fn coordinator_state_upsert_slo_warning(
         now,
     };
     upsert_slo_warning_sqlite(&paths, &change)?;
-    if should_mirror_json(args) {
-        coordinator_storage_export_sqlite_to_json(&paths)?;
-    }
+    maybe_mirror_json(&paths, args)?;
     Ok(())
 }
 
@@ -748,6 +736,47 @@ fn should_mirror_json(args: &BTreeMap<String, String>) -> bool {
         raw.trim().to_ascii_lowercase().as_str(),
         "0" | "false" | "no" | "off"
     )
+}
+
+fn mirror_json_debounce_ms(args: &BTreeMap<String, String>) -> u64 {
+    args.get("mirror-json-debounce-ms")
+        .cloned()
+        .or_else(|| std::env::var("COORDINATOR_JSON_EXPORT_DEBOUNCE_MS").ok())
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn mirror_export_guard(
+) -> &'static Mutex<std::collections::HashMap<std::path::PathBuf, Instant>> {
+    static LAST_EXPORT: OnceLock<Mutex<std::collections::HashMap<std::path::PathBuf, Instant>>> =
+        OnceLock::new();
+    LAST_EXPORT.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn maybe_mirror_json(project_paths: &ProjectPaths, args: &BTreeMap<String, String>) -> Result<()> {
+    if !should_mirror_json(args) {
+        return Ok(());
+    }
+    let debounce_ms = mirror_json_debounce_ms(args);
+    if debounce_ms == 0 {
+        return coordinator_storage_export_sqlite_to_json(project_paths);
+    }
+
+    let now = Instant::now();
+    let threshold = Duration::from_millis(debounce_ms);
+    let mut guard = mirror_export_guard()
+        .lock()
+        .map_err(|_| MaccError::Validation("mirror export guard lock poisoned".to_string()))?;
+    let key = project_paths.root.clone();
+    let should_export = guard
+        .get(&key)
+        .map(|last| now.saturating_duration_since(*last) >= threshold)
+        .unwrap_or(true);
+    if should_export {
+        coordinator_storage_export_sqlite_to_json(project_paths)?;
+        guard.insert(key, now);
+    }
+    Ok(())
 }
 
 fn load_snapshot_view(

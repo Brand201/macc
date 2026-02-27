@@ -582,6 +582,12 @@ Important behavior:
   - YAML (`automation.coordinator`): `log_flush_lines`, `log_flush_ms`
   - TUI (Coordinator Settings): `Log Flush Lines`, `Log Flush Interval (ms)`
   - Precedence: CLI override -> YAML value -> env (`COORDINATOR_LOG_FLUSH_LINES` / `COORDINATOR_LOG_FLUSH_MS`) -> built-in defaults.
+- SQLite -> JSON compatibility export debounce is configurable as an official coordinator setting:
+  - CLI: `--mirror-json-debounce-ms <ms>`
+  - YAML (`automation.coordinator`): `mirror_json_debounce_ms`
+  - TUI (Coordinator Settings): `JSON Export Debounce (ms)`
+  - Env fallback remains supported: `COORDINATOR_JSON_EXPORT_DEBOUNCE_MS=<ms>`
+  - `0` keeps immediate export (legacy behavior).
 - Stale heartbeat policy is enforced during control-plane runs via env:
   - `STALE_HEARTBEAT_SECONDS` (0 disables)
   - `STALE_HEARTBEAT_ACTION=retry|block|requeue`

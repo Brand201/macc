@@ -206,7 +206,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    const AUTOMATION_FIELD_COUNT: usize = 16;
+    const AUTOMATION_FIELD_COUNT: usize = 17;
     const COORDINATOR_EVENTS_EWMA_ALPHA: f64 = 0.30;
     const COORDINATOR_TASK_REGISTRY_REL_PATH: &'static str =
         ".macc/automation/task/task_registry.json";
@@ -878,6 +878,9 @@ impl AppState {
         }
         if let Some(v) = cfg.log_flush_ms {
             cmd.env("COORDINATOR_LOG_FLUSH_MS", v.to_string());
+        }
+        if let Some(v) = cfg.mirror_json_debounce_ms {
+            cmd.env("COORDINATOR_JSON_EXPORT_DEBOUNCE_MS", v.to_string());
         }
         if let Some(v) = cfg.stale_claimed_seconds {
             cmd.env("STALE_CLAIMED_SECONDS", v.to_string());
@@ -2357,6 +2360,7 @@ impl AppState {
             13 => "Stale Action",
             14 => "Log Flush Lines",
             15 => "Log Flush Interval (ms)",
+            16 => "JSON Export Debounce (ms)",
             _ => "",
         }
     }
@@ -2379,6 +2383,7 @@ impl AppState {
             13 => "Action for stale tasks: abandon, todo, blocked.",
             14 => "Flush coordinator logs every N lines (0 uses runtime default).",
             15 => "Flush coordinator logs every N milliseconds (0 uses runtime default).",
+            16 => "Debounce SQLite -> JSON compatibility export in ms (0 disables debounce).",
             _ => "",
         }
     }
@@ -2452,6 +2457,10 @@ impl AppState {
                 .and_then(|c| c.log_flush_ms)
                 .unwrap_or(0)
                 .to_string(),
+            16 => coordinator
+                .and_then(|c| c.mirror_json_debounce_ms)
+                .unwrap_or(0)
+                .to_string(),
             _ => String::new(),
         }
     }
@@ -2520,7 +2529,7 @@ impl AppState {
                 }
                 Err(_) => Err("Invalid integer value.".to_string()),
             },
-            15 => match input.parse::<u64>() {
+            15 | 16 => match input.parse::<u64>() {
                 Ok(value) => {
                     self.set_automation_field_u64(idx, value);
                     Ok(())
@@ -2598,8 +2607,10 @@ impl AppState {
     fn set_automation_field_u64(&mut self, idx: usize, value: u64) {
         self.snapshot_before_config_change();
         if let Some(coordinator) = self.coordinator_config_mut() {
-            if idx == 15 {
-                coordinator.log_flush_ms = Some(value);
+            match idx {
+                15 => coordinator.log_flush_ms = Some(value),
+                16 => coordinator.mirror_json_debounce_ms = Some(value),
+                _ => {}
             }
         }
     }
@@ -3728,7 +3739,7 @@ impl AppState {
                     None
                 }
             }
-            15 => {
+            15 | 16 => {
                 if input.parse::<u64>().is_err() {
                     Some("Invalid integer value.".to_string())
                 } else {

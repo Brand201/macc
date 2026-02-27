@@ -240,6 +240,9 @@ enum Commands {
         /// Flush coordinator log buffer every N milliseconds (default: 1000)
         #[arg(long)]
         log_flush_ms: Option<u64>,
+        /// Debounce SQLite -> JSON compatibility export in milliseconds (0 disables debounce)
+        #[arg(long)]
+        mirror_json_debounce_ms: Option<u64>,
         /// Override STALE_CLAIMED_SECONDS
         #[arg(long)]
         stale_claimed_seconds: Option<usize>,
@@ -738,6 +741,7 @@ fn run_with_engine_provider(
             phase_runner_max_attempts,
             log_flush_lines,
             log_flush_ms,
+            mirror_json_debounce_ms,
             stale_claimed_seconds,
             stale_in_progress_seconds,
             stale_changes_requested_seconds,
@@ -765,6 +769,7 @@ fn run_with_engine_provider(
                     phase_runner_max_attempts: *phase_runner_max_attempts,
                     log_flush_lines: *log_flush_lines,
                     log_flush_ms: *log_flush_ms,
+                    mirror_json_debounce_ms: *mirror_json_debounce_ms,
                     stale_claimed_seconds: *stale_claimed_seconds,
                     stale_in_progress_seconds: *stale_in_progress_seconds,
                     stale_changes_requested_seconds: *stale_changes_requested_seconds,
@@ -1283,6 +1288,15 @@ fn coordinator_env_pairs(
         .or_else(|| coordinator.and_then(|c| c.storage_mode.clone()))
     {
         out.push(("COORDINATOR_STORAGE_MODE".to_string(), value));
+    }
+    if let Some(value) = env_cfg
+        .mirror_json_debounce_ms
+        .or_else(|| coordinator.and_then(|c| c.mirror_json_debounce_ms))
+    {
+        out.push((
+            "COORDINATOR_JSON_EXPORT_DEBOUNCE_MS".to_string(),
+            value.to_string(),
+        ));
     }
     out
 }

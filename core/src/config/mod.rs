@@ -100,6 +100,8 @@ pub struct CoordinatorConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_flush_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_json_debounce_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_claimed_seconds: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_in_progress_seconds: Option<usize>,

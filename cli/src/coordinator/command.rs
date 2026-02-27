@@ -318,6 +318,13 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         };
         std::env::set_var("COORDINATOR_STORAGE_MODE", mode_raw);
     }
+    if let Some(debounce_ms) = input
+        .env_cfg
+        .mirror_json_debounce_ms
+        .or_else(|| coordinator_cfg.as_ref().and_then(|c| c.mirror_json_debounce_ms))
+    {
+        std::env::set_var("COORDINATOR_JSON_EXPORT_DEBOUNCE_MS", debounce_ms.to_string());
+    }
     if action.emits_runtime_events() {
         ensure_coordinator_run_id();
     }
@@ -338,7 +345,14 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         println!("Coordinator process groups signaled: {}", stopped);
         reconcile_registry_native(&paths.root)?;
         cleanup_registry_native(&paths.root)?;
-        unlock_resource_locks_native(&paths.root, &input.env_cfg, None, true, "blocked")?;
+        unlock_resource_locks_native(
+            &paths.root,
+            &input.env_cfg,
+            coordinator_cfg.as_ref(),
+            None,
+            true,
+            "blocked",
+        )?;
         if input.remove_worktrees {
             let removed = remove_all_worktrees(&paths.root, input.remove_branches)?;
             println!("Removed {} worktree(s).", removed);
@@ -598,14 +612,27 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
                 "Action 'status' does not accept extra args in native mode.".into(),
             ));
         }
-        print_status_summary_native(&paths.root, &input.env_cfg)?;
+        print_status_summary_native(&paths.root, &input.env_cfg, coordinator_cfg.as_ref())?;
     } else if action == CoordinatorAction::Unlock {
         let (task_id, resource, clear_all, unlock_state) =
             parse_unlock_args(&input.extra_args)?;
         if let Some(task_id) = task_id {
-            unlock_task_state_native(&paths.root, &input.env_cfg, &task_id, &unlock_state)?;
+            unlock_task_state_native(
+                &paths.root,
+                &input.env_cfg,
+                coordinator_cfg.as_ref(),
+                &task_id,
+                &unlock_state,
+            )?;
         } else {
-            unlock_resource_locks_native(&paths.root, &input.env_cfg, resource, clear_all, &unlock_state)?;
+            unlock_resource_locks_native(
+                &paths.root,
+                &input.env_cfg,
+                coordinator_cfg.as_ref(),
+                resource,
+                clear_all,
+                &unlock_state,
+            )?;
         }
     } else if action == CoordinatorAction::RetryPhase {
         handle_retry_phase_native(
@@ -692,11 +719,12 @@ fn parse_unlock_args(args: &[String]) -> Result<(Option<String>, Option<String>,
 fn unlock_task_state_native(
     repo_root: &Path,
     env_cfg: &CoordinatorEnvConfig,
+    coordinator_cfg: Option<&macc_core::config::CoordinatorConfig>,
     task_id: &str,
     unlock_state: &str,
 ) -> Result<()> {
     let mut args = std::collections::BTreeMap::new();
-    apply_storage_mode_args(&mut args, env_cfg);
+    apply_storage_mode_args(&mut args, env_cfg, coordinator_cfg);
     args.insert("task-id".to_string(), task_id.to_string());
     args.insert("state".to_string(), unlock_state.to_string());
     args.insert("reason".to_string(), "manual_unlock".to_string());
@@ -708,12 +736,13 @@ fn unlock_task_state_native(
 fn unlock_resource_locks_native(
     repo_root: &Path,
     env_cfg: &CoordinatorEnvConfig,
+    coordinator_cfg: Option<&macc_core::config::CoordinatorConfig>,
     resource: Option<String>,
     clear_all: bool,
     unlock_state: &str,
 ) -> Result<()> {
     let mut args = std::collections::BTreeMap::new();
-    apply_storage_mode_args(&mut args, env_cfg);
+    apply_storage_mode_args(&mut args, env_cfg, coordinator_cfg);
     if clear_all {
         let removed =
             coordinator::state::coordinator_state_unlock_resource(repo_root, &args, None, true)?;
@@ -743,15 +772,30 @@ fn unlock_resource_locks_native(
 fn apply_storage_mode_args(
     args: &mut std::collections::BTreeMap<String, String>,
     env_cfg: &CoordinatorEnvConfig,
+    coordinator_cfg: Option<&macc_core::config::CoordinatorConfig>,
 ) {
-    if let Some(value) = env_cfg.storage_mode.clone() {
+    if let Some(value) = env_cfg
+        .storage_mode
+        .clone()
+        .or_else(|| coordinator_cfg.and_then(|c| c.storage_mode.clone()))
+    {
         args.insert("storage-mode".to_string(), value);
+    }
+    if let Some(value) = env_cfg
+        .mirror_json_debounce_ms
+        .or_else(|| coordinator_cfg.and_then(|c| c.mirror_json_debounce_ms))
+    {
+        args.insert("mirror-json-debounce-ms".to_string(), value.to_string());
     }
 }
 
-fn print_status_summary_native(repo_root: &Path, env_cfg: &CoordinatorEnvConfig) -> Result<()> {
+fn print_status_summary_native(
+    repo_root: &Path,
+    env_cfg: &CoordinatorEnvConfig,
+    coordinator_cfg: Option<&macc_core::config::CoordinatorConfig>,
+) -> Result<()> {
     let mut args = std::collections::BTreeMap::new();
-    apply_storage_mode_args(&mut args, env_cfg);
+    apply_storage_mode_args(&mut args, env_cfg, coordinator_cfg);
     let snapshot = coordinator::state::coordinator_state_snapshot(repo_root, &args)?;
     let registry = snapshot.registry;
     let registry_path = repo_root
@@ -840,7 +884,7 @@ fn handle_retry_phase_native(
 ) -> Result<()> {
     let (task_id, phase, skip) = parse_retry_phase_args(args)?;
     let mut state_args = std::collections::BTreeMap::new();
-    apply_storage_mode_args(&mut state_args, env_cfg);
+    apply_storage_mode_args(&mut state_args, env_cfg, coordinator_cfg);
     let mut snapshot = coordinator::state::coordinator_state_snapshot(repo_root, &state_args)?;
     let tasks = snapshot
         .registry
@@ -870,7 +914,7 @@ fn handle_retry_phase_native(
     }
 
     let mut retry_args = std::collections::BTreeMap::new();
-    apply_storage_mode_args(&mut retry_args, env_cfg);
+    apply_storage_mode_args(&mut retry_args, env_cfg, coordinator_cfg);
     retry_args.insert("task-id".to_string(), task_id.clone());
     coordinator::state::coordinator_state_increment_retries(repo_root, &retry_args)?;
 
