@@ -18,6 +18,7 @@ use macc_core::tool::{ToolPerformerSpec, ToolSpec, ToolSpecLoader};
 use macc_core::{load_canonical_config, MaccError, Result};
 use std::collections::BTreeMap;
 use std::process::exit;
+use tracing::{debug, error, info};
 
 mod commands;
 mod coordinator;
@@ -574,9 +575,10 @@ pub enum BackupsCommands {
 
 fn main() {
     let cli = Cli::parse();
+    init_tracing(cli.verbose);
 
     if cli.verbose {
-        eprintln!("Verbose mode enabled");
+        info!("Verbose mode enabled");
     }
 
     // Initialize the real engine with default registry
@@ -584,9 +586,21 @@ fn main() {
     let provider = services::engine_provider::EngineProvider::new(engine);
 
     if let Err(e) = run_with_engine_provider(cli, provider) {
+        error!(error = %e, "Command failed");
         eprintln!("Error: {}", e);
         exit(get_exit_code(&e));
     }
+}
+
+fn init_tracing(verbose: bool) {
+    let fallback = if verbose { "debug" } else { "info" };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .or_else(|_| tracing_subscriber::EnvFilter::try_new(fallback))
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
 }
 
 fn get_exit_code(err: &MaccError) -> i32 {
@@ -612,6 +626,7 @@ fn run_with_engine_provider(
     cli: Cli,
     provider: services::engine_provider::EngineProvider,
 ) -> Result<()> {
+    debug!(cwd = %cli.cwd, "Starting CLI command routing");
     let cwd = std::path::PathBuf::from(&cli.cwd);
     let absolute_cwd = if cwd.is_absolute() {
         cwd
@@ -889,6 +904,7 @@ impl NativeCoordinatorLogger {
     pub(crate) fn note(&self, msg: impl AsRef<str>) -> Result<()> {
         use std::io::Write as _;
         let line = format!("{}\n", msg.as_ref());
+        tracing::info!(target: "macc.coordinator.log", "{}", msg.as_ref());
         let mut state = self.state.lock().map_err(|_| {
             MaccError::Validation("Coordinator logger lock poisoned".to_string())
         })?;
@@ -1356,7 +1372,7 @@ fn run_coordinator_action_with_options(
         )));
     }
     if let Err(err) = coordinator::logs::aggregate_performer_logs(repo_root) {
-        eprintln!("warning: failed to aggregate performer logs: {}", err);
+        tracing::warn!("failed to aggregate performer logs: {}", err);
     }
     Ok(())
 }
@@ -3300,7 +3316,7 @@ mod tests {
                 Some((listener, port))
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("Skipping test: cannot bind loopback socket ({})", e);
+                tracing::warn!("Skipping test: cannot bind loopback socket ({})", e);
                 None
             }
             Err(e) => panic!("Failed to bind loopback socket: {}", e),

@@ -18,3 +18,4 @@ toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["process", "rt", "time", "sync"] }
+tracing = "0.1"

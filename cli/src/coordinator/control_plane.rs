@@ -1321,7 +1321,7 @@ pub async fn monitor_merge_jobs_native(
                                         severity,
                                     );
                                 },
-                                |msg| eprintln!("{}", msg),
+                                |msg| tracing::warn!("{}", msg),
                             );
                         }
                     }

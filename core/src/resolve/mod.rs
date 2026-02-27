@@ -90,7 +90,7 @@ impl CliOverrides {
             if allowed_set.contains(tool.as_str()) {
                 filtered_tools.push(tool.clone());
             } else {
-                eprintln!("Warning: Unknown tool: {}", tool);
+                tracing::warn!("Unknown tool referenced in overrides: {}", tool);
             }
         }
 

@@ -496,7 +496,7 @@ pub(crate) fn find_reusable_worktree_native(
                         repo_root, event_type, task_id, phase, status, message, severity,
                     );
                 },
-                |msg| eprintln!("{}", msg),
+                |msg| tracing::warn!("{}", msg),
             );
         }
         let last_commit = std::process::Command::new("git")
