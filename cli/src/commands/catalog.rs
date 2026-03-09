@@ -127,6 +127,7 @@ impl<'a> Command for CatalogCommand<'a> {
                 add,
                 add_ids,
             } => crate::services::catalog::run_remote_search(
+                &self.app.engine,
                 &paths,
                 api.clone(),
                 kind.clone(),

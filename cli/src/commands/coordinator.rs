@@ -16,6 +16,6 @@ impl CoordinatorCommand {
 
 impl Command for CoordinatorCommand {
     fn run(&self) -> Result<()> {
-        handle(&self.app.cwd, self.input.clone())
+        handle(&self.app.cwd, &self.app.engine, self.input.clone())
     }
 }

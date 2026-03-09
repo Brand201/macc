@@ -1,12 +1,15 @@
 use crate::{
     catalog::{self, Agent, Skill},
+    coordinator,
     config::CanonicalConfig,
     doctor::{self, ToolCheck},
     plan::{self, ActionPlan, PlannedOp},
     resolve::{self, CliOverrides, MaterializedFetchUnit},
     tool::{ToolDescriptor, ToolDiagnostic, ToolRegistry, ToolSpecLoader},
-    ApplyReport, ProjectPaths, Result,
+    ApplyReport, ProjectPaths, Result, WorktreeCreateResult, WorktreeCreateSpec, WorktreeEntry,
 };
+use crate::coordinator_storage::{CoordinatorSnapshot, CoordinatorStorage, CoordinatorStoragePaths, JsonStorage, SqliteStorage};
+use std::path::Path;
 
 /// The interface for UI (CLI/TUI) to interact with MACC core logic.
 pub trait Engine {
@@ -29,6 +32,160 @@ pub trait Engine {
 
     fn builtin_skills(&self) -> Vec<Skill>;
     fn builtin_agents(&self) -> Vec<Agent>;
+
+    fn list_worktrees(&self, root: &Path) -> Result<Vec<WorktreeEntry>> {
+        crate::list_worktrees(root)
+    }
+
+    fn create_worktrees(
+        &self,
+        root: &Path,
+        spec: &WorktreeCreateSpec,
+    ) -> Result<Vec<WorktreeCreateResult>> {
+        crate::create_worktrees(root, spec)
+    }
+
+    fn remove_worktree(&self, root: &Path, path: &Path, force: bool) -> Result<()> {
+        crate::remove_worktree(root, path, force)
+    }
+
+    fn catalog_search_remote(
+        &self,
+        paths: &ProjectPaths,
+        provider: &dyn crate::catalog::service::CatalogRemoteSearchProvider,
+        api: &str,
+        kind: crate::catalog::service::CatalogSearchKind,
+        query: &str,
+        add: bool,
+        add_ids: Option<&str>,
+    ) -> Result<crate::catalog::service::RemoteSearchOutcome> {
+        crate::catalog::service::execute_remote_search(
+            paths, provider, api, kind, query, add, add_ids,
+        )
+    }
+
+    fn install_skill(
+        &self,
+        paths: &ProjectPaths,
+        tool: &str,
+        id: &str,
+        backend: &dyn crate::catalog::service::CatalogInstallBackend,
+    ) -> Result<crate::catalog::service::InstallSkillOutcome> {
+        crate::catalog::service::install_skill(paths, tool, id, backend)
+    }
+
+    fn install_mcp(
+        &self,
+        paths: &ProjectPaths,
+        id: &str,
+        backend: &dyn crate::catalog::service::CatalogInstallBackend,
+    ) -> Result<crate::catalog::service::InstallMcpOutcome> {
+        crate::catalog::service::install_mcp(paths, id, backend)
+    }
+
+    fn coordinator_start_run(
+        &self,
+        backend: &mut dyn coordinator::engine::ControlPlaneBackend,
+        cfg: coordinator::engine::ControlPlaneLoopConfig,
+    ) -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(|e| crate::MaccError::Validation(format!("build runtime for coordinator run: {}", e)))?;
+        runtime.block_on(coordinator::engine::run_control_plane(backend, cfg))
+    }
+
+    fn coordinator_stop(&self, repo_root: &Path, reason: &str) -> Result<()> {
+        coordinator::state_runtime::write_coordinator_pause_file(
+            repo_root,
+            "global",
+            "dev",
+            &format!("stopped: {}", reason),
+        )
+    }
+
+    fn coordinator_resume(&self, repo_root: &Path) -> Result<()> {
+        if let Some(pause) = coordinator::state_runtime::read_coordinator_pause_file(repo_root)? {
+            let task_id = pause
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let phase = pause
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !task_id.is_empty() && phase == "integrate" {
+                coordinator::state_runtime::resume_paused_task_integrate(repo_root, task_id)?;
+            }
+        }
+        let _ = coordinator::state_runtime::clear_coordinator_pause_file(repo_root)?;
+        Ok(())
+    }
+
+    fn coordinator_status_snapshot(
+        &self,
+        project_paths: &ProjectPaths,
+    ) -> Result<CoordinatorStatusSnapshot> {
+        let paths = CoordinatorStoragePaths::from_project_paths(project_paths);
+        let sqlite = SqliteStorage::new(paths.clone());
+        let snapshot: CoordinatorSnapshot = if sqlite.has_snapshot_data()? {
+            sqlite.load_snapshot()?
+        } else {
+            JsonStorage::new(paths).load_snapshot()?
+        };
+
+        let tasks = snapshot
+            .registry
+            .get("tasks")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut counts = CoordinatorStatusSnapshot::default();
+        counts.total = tasks.len();
+        for task in tasks {
+            match task
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("todo")
+            {
+                "todo" => counts.todo += 1,
+                "blocked" => counts.blocked += 1,
+                "merged" => counts.merged += 1,
+                _ => counts.active += 1,
+            }
+        }
+
+        if let Some(pause) = coordinator::state_runtime::read_coordinator_pause_file(&project_paths.root)? {
+            counts.paused = true;
+            counts.pause_reason = pause
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.to_string());
+            counts.pause_task_id = pause
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.to_string());
+            counts.pause_phase = pause
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.to_string());
+        }
+
+        Ok(counts)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CoordinatorStatusSnapshot {
+    pub total: usize,
+    pub todo: usize,
+    pub active: usize,
+    pub blocked: usize,
+    pub merged: usize,
+    pub paused: bool,
+    pub pause_reason: Option<String>,
+    pub pause_task_id: Option<String>,
+    pub pause_phase: Option<String>,
 }
 
 /// The standard production engine.

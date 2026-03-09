@@ -27,11 +27,11 @@ mod services;
 mod test_support;
 
 use crate::coordinator::helpers::now_iso_coordinator;
-use crate::coordinator::types::CoordinatorEnvConfig;
-use crate::coordinator::args::{
+use macc_core::coordinator::args::{
     parse_coordinator_extra_kv_args, RuntimeStatusFromEventArgs, RuntimeTransitionArgs,
     StorageSyncArgs, WorkflowTransitionArgs,
 };
+use macc_core::coordinator::types::CoordinatorEnvConfig;
 use crate::coordinator::state_runtime::{
     cleanup_dead_runtime_tasks, coordinator_pause_file_path, resume_paused_task_integrate,
     set_task_paused_for_integrate, write_coordinator_pause_file,
@@ -818,11 +818,9 @@ fn run_with_engine_provider(
 }
 
 
-pub(crate) const COORDINATOR_TASK_REGISTRY_REL_PATH: &str = ".macc/automation/task/task_registry.json";
-const COORDINATOR_PAUSE_FILE_REL_PATH: &str = ".macc/automation/task/coordinator.pause.json";
-
-pub(crate) type CoordinatorJob = coordinator_runtime::CoordinatorJob;
-pub(crate) type CoordinatorMergeJob = coordinator_runtime::CoordinatorMergeJob;
+#[cfg(test)]
+pub(crate) const COORDINATOR_TASK_REGISTRY_REL_PATH: &str =
+    macc_core::coordinator::COORDINATOR_TASK_REGISTRY_REL_PATH;
 pub(crate) type CoordinatorRunState = coordinator_runtime::CoordinatorRunState;
 
 pub(crate) struct NativeCoordinatorLogger {
@@ -3047,7 +3045,7 @@ fn confirm_user_scope_apply(
         println!("    ... and {} more", user_ops.len() - preview_limit);
     }
 
-    let user_backup_root = user_backup_root()?;
+    let user_backup_root = macc_core::domain::backups::user_backup_root()?;
     println!(
         "  - Backups will be written under: {}",
         user_backup_root.display()
@@ -3066,211 +3064,6 @@ fn confirm_user_scope_apply(
     }
 
     Ok(())
-}
-
-fn user_backup_root() -> Result<std::path::PathBuf> {
-    let home = macc_core::find_user_home().ok_or(MaccError::HomeDirNotFound)?;
-    Ok(home.join(".macc/backups"))
-}
-
-fn backup_root(paths: &macc_core::ProjectPaths, user: bool) -> Result<std::path::PathBuf> {
-    if user {
-        user_backup_root()
-    } else {
-        Ok(paths.backups_dir.clone())
-    }
-}
-
-fn list_backup_sets(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut sets = Vec::new();
-    for entry in std::fs::read_dir(root).map_err(|e| MaccError::Io {
-        path: root.to_string_lossy().into(),
-        action: "read backup root".into(),
-        source: e,
-    })? {
-        let entry = entry.map_err(|e| MaccError::Io {
-            path: root.to_string_lossy().into(),
-            action: "iterate backup root".into(),
-            source: e,
-        })?;
-        let path = entry.path();
-        if path.is_dir() {
-            sets.push(path);
-        }
-    }
-    sets.sort_by(|a, b| {
-        let an = a.file_name().and_then(|v| v.to_str()).unwrap_or_default();
-        let bn = b.file_name().and_then(|v| v.to_str()).unwrap_or_default();
-        bn.cmp(an)
-    });
-    Ok(sets)
-}
-
-fn resolve_backup_set_path(
-    paths: &macc_core::ProjectPaths,
-    user: bool,
-    id: Option<&str>,
-    latest: bool,
-) -> Result<std::path::PathBuf> {
-    let root = backup_root(paths, user)?;
-    let sets = list_backup_sets(&root)?;
-    if sets.is_empty() {
-        return Err(MaccError::Validation(format!(
-            "No backup sets found in {}",
-            root.display()
-        )));
-    }
-
-    if latest {
-        return Ok(sets[0].clone());
-    }
-
-    let id = id.ok_or_else(|| {
-        MaccError::Validation("backup id is required unless --latest is provided".into())
-    })?;
-    let candidate = root.join(id);
-    if !candidate.is_dir() {
-        return Err(MaccError::Validation(format!(
-            "Backup set not found: {}",
-            candidate.display()
-        )));
-    }
-    Ok(candidate)
-}
-
-pub(crate) fn list_backup_sets_command(paths: &macc_core::ProjectPaths, user: bool) -> Result<()> {
-    let root = backup_root(paths, user)?;
-    let sets = list_backup_sets(&root)?;
-    if sets.is_empty() {
-        println!("No backup sets in {}", root.display());
-        return Ok(());
-    }
-    println!("Backup sets in {}:", root.display());
-    for set in sets {
-        let id = set.file_name().and_then(|v| v.to_str()).unwrap_or_default();
-        let files = count_files_recursive(&set)?;
-        println!("  - {} ({} file(s))", id, files);
-    }
-    Ok(())
-}
-
-pub(crate) fn open_backup_set_command(
-    paths: &macc_core::ProjectPaths,
-    id: Option<&str>,
-    latest: bool,
-    user: bool,
-    editor: &Option<String>,
-) -> Result<()> {
-    let set = resolve_backup_set_path(paths, user, id, latest)?;
-    println!("Backup set: {}", set.display());
-    if let Some(cmd) = editor {
-        services::worktree::open_in_editor(&set, cmd)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn restore_backup_set_command(
-    paths: &macc_core::ProjectPaths,
-    user: bool,
-    id: Option<&str>,
-    latest: bool,
-    dry_run: bool,
-    yes: bool,
-) -> Result<()> {
-    let set = resolve_backup_set_path(paths, user, id, latest)?;
-    let target_root = if user {
-        macc_core::find_user_home().ok_or(MaccError::HomeDirNotFound)?
-    } else {
-        paths.root.clone()
-    };
-
-    let files = collect_files_recursive(&set)?;
-    if files.is_empty() {
-        println!("Backup set {} is empty.", set.display());
-        return Ok(());
-    }
-
-    println!("Restore source: {}", set.display());
-    println!("Restore target: {}", target_root.display());
-    println!("Files to restore: {}", files.len());
-    if dry_run {
-        for (idx, file) in files.iter().enumerate() {
-            if idx >= 20 {
-                println!("  ... and {} more", files.len() - idx);
-                break;
-            }
-            let rel = file.strip_prefix(&set).unwrap_or(file.as_path());
-            println!("  - {}", rel.display());
-        }
-        return Ok(());
-    }
-
-    if !yes && !confirm_yes_no("Proceed with restore [y/N]? ")? {
-        return Err(MaccError::Validation("Restore cancelled.".into()));
-    }
-
-    let mut restored = 0usize;
-    for file in files {
-        let rel = file.strip_prefix(&set).map_err(|e| {
-            MaccError::Validation(format!(
-                "Failed to compute backup relative path for {}: {}",
-                file.display(),
-                e
-            ))
-        })?;
-        let destination = target_root.join(rel);
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
-                path: parent.to_string_lossy().into(),
-                action: "create restore parent directory".into(),
-                source: e,
-            })?;
-        }
-        std::fs::copy(&file, &destination).map_err(|e| MaccError::Io {
-            path: file.to_string_lossy().into(),
-            action: format!("restore to {}", destination.display()),
-            source: e,
-        })?;
-        restored += 1;
-    }
-    println!("Restored {} file(s).", restored);
-    Ok(())
-}
-
-fn count_files_recursive(root: &std::path::Path) -> Result<usize> {
-    Ok(collect_files_recursive(root)?.len())
-}
-
-fn collect_files_recursive(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
-    let mut files = Vec::new();
-    if !root.exists() {
-        return Ok(files);
-    }
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        for entry in std::fs::read_dir(&current).map_err(|e| MaccError::Io {
-            path: current.to_string_lossy().into(),
-            action: "read backup set directory".into(),
-            source: e,
-        })? {
-            let entry = entry.map_err(|e| MaccError::Io {
-                path: current.to_string_lossy().into(),
-                action: "iterate backup set directory".into(),
-                source: e,
-            })?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.is_file() {
-                files.push(path);
-            }
-        }
-    }
-    files.sort();
-    Ok(files)
 }
 
 fn apply_worktree(
@@ -3305,12 +3098,14 @@ fn apply_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::tooling::{extract_version_token, run_version_command};
     use crate::test_support::run_git_ok;
-    use macc_core::MaccError;
+    use macc_core::{MaccError, McpCatalog, SkillsCatalog};
     use macc_core::TestEngine;
     use std::fs;
     use std::io;
     use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
 
     fn bind_loopback() -> Option<(TcpListener, u16)> {
         match TcpListener::bind("127.0.0.1:0") {
@@ -3342,6 +3137,20 @@ mod tests {
             let mut perms = std::fs::metadata(path).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn collect_rs_files(root: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                out.push(path);
+            }
         }
     }
 
@@ -3380,6 +3189,37 @@ mod tests {
                 details: "test".into()
             }),
             6
+        );
+    }
+
+    #[test]
+    fn test_no_direct_git_process_invocations_in_cli_tui() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cli_src = manifest_dir.join("src");
+        let tui_src = manifest_dir.join("../tui/src");
+        let patterns = [
+            "Command::new(\"git\")",
+            "std::process::Command::new(\"git\")",
+        ];
+
+        let mut files = Vec::new();
+        collect_rs_files(&cli_src, &mut files);
+        collect_rs_files(&tui_src, &mut files);
+
+        let mut violations = Vec::new();
+        for file in files {
+            let Ok(content) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            if patterns.iter().any(|p| content.contains(p)) {
+                violations.push(file.display().to_string());
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "Direct git process invocation detected; use macc_core::git facade instead: {:?}",
+            violations
         );
     }
 
@@ -3699,6 +3539,9 @@ mod tests {
             max_parallel: None,
             timeout_seconds: Some(10),
             phase_runner_max_attempts: None,
+            log_flush_lines: None,
+            log_flush_ms: None,
+            mirror_json_debounce_ms: None,
             stale_claimed_seconds: None,
             stale_in_progress_seconds: None,
             stale_changes_requested_seconds: None,
@@ -3777,6 +3620,9 @@ mod tests {
             max_parallel: None,
             timeout_seconds: Some(10),
             phase_runner_max_attempts: None,
+            log_flush_lines: None,
+            log_flush_ms: None,
+            mirror_json_debounce_ms: None,
             stale_claimed_seconds: None,
             stale_in_progress_seconds: None,
             stale_changes_requested_seconds: None,
@@ -3802,7 +3648,7 @@ mod tests {
     fn test_coordinator_control_plane_same_input_same_final_state() -> macc_core::Result<()> {
         fn run_once(
             root: &std::path::Path,
-            script: &std::path::Path,
+            _script: &std::path::Path,
         ) -> macc_core::Result<serde_json::Value> {
             let registry = root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
             std::fs::create_dir_all(registry.parent().expect("registry parent")).unwrap();
@@ -3836,6 +3682,9 @@ mod tests {
                 max_parallel: None,
                 timeout_seconds: Some(10),
                 phase_runner_max_attempts: None,
+                log_flush_lines: None,
+                log_flush_ms: None,
+                mirror_json_debounce_ms: None,
                 stale_claimed_seconds: None,
                 stale_in_progress_seconds: None,
                 stale_changes_requested_seconds: None,
@@ -3952,6 +3801,9 @@ fi
             max_parallel: None,
             timeout_seconds: None,
             phase_runner_max_attempts: None,
+            log_flush_lines: None,
+            log_flush_ms: None,
+            mirror_json_debounce_ms: None,
             stale_claimed_seconds: None,
             stale_in_progress_seconds: None,
             stale_changes_requested_seconds: None,
@@ -4041,6 +3893,9 @@ fi
             max_parallel: None,
             timeout_seconds: None,
             phase_runner_max_attempts: None,
+            log_flush_lines: None,
+            log_flush_ms: None,
+            mirror_json_debounce_ms: None,
             stale_claimed_seconds: None,
             stale_in_progress_seconds: None,
             stale_changes_requested_seconds: None,
@@ -4161,6 +4016,9 @@ fi
                     max_parallel: None,
                     timeout_seconds: None,
                     phase_runner_max_attempts: None,
+                    log_flush_lines: None,
+                    log_flush_ms: None,
+                    mirror_json_debounce_ms: None,
                     stale_claimed_seconds: None,
                     stale_in_progress_seconds: None,
                     stale_changes_requested_seconds: None,

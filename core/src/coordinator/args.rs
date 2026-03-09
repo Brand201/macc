@@ -1,25 +1,25 @@
-use macc_core::coordinator::{RuntimeStatus, WorkflowState};
-use macc_core::coordinator_storage::CoordinatorStorageTransfer;
-use macc_core::{MaccError, Result};
+use crate::coordinator::{RuntimeStatus, WorkflowState};
+use crate::coordinator_storage::CoordinatorStorageTransfer;
+use crate::{MaccError, Result};
 use std::collections::BTreeMap;
 
-pub(crate) struct WorkflowTransitionArgs {
-    pub(crate) from: WorkflowState,
-    pub(crate) to: WorkflowState,
+pub struct WorkflowTransitionArgs {
+    pub from: WorkflowState,
+    pub to: WorkflowState,
 }
 
-pub(crate) struct RuntimeTransitionArgs {
-    pub(crate) from: RuntimeStatus,
-    pub(crate) to: RuntimeStatus,
+pub struct RuntimeTransitionArgs {
+    pub from: RuntimeStatus,
+    pub to: RuntimeStatus,
 }
 
-pub(crate) struct RuntimeStatusFromEventArgs {
-    pub(crate) event_type: String,
-    pub(crate) status: String,
+pub struct RuntimeStatusFromEventArgs {
+    pub event_type: String,
+    pub status: String,
 }
 
-pub(crate) struct StorageSyncArgs {
-    pub(crate) direction: CoordinatorStorageTransfer,
+pub struct StorageSyncArgs {
+    pub direction: CoordinatorStorageTransfer,
 }
 
 fn parse_flag_kv_pairs(
@@ -58,8 +58,7 @@ impl TryFrom<&[String]> for WorkflowTransitionArgs {
     type Error = MaccError;
 
     fn try_from(args: &[String]) -> std::result::Result<Self, Self::Error> {
-        let usage =
-            "macc coordinator validate-transition --from <state> --to <state>";
+        let usage = "macc coordinator validate-transition --from <state> --to <state>";
         let map = parse_flag_kv_pairs(args, usage, &["from", "to"])?;
         let from = map
             .get("from")
@@ -116,8 +115,7 @@ impl TryFrom<&[String]> for StorageSyncArgs {
     type Error = MaccError;
 
     fn try_from(args: &[String]) -> std::result::Result<Self, Self::Error> {
-        let usage =
-            "macc coordinator storage-sync --direction <import|export|verify>";
+        let usage = "macc coordinator storage-sync --direction <import|export|verify>";
         let map = parse_flag_kv_pairs(args, usage, &["direction"])?;
         let direction = map
             .get("direction")
@@ -128,7 +126,7 @@ impl TryFrom<&[String]> for StorageSyncArgs {
     }
 }
 
-pub(crate) fn parse_coordinator_extra_kv_args(extra_args: &[String]) -> Result<BTreeMap<String, String>> {
+pub fn parse_coordinator_extra_kv_args(extra_args: &[String]) -> Result<BTreeMap<String, String>> {
     if !extra_args.len().is_multiple_of(2) {
         return Err(MaccError::Validation(
             "Unexpected argument list; expected '--key value' pairs.".into(),

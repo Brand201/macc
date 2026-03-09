@@ -2,11 +2,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::str::FromStr;
 
+pub mod args;
+pub mod control_plane;
 pub mod engine;
+pub mod helpers;
+pub mod logs;
 pub mod model;
 pub mod runtime;
 pub mod session_manager;
+pub mod state;
+pub mod state_runtime;
 pub mod task_selector;
+pub mod types;
+
+pub const COORDINATOR_TASK_REGISTRY_REL_PATH: &str = ".macc/automation/task/task_registry.json";
+pub const COORDINATOR_PAUSE_FILE_REL_PATH: &str = ".macc/automation/task/coordinator.pause.json";
 
 pub const COORDINATOR_EVENT_SCHEMA_VERSION: &str = "1";
 pub const COORDINATOR_EVENT_TYPES_V1: &[&str] = &[

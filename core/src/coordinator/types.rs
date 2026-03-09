@@ -1,0 +1,23 @@
+#[derive(Debug, Clone, Default)]
+pub struct CoordinatorEnvConfig {
+    pub prd: Option<String>,
+    pub coordinator_tool: Option<String>,
+    pub reference_branch: Option<String>,
+    pub tool_priority: Option<String>,
+    pub max_parallel_per_tool_json: Option<String>,
+    pub tool_specializations_json: Option<String>,
+    pub max_dispatch: Option<usize>,
+    pub max_parallel: Option<usize>,
+    pub timeout_seconds: Option<usize>,
+    pub phase_runner_max_attempts: Option<usize>,
+    pub log_flush_lines: Option<usize>,
+    pub log_flush_ms: Option<u64>,
+    pub mirror_json_debounce_ms: Option<u64>,
+    pub stale_claimed_seconds: Option<usize>,
+    pub stale_in_progress_seconds: Option<usize>,
+    pub stale_changes_requested_seconds: Option<usize>,
+    pub stale_action: Option<String>,
+    pub storage_mode: Option<String>,
+    pub error_code_retry_list: Option<String>,
+    pub error_code_retry_max: Option<usize>,
+}

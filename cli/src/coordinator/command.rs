@@ -2,22 +2,21 @@ use crate::{
     coordinator,
     coordinator_runtime_status_from_event_action, coordinator_select_ready_task_action,
     coordinator_storage_sync_action, load_canonical_config, remove_all_worktrees,
-    resolve_coordinator_storage_mode, run_coordinator_control_plane_rust,
     stop_coordinator_process_groups,
     validate_coordinator_runtime_transition_action, validate_coordinator_transition_action,
     CoordinatorRunState, NativeCoordinatorLogger,
 };
-use crate::coordinator::args::parse_coordinator_extra_kv_args;
-use crate::coordinator::types::CoordinatorEnvConfig;
 use crate::coordinator::helpers::now_iso_coordinator;
 use crate::coordinator::state_runtime::{
-    cleanup_registry_native, clear_coordinator_pause_file, read_coordinator_pause_file,
-    reconcile_registry_native, resume_paused_task_integrate, set_task_paused_for_integrate,
+    cleanup_registry_native,
+    reconcile_registry_native, set_task_paused_for_integrate,
     write_coordinator_pause_file,
 };
 use macc_core::coordinator::engine as coordinator_engine;
 use macc_core::coordinator::runtime as coordinator_runtime;
 use macc_core::coordinator::WorkflowState;
+use macc_core::coordinator::args::parse_coordinator_extra_kv_args;
+use macc_core::coordinator::types::CoordinatorEnvConfig;
 use macc_core::coordinator_storage::{
     coordinator_storage_export_sqlite_to_json, coordinator_storage_import_json_to_sqlite,
     coordinator_storage_verify_parity, CoordinatorStorageMode,
@@ -44,6 +43,14 @@ fn build_native_logger(
             .log_flush_ms
             .or_else(|| coordinator_cfg.and_then(|c| c.log_flush_ms)),
     )
+}
+
+struct LoggerAdapter<'a>(&'a NativeCoordinatorLogger);
+
+impl macc_core::coordinator::control_plane::CoordinatorLog for LoggerAdapter<'_> {
+    fn note(&self, line: String) -> Result<()> {
+        self.0.note(line)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -177,7 +184,11 @@ impl ProjectContext {
     }
 }
 
-pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()> {
+pub fn handle(
+    absolute_cwd: &Path,
+    engine: &crate::services::engine_provider::SharedEngine,
+    input: CoordinatorCommandInput,
+) -> Result<()> {
     let action = CoordinatorAction::from_str(input.action.as_str())?;
 
     if action == CoordinatorAction::ValidateTransition {
@@ -309,7 +320,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
     let _ = macc_core::ensure_embedded_automation_scripts(&paths)?;
 
     if let Ok(effective_storage_mode) =
-        resolve_coordinator_storage_mode(&input.env_cfg, coordinator_cfg.as_ref())
+        coordinator_engine::resolve_storage_mode(&input.env_cfg, coordinator_cfg.as_ref())
     {
         let mode_raw = match effective_storage_mode {
             CoordinatorStorageMode::Json => "json",
@@ -330,12 +341,27 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
     }
 
     if action == CoordinatorAction::ControlPlaneRun {
-        run_coordinator_control_plane_rust(
+        let logger = build_native_logger(
+            &paths.root,
+            "run",
+            &input.env_cfg,
+            coordinator_cfg.as_ref(),
+        )?;
+        println!("Coordinator log file: {}", logger.file.display());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .map_err(|e| {
+                MaccError::Validation(format!("Failed to initialize tokio runtime: {}", e))
+            })?;
+        runtime.block_on(coordinator_engine::run_native_control_plane(
             &paths.root,
             &canonical,
             coordinator_cfg.as_ref(),
             &input.env_cfg,
-        )?;
+            Some(&LoggerAdapter(&logger)),
+        ))?;
         return Ok(());
     }
 
@@ -343,6 +369,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         let coordinator_path = paths.automation_coordinator_path();
         let stopped = stop_coordinator_process_groups(&paths.root, &coordinator_path, input.graceful)?;
         println!("Coordinator process groups signaled: {}", stopped);
+        let _ = engine.coordinator_stop(&paths.root, "manual stop");
         reconcile_registry_native(&paths.root)?;
         cleanup_registry_native(&paths.root)?;
         unlock_resource_locks_native(
@@ -365,12 +392,27 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
                 "Action 'run' does not accept extra args after '--'.".into(),
             ));
         }
-        run_coordinator_control_plane_rust(
+        let logger = build_native_logger(
+            &paths.root,
+            "run",
+            &input.env_cfg,
+            coordinator_cfg.as_ref(),
+        )?;
+        println!("Coordinator log file: {}", logger.file.display());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .map_err(|e| {
+                MaccError::Validation(format!("Failed to initialize tokio runtime: {}", e))
+            })?;
+        runtime.block_on(coordinator_engine::run_native_control_plane(
             &paths.root,
             &canonical,
             coordinator_cfg.as_ref(),
             &input.env_cfg,
-        )?;
+            Some(&LoggerAdapter(&logger)),
+        ))?;
     } else if action == CoordinatorAction::Dispatch {
         if !input.extra_args.is_empty() {
             return Err(MaccError::Validation(
@@ -509,16 +551,9 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
                 "Action 'resume' does not accept extra args in native mode.".into(),
             ));
         }
-        let pause = read_coordinator_pause_file(&paths.root)?;
-        if let Some(value) = pause {
-            let task_id = value
-                .get("task_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if !task_id.is_empty() {
-                resume_paused_task_integrate(&paths.root, task_id)?;
-            }
-            let _ = clear_coordinator_pause_file(&paths.root)?;
+        let before = engine.coordinator_status_snapshot(&paths)?;
+        if before.paused {
+            engine.coordinator_resume(&paths.root)?;
             println!("Coordinator resume signal applied.");
         } else {
             println!("Coordinator is not paused.");
@@ -549,7 +584,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
         )?;
         println!("Coordinator log file: {}", logger.file.display());
         let storage_mode =
-            resolve_coordinator_storage_mode(&input.env_cfg, coordinator_cfg.as_ref())?;
+            coordinator_engine::resolve_storage_mode(&input.env_cfg, coordinator_cfg.as_ref())?;
         if storage_mode != CoordinatorStorageMode::Json {
             let storage_paths = macc_core::ProjectPaths::from_root(&paths.root);
             coordinator_storage_import_json_to_sqlite(&storage_paths)?;
@@ -612,7 +647,7 @@ pub fn handle(absolute_cwd: &Path, input: CoordinatorCommandInput) -> Result<()>
                 "Action 'status' does not accept extra args in native mode.".into(),
             ));
         }
-        print_status_summary_native(&paths.root, &input.env_cfg, coordinator_cfg.as_ref())?;
+        print_status_summary_native(engine, &paths, &paths.root, &input.env_cfg, coordinator_cfg.as_ref())?;
     } else if action == CoordinatorAction::Unlock {
         let (task_id, resource, clear_all, unlock_state) =
             parse_unlock_args(&input.extra_args)?;
@@ -790,87 +825,38 @@ fn apply_storage_mode_args(
 }
 
 fn print_status_summary_native(
+    engine: &crate::services::engine_provider::SharedEngine,
+    paths: &macc_core::ProjectPaths,
     repo_root: &Path,
     env_cfg: &CoordinatorEnvConfig,
     coordinator_cfg: Option<&macc_core::config::CoordinatorConfig>,
 ) -> Result<()> {
-    let mut args = std::collections::BTreeMap::new();
-    apply_storage_mode_args(&mut args, env_cfg, coordinator_cfg);
-    let snapshot = coordinator::state::coordinator_state_snapshot(repo_root, &args)?;
-    let registry = snapshot.registry;
+    let _ = (env_cfg, coordinator_cfg);
+    let status = engine.coordinator_status_snapshot(paths)?;
     let registry_path = repo_root
         .join(".macc")
         .join("automation")
         .join("task")
         .join("task_registry.json");
     println!("Registry: {}", registry_path.display());
-    let tasks = registry
-        .get("tasks")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut counts = (0usize, 0usize, 0usize, 0usize, 0usize);
-    counts.0 = tasks.len();
-    for task in &tasks {
-        let state = task.get("state").and_then(serde_json::Value::as_str).unwrap_or("todo");
-        match state {
-            "todo" => counts.1 += 1,
-            "blocked" => counts.3 += 1,
-            "merged" => counts.4 += 1,
-            "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued" => counts.2 += 1,
-            _ => {}
+    println!("Tasks: {}", status.total);
+    println!("  todo: {}", status.todo);
+    println!("  active: {}", status.active);
+    println!("  blocked: {}", status.blocked);
+    println!("  merged: {}", status.merged);
+    if status.paused {
+        println!("Paused: yes");
+        if let Some(task) = status.pause_task_id {
+            println!("  task: {}", task);
         }
-    }
-    println!("Tasks: {}", counts.0);
-    println!("  todo: {}", counts.1);
-    println!("  active: {}", counts.2);
-    println!("  blocked: {}", counts.3);
-    println!("  merged: {}", counts.4);
-
-    let locks = registry
-        .get("resource_locks")
-        .and_then(serde_json::Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    println!("Locks: {}", locks.len());
-    for (key, value) in locks {
-        let task_id = value
-            .get("task_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        println!("  {} -> {}", key, task_id);
-    }
-
-    let mut slo_warn_count = 0usize;
-    for task in &tasks {
-        let warnings = task
-            .get("task_runtime")
-            .and_then(|v| v.get("slo_warnings"))
-            .and_then(serde_json::Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        slo_warn_count += warnings.len();
-    }
-    println!("SLO warnings: {}", slo_warn_count);
-    for task in &tasks {
-        let task_id = task.get("id").and_then(serde_json::Value::as_str).unwrap_or("");
-        let warnings = task
-            .get("task_runtime")
-            .and_then(|v| v.get("slo_warnings"))
-            .and_then(serde_json::Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        for (metric, entry) in warnings {
-            let value = entry
-                .get("value")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let threshold = entry
-                .get("threshold")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            println!("  task={} metric={} value={} threshold={}", task_id, metric, value, threshold);
+        if let Some(phase) = status.pause_phase {
+            println!("  phase: {}", phase);
         }
+        if let Some(reason) = status.pause_reason {
+            println!("  reason: {}", reason);
+        }
+    } else {
+        println!("Paused: no");
     }
     Ok(())
 }

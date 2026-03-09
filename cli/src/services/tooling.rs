@@ -366,7 +366,7 @@ fn get_tool_update_status(spec: &ToolSpec) -> ToolUpdateStatus {
     }
 }
 
-fn run_version_command(cmd_spec: &macc_core::tool::ToolInstallCommand) -> Option<String> {
+pub(crate) fn run_version_command(cmd_spec: &macc_core::tool::ToolInstallCommand) -> Option<String> {
     let output = std::process::Command::new(&cmd_spec.command)
         .args(&cmd_spec.args)
         .output()
@@ -386,7 +386,7 @@ fn run_version_command(cmd_spec: &macc_core::tool::ToolInstallCommand) -> Option
     extract_version_token(&text)
 }
 
-fn extract_version_token(text: &str) -> Option<String> {
+pub(crate) fn extract_version_token(text: &str) -> Option<String> {
     for raw in text.split_whitespace() {
         let token =
             raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');

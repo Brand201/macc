@@ -1,8 +1,22 @@
 use super::{RuntimeStatus, WorkflowState};
+use crate::config::{CanonicalConfig, CoordinatorConfig};
+use crate::coordinator::control_plane::CoordinatorLog;
+use crate::coordinator::runtime::{
+    process_branch_cleanup_queue, terminate_active_jobs, CoordinatorRunState,
+};
+use crate::coordinator::state_runtime::{
+    cleanup_dead_runtime_tasks, clear_coordinator_pause_file, coordinator_pause_file_path,
+    resume_paused_task_integrate, set_task_paused_for_integrate, write_coordinator_pause_file,
+};
+use crate::coordinator_storage::{
+    coordinator_storage_bootstrap_sqlite_from_json, coordinator_storage_export_sqlite_to_json,
+    CoordinatorStorageMode,
+};
 use crate::{MaccError, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -834,7 +848,7 @@ impl CoordinatorRunController {
     }
 }
 
-pub async fn run_control_plane<B: ControlPlaneBackend>(
+pub async fn run_control_plane<B: ControlPlaneBackend + ?Sized>(
     backend: &mut B,
     cfg: ControlPlaneLoopConfig,
 ) -> Result<()> {
@@ -878,6 +892,391 @@ pub async fn run_control_plane<B: ControlPlaneBackend>(
 
         backend.sleep_between_cycles().await?;
     }
+}
+
+struct NativeControlPlaneBackend<'a> {
+    repo_root: &'a Path,
+    canonical: &'a CanonicalConfig,
+    coordinator: Option<&'a CoordinatorConfig>,
+    env_cfg: &'a super::types::CoordinatorEnvConfig,
+    logger: Option<&'a dyn CoordinatorLog>,
+    prd_file: PathBuf,
+    run_state: CoordinatorRunState,
+    phase_runner_max_attempts: usize,
+    coordinator_tool_override: Option<String>,
+    phase_timeout_seconds: usize,
+    last_logged_counts: Option<CoordinatorCounts>,
+}
+
+#[async_trait]
+impl ControlPlaneBackend for NativeControlPlaneBackend<'_> {
+    async fn on_cycle_start(&mut self, _cycle: usize) -> Result<()> {
+        crate::coordinator::control_plane::sync_registry_from_prd_native(
+            self.repo_root,
+            &self.prd_file,
+            self.logger,
+        )?;
+        let logger = self.logger;
+        let _ = process_branch_cleanup_queue(
+            self.repo_root,
+            |event_type, task_id, phase, status, message, severity| {
+                let _ = crate::coordinator::helpers::append_coordinator_event_with_severity(
+                    self.repo_root,
+                    event_type,
+                    task_id,
+                    phase,
+                    status,
+                    message,
+                    severity,
+                );
+            },
+            Some(move |msg| {
+                if let Some(log) = logger {
+                    let _ = log.note(msg);
+                }
+            }),
+        )?;
+        let cleaned = if let Some(log) = self.logger {
+            let note = |line: String| {
+                let _ = log.note(line);
+            };
+            cleanup_dead_runtime_tasks(self.repo_root, "run-cycle", Some(&note))?
+        } else {
+            cleanup_dead_runtime_tasks(self.repo_root, "run-cycle", None)?
+        };
+        if cleaned > 0 {
+            if let Some(log) = self.logger {
+                let _ = log.note(format!("- Runtime cleanup fixed {} ghost task(s)", cleaned));
+            }
+        }
+        Ok(())
+    }
+
+    async fn monitor_active_jobs(&mut self) -> Result<()> {
+        crate::coordinator::control_plane::monitor_active_jobs_native(
+            self.repo_root,
+            self.env_cfg,
+            &mut self.run_state,
+            self.phase_runner_max_attempts,
+            self.phase_timeout_seconds,
+            self.logger,
+        )
+        .await
+    }
+
+    async fn monitor_merge_jobs(&mut self) -> Result<Option<(String, String)>> {
+        crate::coordinator::control_plane::monitor_merge_jobs_native(
+            self.repo_root,
+            &mut self.run_state,
+            self.logger,
+        )
+        .await
+    }
+
+    async fn on_blocked_merge(&mut self, task_id: &str, reason: &str) -> Result<()> {
+        for (tid, pid) in terminate_active_jobs(&self.run_state) {
+            if let Some(log) = self.logger {
+                let _ = log.note(format!("- Sent TERM to active task={} pid={}", tid, pid));
+            }
+        }
+        self.run_state.merge_join_set.abort_all();
+        self.run_state.active_merge_jobs.clear();
+        set_task_paused_for_integrate(self.repo_root, task_id, reason)?;
+        write_coordinator_pause_file(self.repo_root, task_id, "integrate", reason)?;
+        if let Some(log) = self.logger {
+            let _ = log.note(format!(
+                "- Run paused task={} phase=integrate reason={}",
+                task_id, reason
+            ));
+        }
+        loop {
+            if !coordinator_pause_file_path(self.repo_root).exists() {
+                if let Some(log) = self.logger {
+                    let _ = log.note("- Resume signal received; continuing run loop".to_string());
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        resume_paused_task_integrate(self.repo_root, task_id)?;
+        let _ = clear_coordinator_pause_file(self.repo_root)?;
+        Ok(())
+    }
+
+    async fn advance_tasks(&mut self) -> Result<AdvanceResult> {
+        crate::coordinator::control_plane::advance_tasks_native(
+            self.repo_root,
+            self.coordinator_tool_override.as_deref(),
+            self.phase_runner_max_attempts,
+            &mut self.run_state,
+            self.logger,
+        )
+        .await
+    }
+
+    async fn dispatch_ready_tasks(&mut self) -> Result<usize> {
+        crate::coordinator::control_plane::dispatch_ready_tasks_native(
+            self.repo_root,
+            self.canonical,
+            self.coordinator,
+            self.env_cfg,
+            &self.prd_file,
+            &mut self.run_state,
+            self.logger,
+        )
+        .await
+    }
+
+    async fn on_cycle_end(
+        &mut self,
+        _cycle: usize,
+        _advance: &AdvanceResult,
+        _dispatched: usize,
+    ) -> Result<CoordinatorCounts> {
+        let snapshot = crate::coordinator::state::coordinator_state_snapshot(
+            self.repo_root,
+            &std::collections::BTreeMap::new(),
+        )?;
+        let tasks = snapshot
+            .registry
+            .get("tasks")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut counts = CoordinatorCounts {
+            total: tasks.len(),
+            todo: 0,
+            active: 0,
+            blocked: 0,
+            merged: 0,
+        };
+        for task in tasks {
+            let state = task
+                .get("state")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default();
+            match state {
+                "todo" => counts.todo += 1,
+                "blocked" => counts.blocked += 1,
+                "merged" => counts.merged += 1,
+                "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued" => {
+                    counts.active += 1
+                }
+                _ => {}
+            }
+        }
+        self.last_logged_counts = Some(counts);
+        Ok(counts)
+    }
+
+    async fn sleep_between_cycles(&mut self) -> Result<()> {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Ok(())
+    }
+
+    fn should_terminate_run(&self, counts: &CoordinatorCounts) -> bool {
+        let max_dispatch_total = self
+            .env_cfg
+            .max_dispatch
+            .or_else(|| self.coordinator.and_then(|c| c.max_dispatch))
+            .unwrap_or(10);
+        if max_dispatch_total == 0 {
+            return false;
+        }
+        self.run_state.dispatched_total_run >= max_dispatch_total
+            && counts.active == 0
+            && self.run_state.active_jobs.is_empty()
+            && self.run_state.active_merge_jobs.is_empty()
+    }
+}
+
+pub fn resolve_storage_mode(
+    env_cfg: &super::types::CoordinatorEnvConfig,
+    coordinator: Option<&CoordinatorConfig>,
+) -> Result<CoordinatorStorageMode> {
+    let raw = env_cfg
+        .storage_mode
+        .clone()
+        .or_else(|| coordinator.and_then(|c| c.storage_mode.clone()))
+        .unwrap_or_else(|| "sqlite".to_string());
+    raw.parse::<CoordinatorStorageMode>()
+        .map_err(MaccError::Validation)
+}
+
+pub fn sync_storage_with_startup_reconcile(
+    project_paths: &crate::ProjectPaths,
+    storage_mode: CoordinatorStorageMode,
+    logger: Option<&dyn CoordinatorLog>,
+) -> Result<()> {
+    if storage_mode == CoordinatorStorageMode::Json {
+        return Ok(());
+    }
+    let imported = coordinator_storage_bootstrap_sqlite_from_json(project_paths)?;
+    if imported {
+        if let Some(log) = logger {
+            let _ = log.note("- Storage bootstrap: imported JSON snapshot into SQLite".to_string());
+        }
+    }
+    if std::env::var("COORDINATOR_JSON_COMPAT")
+        .ok()
+        .map(|raw| {
+            !matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(false)
+    {
+        coordinator_storage_export_sqlite_to_json(project_paths)?;
+    }
+    Ok(())
+}
+
+pub async fn run_native_control_plane(
+    repo_root: &Path,
+    canonical: &CanonicalConfig,
+    coordinator: Option<&CoordinatorConfig>,
+    env_cfg: &super::types::CoordinatorEnvConfig,
+    logger: Option<&dyn CoordinatorLog>,
+) -> Result<()> {
+    let run_id = if let Ok(existing) = std::env::var("COORDINATOR_RUN_ID") {
+        let trimmed = existing.trim();
+        if trimmed.is_empty() {
+            let generated = format!(
+                "run-{}-{}",
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+                std::process::id()
+            );
+            std::env::set_var("COORDINATOR_RUN_ID", &generated);
+            generated
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        let generated = format!(
+            "run-{}-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            std::process::id()
+        );
+        std::env::set_var("COORDINATOR_RUN_ID", &generated);
+        generated
+    };
+
+    let _ = crate::coordinator::helpers::append_coordinator_event_with_severity(
+        repo_root,
+        "command_start",
+        "-",
+        "run",
+        "started",
+        &format!("Coordinator run started (run_id={})", run_id),
+        "info",
+    );
+
+    let prd_file = env_cfg
+        .prd
+        .as_ref()
+        .map(PathBuf::from)
+        .or_else(|| coordinator.and_then(|c| c.prd_file.clone()).map(PathBuf::from))
+        .unwrap_or_else(|| repo_root.join("prd.json"));
+    if !prd_file.exists() {
+        return Err(MaccError::Validation(format!(
+            "Coordinator PRD file not found: {}. Configure `automation.coordinator.prd_file` or pass `--prd`.",
+            prd_file.display()
+        )));
+    }
+
+    let phase_runner_max_attempts = env_cfg
+        .phase_runner_max_attempts
+        .or_else(|| coordinator.and_then(|c| c.phase_runner_max_attempts))
+        .unwrap_or(1)
+        .max(1);
+    let coordinator_tool_override = env_cfg
+        .coordinator_tool
+        .clone()
+        .or_else(|| coordinator.and_then(|c| c.coordinator_tool.clone()));
+    let phase_timeout_seconds = env_cfg
+        .stale_in_progress_seconds
+        .or_else(|| coordinator.and_then(|c| c.stale_in_progress_seconds))
+        .unwrap_or(0);
+
+    let storage_mode = resolve_storage_mode(env_cfg, coordinator)?;
+    let storage_paths = crate::ProjectPaths::from_root(repo_root);
+    sync_storage_with_startup_reconcile(&storage_paths, storage_mode, logger)?;
+    let startup_cleaned = if let Some(log) = logger {
+        let note = |line: String| {
+            let _ = log.note(line);
+        };
+        cleanup_dead_runtime_tasks(repo_root, "run-startup", Some(&note))?
+    } else {
+        cleanup_dead_runtime_tasks(repo_root, "run-startup", None)?
+    };
+    if startup_cleaned > 0 {
+        if let Some(log) = logger {
+            let _ = log.note(format!(
+                "- Startup runtime cleanup fixed {} ghost task(s)",
+                startup_cleaned
+            ));
+        }
+    }
+
+    let mut backend = NativeControlPlaneBackend {
+        repo_root,
+        canonical,
+        coordinator,
+        env_cfg,
+        logger,
+        prd_file,
+        run_state: CoordinatorRunState::new(),
+        phase_runner_max_attempts,
+        coordinator_tool_override,
+        phase_timeout_seconds,
+        last_logged_counts: None,
+    };
+
+    let timeout_seconds = env_cfg
+        .timeout_seconds
+        .or_else(|| coordinator.and_then(|c| c.timeout_seconds))
+        .unwrap_or(0);
+    let loop_cfg = ControlPlaneLoopConfig {
+        timeout: if timeout_seconds > 0 {
+            Some(Duration::from_secs(timeout_seconds as u64))
+        } else {
+            None
+        },
+        max_no_progress_cycles: 2,
+    };
+    let run_result = run_control_plane(&mut backend, loop_cfg).await;
+    if run_result.is_err() {
+        if let Err(err) = &run_result {
+            let _ = crate::coordinator::helpers::append_coordinator_event_with_severity(
+                repo_root,
+                "command_end",
+                "-",
+                "run",
+                "failed",
+                &format!("Coordinator run failed: {}", err),
+                "blocking",
+            );
+        }
+        for (_tid, _pid) in terminate_active_jobs(&backend.run_state) {}
+        backend.run_state.active_jobs.clear();
+        backend.run_state.join_set.abort_all();
+        backend.run_state.active_merge_jobs.clear();
+        backend.run_state.merge_join_set.abort_all();
+        return run_result;
+    }
+
+    let _ = crate::coordinator::helpers::append_coordinator_event_with_severity(
+        repo_root,
+        "command_end",
+        "-",
+        "run",
+        "done",
+        "Coordinator run complete",
+        "info",
+    );
+    Ok(())
 }
 
 #[cfg(test)]

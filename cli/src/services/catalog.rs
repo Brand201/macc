@@ -1,15 +1,57 @@
 use macc_adapter_shared::catalog::{remote_search, SearchKind as RemoteSearchKind};
 use macc_core::catalog::{
-    load_effective_mcp_catalog, load_effective_skills_catalog, McpCatalog, McpEntry, Selector,
-    SkillEntry, SkillsCatalog, Source, SourceKind,
+    McpCatalog, McpEntry, Selector, SkillEntry, SkillsCatalog, Source, SourceKind,
 };
-use macc_core::plan::builders::{plan_mcp_install, plan_skill_install};
-use macc_core::plan::ActionPlan;
-use macc_core::resolve::{FetchUnit, Selection, SelectionKind};
 use macc_core::{MaccError, Result};
 use crate::services::engine_provider::SharedEngine;
 
+struct CliRemoteSearchProvider;
+
+impl macc_core::catalog::service::CatalogRemoteSearchProvider for CliRemoteSearchProvider {
+    fn search_skills(&self, api: &str, query: &str) -> Result<Vec<SkillEntry>> {
+        remote_search(api, RemoteSearchKind::Skill, query)
+    }
+
+    fn search_mcp(&self, api: &str, query: &str) -> Result<Vec<macc_core::catalog::McpEntry>> {
+        remote_search(api, RemoteSearchKind::Mcp, query)
+    }
+}
+
+struct CliCatalogInstallBackend<'a> {
+    engine: &'a SharedEngine,
+}
+
+impl macc_core::catalog::service::CatalogInstallBackend for CliCatalogInstallBackend<'_> {
+    fn list_tools(
+        &self,
+        paths: &macc_core::ProjectPaths,
+    ) -> (
+        Vec<macc_core::tool::ToolDescriptor>,
+        Vec<macc_core::tool::ToolDiagnostic>,
+    ) {
+        self.engine.list_tools(paths)
+    }
+
+    fn materialize_fetch_unit(
+        &self,
+        paths: &macc_core::ProjectPaths,
+        fetch_unit: macc_core::resolve::FetchUnit,
+    ) -> Result<macc_core::resolve::MaterializedFetchUnit> {
+        macc_adapter_shared::fetch::materialize_fetch_unit(paths, fetch_unit)
+    }
+
+    fn apply(
+        &self,
+        paths: &macc_core::ProjectPaths,
+        plan: &mut macc_core::plan::ActionPlan,
+        allow_user_scope: bool,
+    ) -> Result<macc_core::ApplyReport> {
+        self.engine.apply(paths, plan, allow_user_scope)
+    }
+}
+
 pub fn run_remote_search(
+    engine: &SharedEngine,
     paths: &macc_core::ProjectPaths,
     api: String,
     kind: String,
@@ -17,119 +59,47 @@ pub fn run_remote_search(
     add: bool,
     add_ids: Option<String>,
 ) -> Result<()> {
-    let search_kind = match kind.as_str() {
-        "skill" => RemoteSearchKind::Skill,
-        "mcp" => RemoteSearchKind::Mcp,
-        _ => {
-            return Err(MaccError::Validation(format!(
-                "Invalid kind: {}. Must be 'skill' or 'mcp'.",
-                kind
-            )))
-        }
-    };
+    let search_kind = macc_core::catalog::service::parse_search_kind(kind.as_str())?;
 
     println!("Searching {} for '{}' in {}...", kind, q, api);
 
-    let whitelist: Option<Vec<String>> = add_ids
-        .as_ref()
-        .map(|s| s.split(',').map(|i| i.trim().to_string()).collect());
-    let should_save = add || whitelist.is_some();
+    let outcome = engine.catalog_search_remote(
+        paths,
+        &CliRemoteSearchProvider,
+        &api,
+        search_kind,
+        &q,
+        add,
+        add_ids.as_deref(),
+    )?;
 
-    match search_kind {
-        RemoteSearchKind::Skill => {
-            let results: Vec<SkillEntry> = remote_search(&api, search_kind, &q)?;
-            if results.is_empty() {
-                println!("No skills found.");
-                return Ok(());
-            }
-
-            println!("{:<20} {:<30} {:<10} {:<20}", "ID", "NAME", "KIND", "TAGS");
-            println!("{:-<20} {:-<30} {:-<10} {:-<20}", "", "", "", "");
-
-            let mut catalog = if should_save {
-                Some(SkillsCatalog::load(&paths.skills_catalog_path())?)
-            } else {
-                None
-            };
-
-            for entry in &results {
-                let tags = entry.tags.join(", ");
-                let kind_str = match entry.source.kind {
-                    SourceKind::Git => "git",
-                    SourceKind::Http => "http",
-                    SourceKind::Local => "local",
-                };
-                println!(
-                    "{:<20} {:<30} {:<10} {:<20}",
-                    entry.id, entry.name, kind_str, tags
-                );
-
-                if let Some(cat) = &mut catalog {
-                    let should_add = if add {
-                        true
-                    } else if let Some(wl) = &whitelist {
-                        wl.contains(&entry.id)
-                    } else {
-                        false
-                    };
-                    if should_add {
-                        cat.upsert_skill_entry(entry.clone());
-                        println!("  [+] Queued import for '{}'", entry.id);
-                    }
-                }
-            }
-
-            if let Some(cat) = catalog {
-                cat.save_atomically(paths, &paths.skills_catalog_path())?;
-                println!("Saved changes to skills catalog.");
-            }
+    if outcome.rows.is_empty() {
+        match outcome.kind {
+            macc_core::catalog::service::CatalogSearchKind::Skill => println!("No skills found."),
+            macc_core::catalog::service::CatalogSearchKind::Mcp => println!("No MCP servers found."),
         }
-        RemoteSearchKind::Mcp => {
-            let results: Vec<McpEntry> = remote_search(&api, search_kind, &q)?;
-            if results.is_empty() {
-                println!("No MCP servers found.");
-                return Ok(());
+        return Ok(());
+    }
+
+    println!("{:<20} {:<30} {:<10} {:<20}", "ID", "NAME", "KIND", "TAGS");
+    println!("{:-<20} {:-<30} {:-<10} {:-<20}", "", "", "", "");
+    for row in &outcome.rows {
+        println!(
+            "{:<20} {:<30} {:<10} {:<20}",
+            row.id, row.name, row.kind, row.tags
+        );
+        if row.queued {
+            println!("  [+] Queued import for '{}'", row.id);
+        }
+    }
+
+    if outcome.imported > 0 {
+        match outcome.kind {
+            macc_core::catalog::service::CatalogSearchKind::Skill => {
+                println!("Saved changes to skills catalog.")
             }
-
-            println!("{:<20} {:<30} {:<10} {:<20}", "ID", "NAME", "KIND", "TAGS");
-            println!("{:-<20} {:-<30} {:-<10} {:-<20}", "", "", "", "");
-
-            let mut catalog = if should_save {
-                Some(McpCatalog::load(&paths.mcp_catalog_path())?)
-            } else {
-                None
-            };
-
-            for entry in &results {
-                let tags = entry.tags.join(", ");
-                let kind_str = match entry.source.kind {
-                    SourceKind::Git => "git",
-                    SourceKind::Http => "http",
-                    SourceKind::Local => "local",
-                };
-                println!(
-                    "{:<20} {:<30} {:<10} {:<20}",
-                    entry.id, entry.name, kind_str, tags
-                );
-
-                if let Some(cat) = &mut catalog {
-                    let should_add = if add {
-                        true
-                    } else if let Some(wl) = &whitelist {
-                        wl.contains(&entry.id)
-                    } else {
-                        false
-                    };
-                    if should_add {
-                        cat.upsert_mcp_entry(entry.clone());
-                        println!("  [+] Queued import for '{}'", entry.id);
-                    }
-                }
-            }
-
-            if let Some(cat) = catalog {
-                cat.save_atomically(paths, &paths.mcp_catalog_path())?;
-                println!("Saved changes to MCP catalog.");
+            macc_core::catalog::service::CatalogSearchKind::Mcp => {
+                println!("Saved changes to MCP catalog.")
             }
         }
     }
@@ -159,30 +129,16 @@ pub fn list_skills(catalog: &SkillsCatalog) {
 }
 
 pub fn search_skills(catalog: &SkillsCatalog, query: &str) {
-    let query = query.to_lowercase();
-    let filtered: Vec<_> = catalog
-        .entries
-        .iter()
-        .filter(|e| {
-            e.id.to_lowercase().contains(&query)
-                || e.name.to_lowercase().contains(&query)
-                || e.description.to_lowercase().contains(&query)
-                || e.tags.iter().any(|t| t.to_lowercase().contains(&query))
-        })
-        .collect();
+    let filtered = macc_core::catalog::service::filter_skills(catalog, query);
     if filtered.is_empty() {
         println!("No skills matching '{}' found.", query);
         return;
     }
     println!("{:<20} {:<30} {:<10} {:<20}", "ID", "NAME", "KIND", "TAGS");
     println!("{:-<20} {:-<30} {:-<10} {:-<20}", "", "", "", "");
-    for entry in filtered {
+    for entry in &filtered {
         let tags = entry.tags.join(", ");
-        let kind = match entry.source.kind {
-            SourceKind::Git => "git",
-            SourceKind::Http => "http",
-            SourceKind::Local => "local",
-        };
+        let kind = macc_core::catalog::service::source_kind_label(&entry.source.kind);
         println!(
             "{:<20} {:<30} {:<10} {:<20}",
             entry.id, entry.name, kind, tags
@@ -204,26 +160,20 @@ pub fn add_skill(
     reference: String,
     checksum: Option<String>,
 ) -> Result<()> {
-    let tags = tags
-        .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
-        .unwrap_or_default();
-    let source_kind = parse_source_kind(&kind)?;
-    let entry = SkillEntry {
-        id: id.clone(),
-        name,
-        description,
-        tags,
-        selector: Selector { subpath },
-        source: Source {
-            kind: source_kind,
+    let entry = macc_core::catalog::service::build_skill_entry(
+        macc_core::catalog::service::CatalogEntryInput {
+            id: id.clone(),
+            name,
+            description,
+            tags_csv: tags,
+            subpath,
+            kind,
             url,
             reference,
             checksum,
-            subpaths: vec![],
         },
-    };
-    catalog.upsert_skill_entry(entry);
-    catalog.save_atomically(paths, &paths.skills_catalog_path())?;
+    )?;
+    macc_core::catalog::service::upsert_skill(paths, catalog, entry)?;
     println!("Skill '{}' upserted successfully.", id);
     Ok(())
 }
@@ -233,14 +183,7 @@ pub fn remove_skill(
     catalog: &mut SkillsCatalog,
     id: String,
 ) -> Result<()> {
-    if macc_core::is_required_skill(&id) {
-        return Err(MaccError::Validation(format!(
-            "cannot disable required skill '{}'",
-            id
-        )));
-    }
-    if catalog.delete_skill_entry(&id) {
-        catalog.save_atomically(paths, &paths.skills_catalog_path())?;
+    if macc_core::catalog::service::remove_skill(paths, catalog, &id)? {
         println!("Skill '{}' removed successfully.", id);
     } else {
         println!("Skill '{}' not found in catalog.", id);
@@ -270,30 +213,16 @@ pub fn list_mcp(catalog: &McpCatalog) {
 }
 
 pub fn search_mcp(catalog: &McpCatalog, query: &str) {
-    let query = query.to_lowercase();
-    let filtered: Vec<_> = catalog
-        .entries
-        .iter()
-        .filter(|e| {
-            e.id.to_lowercase().contains(&query)
-                || e.name.to_lowercase().contains(&query)
-                || e.description.to_lowercase().contains(&query)
-                || e.tags.iter().any(|t| t.to_lowercase().contains(&query))
-        })
-        .collect();
+    let filtered = macc_core::catalog::service::filter_mcp(catalog, query);
     if filtered.is_empty() {
         println!("No MCP servers matching '{}' found.", query);
         return;
     }
     println!("{:<20} {:<30} {:<10} {:<20}", "ID", "NAME", "KIND", "TAGS");
     println!("{:-<20} {:-<30} {:-<10} {:-<20}", "", "", "", "");
-    for entry in filtered {
+    for entry in &filtered {
         let tags = entry.tags.join(", ");
-        let kind = match entry.source.kind {
-            SourceKind::Git => "git",
-            SourceKind::Http => "http",
-            SourceKind::Local => "local",
-        };
+        let kind = macc_core::catalog::service::source_kind_label(&entry.source.kind);
         println!(
             "{:<20} {:<30} {:<10} {:<20}",
             entry.id, entry.name, kind, tags
@@ -315,33 +244,26 @@ pub fn add_mcp(
     reference: String,
     checksum: Option<String>,
 ) -> Result<()> {
-    let tags = tags
-        .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
-        .unwrap_or_default();
-    let source_kind = parse_source_kind(&kind)?;
-    let entry = McpEntry {
-        id: id.clone(),
-        name,
-        description,
-        tags,
-        selector: Selector { subpath },
-        source: Source {
-            kind: source_kind,
+    let entry = macc_core::catalog::service::build_mcp_entry(
+        macc_core::catalog::service::CatalogEntryInput {
+            id: id.clone(),
+            name,
+            description,
+            tags_csv: tags,
+            subpath,
+            kind,
             url,
             reference,
             checksum,
-            subpaths: vec![],
         },
-    };
-    catalog.upsert_mcp_entry(entry);
-    catalog.save_atomically(paths, &paths.mcp_catalog_path())?;
+    )?;
+    macc_core::catalog::service::upsert_mcp(paths, catalog, entry)?;
     println!("MCP server '{}' upserted successfully.", id);
     Ok(())
 }
 
 pub fn remove_mcp(paths: &macc_core::ProjectPaths, catalog: &mut McpCatalog, id: String) -> Result<()> {
-    if catalog.delete_mcp_entry(&id) {
-        catalog.save_atomically(paths, &paths.mcp_catalog_path())?;
+    if macc_core::catalog::service::remove_mcp(paths, catalog, &id)? {
         println!("MCP server '{}' removed successfully.", id);
     } else {
         println!("MCP server '{}' not found in catalog.", id);
@@ -355,47 +277,11 @@ pub fn install_skill(
     id: &str,
     engine: &SharedEngine,
 ) -> Result<()> {
-    let catalog = load_effective_skills_catalog(paths)?;
-    let entry = catalog
-        .entries
-        .iter()
-        .find(|e| e.id == id)
-        .ok_or_else(|| MaccError::Validation(format!("Skill '{}' not found in catalog.", id)))?;
-
-    let (descriptors, diagnostics) = engine.list_tools(paths);
-    crate::services::project::report_diagnostics(&diagnostics);
-    let tool_title = descriptors
-        .iter()
-        .find(|d| d.id == tool)
-        .map(|d| d.title.as_str())
-        .unwrap_or(tool);
-    println!("Installing skill '{}' for {}...", id, tool_title);
-
-    let mut source = entry.source.clone();
-    if !entry.selector.subpath.is_empty() && entry.selector.subpath != "." {
-        source.subpaths = vec![entry.selector.subpath.clone()];
-    }
-
-    let fetch_unit = FetchUnit {
-        source,
-        selections: vec![Selection {
-            id: entry.id.clone(),
-            subpath: entry.selector.subpath.clone(),
-            kind: SelectionKind::Skill,
-        }],
-    };
-    let materialized = macc_adapter_shared::fetch::materialize_fetch_unit(paths, fetch_unit)?;
-    let mut plan = ActionPlan::new();
-    plan_skill_install(
-        &mut plan,
-        tool,
-        id,
-        &materialized.source_root_path,
-        &entry.selector.subpath,
-    )
-    .map_err(MaccError::Validation)?;
-    let report = engine.apply(paths, &mut plan, false)?;
-    println!("{}", report.render_cli());
+    let backend = CliCatalogInstallBackend { engine };
+    let outcome = engine.install_skill(paths, tool, id, &backend)?;
+    crate::services::project::report_diagnostics(&outcome.diagnostics);
+    println!("Installing skill '{}' for {}...", id, outcome.tool_title);
+    println!("{}", outcome.report.render_cli());
     Ok(())
 }
 
@@ -404,37 +290,10 @@ pub fn install_mcp(
     id: &str,
     engine: &SharedEngine,
 ) -> Result<()> {
-    let catalog = load_effective_mcp_catalog(paths)?;
-    let entry = catalog
-        .entries
-        .iter()
-        .find(|e| e.id == id)
-        .ok_or_else(|| MaccError::Validation(format!("MCP server '{}' not found in catalog.", id)))?;
+    let backend = CliCatalogInstallBackend { engine };
+    let outcome = engine.install_mcp(paths, id, &backend)?;
     println!("Installing MCP server '{}'...", id);
-
-    let mut source = entry.source.clone();
-    if !entry.selector.subpath.is_empty() && entry.selector.subpath != "." {
-        source.subpaths = vec![entry.selector.subpath.clone()];
-    }
-    let fetch_unit = FetchUnit {
-        source,
-        selections: vec![Selection {
-            id: entry.id.clone(),
-            subpath: entry.selector.subpath.clone(),
-            kind: SelectionKind::Mcp,
-        }],
-    };
-    let materialized = macc_adapter_shared::fetch::materialize_fetch_unit(paths, fetch_unit)?;
-    let mut plan = ActionPlan::new();
-    plan_mcp_install(
-        &mut plan,
-        id,
-        &materialized.source_root_path,
-        &entry.selector.subpath,
-    )
-    .map_err(MaccError::Validation)?;
-    let report = engine.apply(paths, &mut plan, false)?;
-    println!("{}", report.render_cli());
+    println!("{}", outcome.report.render_cli());
     Ok(())
 }
 
@@ -517,16 +376,4 @@ pub fn import_url(
         }
     }
     Ok(())
-}
-
-fn parse_source_kind(kind: &str) -> Result<SourceKind> {
-    match kind.to_lowercase().as_str() {
-        "git" => Ok(SourceKind::Git),
-        "http" => Ok(SourceKind::Http),
-        "local" => Ok(SourceKind::Local),
-        _ => Err(MaccError::Validation(format!(
-            "Invalid source kind: {}. Must be 'git', 'http', or 'local'.",
-            kind
-        ))),
-    }
 }
