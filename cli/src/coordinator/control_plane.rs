@@ -99,20 +99,6 @@ pub async fn monitor_active_jobs_native(
     .await
 }
 
-pub async fn monitor_merge_jobs_native(
-    repo_root: &Path,
-    state: &mut CoordinatorRunState,
-    logger: Option<&NativeCoordinatorLogger>,
-) -> Result<Option<(String, String)>> {
-    let adapter = logger.map(LoggerAdapter);
-    core_cp::monitor_merge_jobs_native(
-        repo_root,
-        state,
-        adapter.as_ref().map(|v| v as &dyn core_cp::CoordinatorLog),
-    )
-    .await
-}
-
 pub async fn dispatch_ready_tasks_native(
     repo_root: &Path,
     canonical: &macc_core::config::CanonicalConfig,
