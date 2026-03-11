@@ -1,5 +1,5 @@
-use crate::commands::Command;
 use crate::commands::AppContext;
+use crate::commands::Command;
 use macc_core::Result;
 
 pub struct InitCommand {

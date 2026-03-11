@@ -1,10 +1,10 @@
 use crate::screen::Screen;
 use macc_adapter_shared::fetch::materialize_fetch_units;
 use macc_core::catalog::{Agent, McpEntry, Skill};
+use macc_core::config::{CanonicalConfig, CoordinatorConfig};
 use macc_core::coordinator_storage::{
     CoordinatorSnapshot, CoordinatorStorage, CoordinatorStoragePaths, JsonStorage, SqliteStorage,
 };
-use macc_core::config::{CanonicalConfig, CoordinatorConfig};
 use macc_core::doctor::ToolCheck;
 use macc_core::plan::{render_diff, ActionPlan, DiffView, PlannedOp, Scope};
 use macc_core::resolve::{resolve, resolve_fetch_units, CliOverrides};
@@ -510,11 +510,17 @@ impl AppState {
                         err, json_err
                     )
                 }),
-            Err(err) => Err(format!("failed to load coordinator snapshot from sqlite: {}", err)),
+            Err(err) => Err(format!(
+                "failed to load coordinator snapshot from sqlite: {}",
+                err
+            )),
         }
     }
 
-    fn read_registry_snapshot_from_value(&self, root: &Value) -> Result<CoordinatorTaskSnapshot, String> {
+    fn read_registry_snapshot_from_value(
+        &self,
+        root: &Value,
+    ) -> Result<CoordinatorTaskSnapshot, String> {
         let tasks = root
             .get("tasks")
             .and_then(|v| v.as_array())
@@ -615,9 +621,10 @@ impl AppState {
 
     pub fn refresh_coordinator_snapshot(&mut self) {
         self.refresh_coordinator_pause_state();
-        match self.load_coordinator_storage_snapshot().and_then(|snapshot| {
-            self.read_registry_snapshot_from_value(&snapshot.registry)
-        }) {
+        match self
+            .load_coordinator_storage_snapshot()
+            .and_then(|snapshot| self.read_registry_snapshot_from_value(&snapshot.registry))
+        {
             Ok(snapshot) => {
                 self.coordinator_snapshot = Some(snapshot);
                 self.coordinator_last_refresh = Some(Instant::now());
@@ -714,7 +721,11 @@ impl AppState {
             .iter()
             .filter(|v| Self::event_matches_current_run(v, current_run_id))
             .filter_map(|v| {
-                let ts = v.get("ts").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let ts = v
+                    .get("ts")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let event = v
                     .get("type")
                     .or_else(|| v.get("event"))
@@ -4202,7 +4213,10 @@ mod tests {
     fn test_event_matches_current_run_filters_legacy_events() {
         let with_run = serde_json::json!({"type":"heartbeat","run_id":"run-2"});
         let without_run = serde_json::json!({"type":"heartbeat"});
-        assert!(AppState::event_matches_current_run(&with_run, Some("run-2")));
+        assert!(AppState::event_matches_current_run(
+            &with_run,
+            Some("run-2")
+        ));
         assert!(!AppState::event_matches_current_run(
             &without_run,
             Some("run-2")

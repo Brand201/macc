@@ -134,7 +134,10 @@ impl TaskRegistry {
 
     pub fn to_value(&self) -> Result<Value> {
         serde_json::to_value(self).map_err(|e| {
-            MaccError::Validation(format!("Failed to serialize typed coordinator registry: {}", e))
+            MaccError::Validation(format!(
+                "Failed to serialize typed coordinator registry: {}",
+                e
+            ))
         })
     }
 
@@ -185,7 +188,11 @@ impl TaskRegistry {
             ) {
                 continue;
             }
-            if let Some(path) = task.worktree.as_ref().and_then(|w| w.worktree_path.as_ref()) {
+            if let Some(path) = task
+                .worktree
+                .as_ref()
+                .and_then(|w| w.worktree_path.as_ref())
+            {
                 if !path.is_empty() {
                     out.insert(path.to_string());
                 }
@@ -198,7 +205,11 @@ impl TaskRegistry {
         let mut seen = false;
         let mut all_merged = true;
         for task in &self.tasks {
-            let Some(path) = task.worktree.as_ref().and_then(|w| w.worktree_path.as_ref()) else {
+            let Some(path) = task
+                .worktree
+                .as_ref()
+                .and_then(|w| w.worktree_path.as_ref())
+            else {
                 continue;
             };
             if path != worktree_path {

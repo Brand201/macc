@@ -1,5 +1,5 @@
-use crate::commands::Command;
 use crate::commands::AppContext;
+use crate::commands::Command;
 use macc_core::Result;
 
 pub struct PlanCommand {
@@ -10,12 +10,7 @@ pub struct PlanCommand {
 }
 
 impl PlanCommand {
-    pub fn new(
-        app: AppContext,
-        tools: Option<String>,
-        json: bool,
-        explain: bool,
-    ) -> Self {
+    pub fn new(app: AppContext, tools: Option<String>, json: bool, explain: bool) -> Self {
         Self {
             app,
             tools,
@@ -27,11 +22,6 @@ impl PlanCommand {
 
 impl Command for PlanCommand {
     fn run(&self) -> Result<()> {
-        crate::services::lifecycle::plan(
-            &self.app,
-            self.tools.as_deref(),
-            self.json,
-            self.explain,
-        )
+        crate::services::lifecycle::plan(&self.app, self.tools.as_deref(), self.json, self.explain)
     }
 }

@@ -1,9 +1,9 @@
-use crate::coordinator::runtime::{CoordinatorJob, CoordinatorMergeJob, CoordinatorRunState};
 use crate::coordinator::helpers::{
     append_coordinator_event, append_coordinator_event_with_severity, build_non_task_worker_slug,
     count_pool_worktrees, find_reusable_worktree_native, now_iso_coordinator,
     recompute_resource_locks_from_tasks, set_registry_updated_at, write_worktree_prd_for_task,
 };
+use crate::coordinator::runtime::{CoordinatorJob, CoordinatorMergeJob, CoordinatorRunState};
 use crate::coordinator::types::CoordinatorEnvConfig;
 use crate::coordinator::{engine as coordinator_engine, runtime as coordinator_runtime};
 use crate::{MaccError, Result};
@@ -31,10 +31,7 @@ fn resolve_merge_timeout_seconds() -> usize {
         .unwrap_or(0)
 }
 
-async fn sanitize_worktree_to_base(
-    worktree_path: &Path,
-    base_branch: &str,
-) -> Result<bool> {
+async fn sanitize_worktree_to_base(worktree_path: &Path, base_branch: &str) -> Result<bool> {
     if !crate::git::reset_hard_async(worktree_path, "HEAD").await? {
         return Ok(false);
     }
@@ -506,7 +503,13 @@ pub fn run_phase_for_task_native(
     logger: Option<&dyn CoordinatorLog>,
 ) -> Result<std::result::Result<String, String>> {
     let executor = NativePhaseExecutor { repo_root, logger };
-    coordinator_runtime::run_phase(&executor, task, mode, coordinator_tool_override, max_attempts)
+    coordinator_runtime::run_phase(
+        &executor,
+        task,
+        mode,
+        coordinator_tool_override,
+        max_attempts,
+    )
 }
 
 pub fn run_review_phase_for_task_native(
@@ -664,13 +667,7 @@ pub async fn advance_tasks_native(
                             &base_for_worker,
                             |event_type, task_id, phase, status, message, severity| {
                                 let _ = append_coordinator_event_with_severity(
-                                    &repo,
-                                    event_type,
-                                    task_id,
-                                    phase,
-                                    status,
-                                    message,
-                                    severity,
+                                    &repo, event_type, task_id, phase, status, message, severity,
                                 );
                             },
                         )
@@ -753,14 +750,13 @@ pub async fn monitor_active_jobs_native(
                     &registry,
                 )?;
                 if !completion.should_retry && completion.status_label == "phase_done" {
-                    let sealed =
-                        crate::coordinator::session_manager::seal_worktree_scoped_session(
-                            repo_root,
-                            &job.tool,
-                            &job.worktree_path,
-                            &evt.task_id,
-                            &now_iso_coordinator(),
-                        )?;
+                    let sealed = crate::coordinator::session_manager::seal_worktree_scoped_session(
+                        repo_root,
+                        &job.tool,
+                        &job.worktree_path,
+                        &evt.task_id,
+                        &now_iso_coordinator(),
+                    )?;
                     if sealed.sealed {
                         if let Some(log) = logger {
                             let sid = sealed.session_id.as_deref().unwrap_or("unknown");
@@ -849,11 +845,14 @@ fn consume_heartbeat_events(
         action: "open coordinator events for heartbeat scan".into(),
         source: e,
     })?;
-    let len = file.metadata().map_err(|e| MaccError::Io {
-        path: events_file.to_string_lossy().into(),
-        action: "read coordinator events metadata".into(),
-        source: e,
-    })?.len();
+    let len = file
+        .metadata()
+        .map_err(|e| MaccError::Io {
+            path: events_file.to_string_lossy().into(),
+            action: "read coordinator events metadata".into(),
+            source: e,
+        })?
+        .len();
     if len < state.events_cursor_offset {
         state.events_cursor_offset = 0;
     }
@@ -920,8 +919,7 @@ fn consume_heartbeat_events(
         let is_terminal_success = event_type == "commit_created"
             || (event_type == "phase_result" && event_status == "done" && !payload_attempt);
         if is_terminal_success && !event_task_id.is_empty() && !event_source.is_empty() {
-            terminal_success_sources
-                .insert((event_task_id.to_string(), event_source.to_string()));
+            terminal_success_sources.insert((event_task_id.to_string(), event_source.to_string()));
         }
         let is_failed =
             event_type == "failed" || (event_type == "phase_result" && event_status == "failed");
@@ -964,7 +962,10 @@ fn consume_heartbeat_events(
     let mut registry =
         crate::coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
     let mut updated = 0usize;
-    if let Some(tasks) = registry.get_mut("tasks").and_then(serde_json::Value::as_array_mut) {
+    if let Some(tasks) = registry
+        .get_mut("tasks")
+        .and_then(serde_json::Value::as_array_mut)
+    {
         for task in tasks {
             let id = task
                 .get("id")
@@ -1027,16 +1028,17 @@ fn apply_stale_heartbeat_policy(
 
     let mut registry =
         crate::coordinator::state::coordinator_state_registry_load(repo_root, &BTreeMap::new())?;
-    let Some(tasks) = registry.get_mut("tasks").and_then(serde_json::Value::as_array_mut) else {
+    let Some(tasks) = registry
+        .get_mut("tasks")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
         return Ok(0);
     };
 
     let mut stale_ids = Vec::new();
     for task in tasks.iter_mut() {
         coordinator_engine::ensure_runtime_object(task);
-        let status = task["task_runtime"]["status"]
-            .as_str()
-            .unwrap_or_default();
+        let status = task["task_runtime"]["status"].as_str().unwrap_or_default();
         if status != "running" {
             continue;
         }
@@ -1087,17 +1089,14 @@ fn apply_stale_heartbeat_policy(
 
         match action {
             StaleHeartbeatAction::Block => {
-                task["task_runtime"]["status"] =
-                    serde_json::Value::String("stale".to_string());
+                task["task_runtime"]["status"] = serde_json::Value::String("stale".to_string());
                 task["task_runtime"]["pid"] = serde_json::Value::Null;
-                task["task_runtime"]["last_error"] =
-                    serde_json::Value::String(detail.clone());
+                task["task_runtime"]["last_error"] = serde_json::Value::String(detail.clone());
                 task["state"] = serde_json::Value::String("blocked".to_string());
             }
             StaleHeartbeatAction::Requeue => {
                 crate::coordinator::state::reset_runtime_to_idle(task);
-                task["task_runtime"]["last_error"] =
-                    serde_json::Value::String(detail.clone());
+                task["task_runtime"]["last_error"] = serde_json::Value::String(detail.clone());
                 task["state"] = serde_json::Value::String("todo".to_string());
                 task["assignee"] = serde_json::Value::Null;
                 task["claimed_at"] = serde_json::Value::Null;
@@ -1106,8 +1105,7 @@ fn apply_stale_heartbeat_policy(
             StaleHeartbeatAction::Retry => {
                 increment_runtime_retries(task);
                 crate::coordinator::state::reset_runtime_to_idle(task);
-                task["task_runtime"]["last_error"] =
-                    serde_json::Value::String(detail.clone());
+                task["task_runtime"]["last_error"] = serde_json::Value::String(detail.clone());
                 task["state"] = serde_json::Value::String("todo".to_string());
                 task["assignee"] = serde_json::Value::Null;
                 task["claimed_at"] = serde_json::Value::Null;
@@ -1282,12 +1280,9 @@ pub async fn monitor_merge_jobs_native(
                         // Post-merge order is strict:
                         // 1) switch worktree to base (release task branch)
                         // 2) cleanup merged task branch
-                        let _ = switch_worktree_to_base_after_merge(
-                            repo_root,
-                            &task_snapshot,
-                            logger,
-                        )
-                        .await;
+                        let _ =
+                            switch_worktree_to_base_after_merge(repo_root, &task_snapshot, logger)
+                                .await;
                         let branch = task_snapshot
                             .get("worktree")
                             .and_then(|w| w.get("branch"))
@@ -1316,12 +1311,7 @@ pub async fn monitor_merge_jobs_native(
                                 ),
                                 |event_type, task_id, phase, status, message, severity| {
                                     let _ = append_coordinator_event_with_severity(
-                                        repo_root,
-                                        event_type,
-                                        task_id,
-                                        phase,
-                                        status,
-                                        message,
+                                        repo_root, event_type, task_id, phase, status, message,
                                         severity,
                                     );
                                 },
@@ -1505,10 +1495,7 @@ pub async fn dispatch_ready_tasks_native(
             break;
         }
         if let Some(log) = logger {
-            let _ = log.note(format!(
-                "- Lifecycle task={} stage=claim",
-                selected.id
-            ));
+            let _ = log.note(format!("- Lifecycle task={} stage=claim", selected.id));
         }
         if let Some(log) = logger {
             let _ = log.note(format!(
@@ -1738,8 +1725,7 @@ pub async fn dispatch_ready_tasks_native(
                         task["task_runtime"]["last_error"] =
                             serde_json::Value::String(detail.to_string());
                         task["updated_at"] = serde_json::Value::String(now_iso_coordinator());
-                        task["state_changed_at"] =
-                            serde_json::Value::String(now_iso_coordinator());
+                        task["state_changed_at"] = serde_json::Value::String(now_iso_coordinator());
                         break;
                     }
                 }
@@ -1754,10 +1740,7 @@ pub async fn dispatch_ready_tasks_native(
         };
 
         if let Some(log) = logger {
-            let _ = log.note(format!(
-                "- Lifecycle task={} stage=setup",
-                selected.id
-            ));
+            let _ = log.note(format!("- Lifecycle task={} stage=setup", selected.id));
         }
         if let Err(err) = write_worktree_prd_for_task(prd_file, &selected.id, &worktree_path) {
             let msg = format!(
@@ -1795,7 +1778,9 @@ pub async fn dispatch_ready_tasks_native(
         }
         let tool_json_path = worktree_path.join(".macc").join("tool.json");
         if !tool_json_path.exists() {
-            if let Err(err) = crate::worktree::write_tool_json(repo_root, &worktree_path, &selected.tool) {
+            if let Err(err) =
+                crate::worktree::write_tool_json(repo_root, &worktree_path, &selected.tool)
+            {
                 let msg = format!(
                     "dispatch failed for task {}: ensure tool.json failed ({})",
                     selected.id, err
@@ -1930,8 +1915,12 @@ pub async fn dispatch_ready_tasks_native(
         if !apply_output.status.success() {
             let detail = format!(
                 "stdout=\"{}\" stderr=\"{}\"",
-                coordinator_runtime::summarize_output(&String::from_utf8_lossy(&apply_output.stdout)),
-                coordinator_runtime::summarize_output(&String::from_utf8_lossy(&apply_output.stderr))
+                coordinator_runtime::summarize_output(&String::from_utf8_lossy(
+                    &apply_output.stdout
+                )),
+                coordinator_runtime::summarize_output(&String::from_utf8_lossy(
+                    &apply_output.stderr
+                ))
             );
             let msg = format!(
                 "dispatch failed for task {}: worktree apply failed status={} {}",
@@ -2057,10 +2046,7 @@ pub async fn dispatch_ready_tasks_native(
             },
         );
         if let Some(log) = logger {
-            let _ = log.note(format!(
-                "- Lifecycle task={} stage=run",
-                selected.id
-            ));
+            let _ = log.note(format!("- Lifecycle task={} stage=run", selected.id));
             let _ = log.note(format!(
                 "- Task dispatched task={} pid={}",
                 selected.id,

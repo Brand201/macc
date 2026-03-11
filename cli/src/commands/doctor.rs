@@ -1,5 +1,5 @@
-use crate::commands::Command;
 use crate::commands::AppContext;
+use crate::commands::Command;
 use macc_core::Result;
 
 pub struct DoctorCommand {
@@ -16,6 +16,10 @@ impl DoctorCommand {
 impl Command for DoctorCommand {
     fn run(&self) -> Result<()> {
         let paths = self.app.project_paths()?;
-        crate::services::project::run_doctor(&paths, &self.app.engine, self.fix)
+        self.app.engine.project_run_doctor(
+            &paths,
+            self.fix,
+            &crate::services::interaction::CliInteraction,
+        )
     }
 }

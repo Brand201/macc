@@ -1,5 +1,5 @@
-use crate::commands::Command;
 use crate::commands::AppContext;
+use crate::commands::Command;
 use crate::LogsCommands;
 use macc_core::Result;
 pub struct LogsCommand<'a> {
@@ -30,6 +30,7 @@ impl<'a> Command for LogsCommand<'a> {
                     let _ = crate::coordinator::logs::aggregate_performer_logs(&paths.root);
                 }
                 let file = crate::services::logs::select_log_file(
+                    &self.app.engine,
                     &paths,
                     component.as_str(),
                     worktree.as_deref(),
@@ -37,9 +38,9 @@ impl<'a> Command for LogsCommand<'a> {
                 )?;
                 println!("Log file: {}", file.display());
                 if *follow {
-                    crate::services::logs::tail_file_follow(&file, *lines)?;
+                    crate::services::logs::tail_file_follow(&self.app.engine, &file, *lines)?;
                 } else {
-                    crate::services::logs::print_file_tail(&file, *lines)?;
+                    crate::services::logs::print_file_tail(&self.app.engine, &file, *lines)?;
                 }
                 Ok(())
             }

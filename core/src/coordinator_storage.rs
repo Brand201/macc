@@ -1,5 +1,5 @@
-use crate::{MaccError, ProjectPaths, Result};
 use crate::coordinator::model::{ResourceLock, Task, TaskRegistry};
+use crate::{MaccError, ProjectPaths, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -329,7 +329,10 @@ impl SqliteStorage {
                 .and_then(|v| v.as_str())
                 .map(|v| v.to_string()),
             seq: event.get("seq").and_then(|v| v.as_i64()),
-            ts: event.get("ts").and_then(|v| v.as_str()).map(|v| v.to_string()),
+            ts: event
+                .get("ts")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
             source: event
                 .get("source")
                 .and_then(|v| v.as_str())
@@ -1040,7 +1043,9 @@ impl SqliteStorage {
             }
         }
         registry.updated_at = Some(now_iso_string());
-        registry.extra.insert("schema_version".into(), Value::from(1));
+        registry
+            .extra
+            .insert("schema_version".into(), Value::from(1));
         registry
             .extra
             .entry("processed_event_ids".into())
@@ -1363,7 +1368,9 @@ pub fn sync_coordinator_storage(
     // Backward-compatible entry point. New code should call explicit transfer APIs.
     match (mode, phase) {
         (CoordinatorStorageMode::Json, _) => Ok(()),
-        (CoordinatorStorageMode::DualWrite, _) => coordinator_storage_import_json_to_sqlite(project_paths),
+        (CoordinatorStorageMode::DualWrite, _) => {
+            coordinator_storage_import_json_to_sqlite(project_paths)
+        }
         (CoordinatorStorageMode::Sqlite, CoordinatorStoragePhase::Pre) => {
             let imported = coordinator_storage_bootstrap_sqlite_from_json(project_paths)?;
             if !imported {
@@ -1377,7 +1384,9 @@ pub fn sync_coordinator_storage(
     }
 }
 
-pub fn coordinator_storage_bootstrap_sqlite_from_json(project_paths: &ProjectPaths) -> Result<bool> {
+pub fn coordinator_storage_bootstrap_sqlite_from_json(
+    project_paths: &ProjectPaths,
+) -> Result<bool> {
     let paths = CoordinatorStoragePaths::from_project_paths(project_paths);
     let json_store = JsonStorage::new(paths.clone());
     let sqlite_store = SqliteStorage::new(paths);

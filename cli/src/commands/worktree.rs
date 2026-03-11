@@ -1,7 +1,102 @@
-use crate::commands::Command;
 use crate::commands::AppContext;
+use crate::commands::Command;
 use crate::WorktreeCommands;
 use macc_core::Result;
+
+struct CliFetchMaterializer;
+
+impl macc_core::service::worktree::WorktreeFetchMaterializer for CliFetchMaterializer {
+    fn materialize_fetch_units(
+        &self,
+        paths: &macc_core::ProjectPaths,
+        units: Vec<macc_core::resolve::FetchUnit>,
+    ) -> Result<Vec<macc_core::resolve::MaterializedFetchUnit>> {
+        macc_adapter_shared::fetch::materialize_fetch_units(paths, units)
+    }
+}
+
+pub(crate) fn open_in_editor(path: &std::path::Path, command: &str) -> Result<()> {
+    let mut parts = command.split_whitespace();
+    let Some(bin) = parts.next() else {
+        return Ok(());
+    };
+    let mut cmd = std::process::Command::new(bin);
+    for arg in parts {
+        cmd.arg(arg);
+    }
+    let status = cmd
+        .arg(path)
+        .status()
+        .map_err(|e| macc_core::MaccError::Io {
+            path: path.to_string_lossy().into(),
+            action: "launch editor".into(),
+            source: e,
+        })?;
+    if !status.success() {
+        return Err(macc_core::MaccError::Validation(format!(
+            "Editor command failed with status: {}",
+            status
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn open_in_terminal(path: &std::path::Path) -> Result<()> {
+    if let Ok(term) = std::env::var("TERMINAL") {
+        launch_terminal(&term, path)?;
+        return Ok(());
+    }
+
+    let candidates = [
+        ("x-terminal-emulator", &["-e", "bash", "-lc"][..]),
+        ("gnome-terminal", &["--", "bash", "-lc"][..]),
+        ("konsole", &["-e", "bash", "-lc"][..]),
+        ("xterm", &["-e", "bash", "-lc"][..]),
+    ];
+    for (bin, prefix) in candidates {
+        if launch_terminal_with_prefix(bin, prefix, path).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(macc_core::MaccError::Validation(
+        "No terminal launcher found (set $TERMINAL)".into(),
+    ))
+}
+
+fn launch_terminal(command: &str, path: &std::path::Path) -> Result<()> {
+    let mut parts = command.split_whitespace();
+    let Some(bin) = parts.next() else {
+        return Ok(());
+    };
+    let mut cmd = std::process::Command::new(bin);
+    for arg in parts {
+        cmd.arg(arg);
+    }
+    cmd.arg("--");
+    cmd.arg("bash");
+    cmd.arg("-lc");
+    cmd.arg(format!("cd {}; exec $SHELL", path.display()));
+    cmd.spawn().map_err(|e| macc_core::MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "launch terminal".into(),
+        source: e,
+    })?;
+    Ok(())
+}
+
+fn launch_terminal_with_prefix(bin: &str, prefix: &[&str], path: &std::path::Path) -> Result<()> {
+    let mut cmd = std::process::Command::new(bin);
+    for arg in prefix {
+        cmd.arg(arg);
+    }
+    cmd.arg(format!("cd {}; exec $SHELL", path.display()));
+    cmd.spawn().map_err(|e| macc_core::MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "launch terminal".into(),
+        source: e,
+    })?;
+    Ok(())
+}
 
 pub struct WorktreeCommand<'a> {
     app: AppContext,
@@ -42,7 +137,10 @@ impl<'a> Command for WorktreeCommand<'a> {
                 let created = macc_core::create_worktrees(&paths.root, &spec)?;
 
                 let (descriptors, diagnostics) = self.app.engine.list_tools(&paths);
-                crate::services::project::report_diagnostics(&diagnostics);
+                macc_core::service::project::report_diagnostics(
+                    &diagnostics,
+                    &crate::services::interaction::CliInteraction,
+                );
                 let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
                 let overrides = macc_core::resolve::CliOverrides::from_tools_csv(
                     tool.as_str(),
@@ -64,7 +162,7 @@ impl<'a> Command for WorktreeCommand<'a> {
                         &worktree_paths.config_path,
                         yaml.as_bytes(),
                     )?;
-                    crate::services::worktree::write_tool_json(&paths.root, &entry.path, tool)?;
+                    macc_core::service::worktree::write_tool_json(&paths.root, &entry.path, tool)?;
 
                     if !*skip_apply {
                         let resolved = macc_core::resolve::resolve(&canonical, &overrides);
@@ -81,9 +179,10 @@ impl<'a> Command for WorktreeCommand<'a> {
                             &materialized_units,
                             &overrides,
                         )?;
-                        let _ = self
-                            .app.engine
-                            .apply(&worktree_paths, &mut plan, *allow_user_scope)?;
+                        let _ =
+                            self.app
+                                .engine
+                                .apply(&worktree_paths, &mut plan, *allow_user_scope)?;
                     }
                 }
 
@@ -131,7 +230,9 @@ impl<'a> Command for WorktreeCommand<'a> {
                 let project_paths = macc_core::find_project_root(&self.app.cwd)
                     .map(|root| macc_core::ProjectPaths::from_root(&root.root))
                     .ok();
-                let session_map = crate::services::worktree::load_worktree_session_labels(project_paths.as_ref())?;
+                let session_map = macc_core::service::worktree::load_worktree_session_labels(
+                    project_paths.as_ref(),
+                )?;
 
                 println!(
                     "{:<54} {:<12} {:<24} {:<8} {:<10} {:<16} {:<8} {:<8}",
@@ -142,7 +243,9 @@ impl<'a> Command for WorktreeCommand<'a> {
                     "", "", "", "", "", "", "", ""
                 );
                 for entry in entries {
-                    let metadata = macc_core::read_worktree_metadata(&entry.path).ok().flatten();
+                    let metadata = macc_core::read_worktree_metadata(&entry.path)
+                        .ok()
+                        .flatten();
                     let tool = metadata
                         .as_ref()
                         .map(|m| m.tool.as_str())
@@ -157,25 +260,33 @@ impl<'a> Command for WorktreeCommand<'a> {
                     let scope = metadata
                         .as_ref()
                         .and_then(|m| m.scope.as_ref())
-                        .map(|s| crate::services::worktree::truncate_cell(s, 8))
+                        .map(|s| macc_core::service::worktree::truncate_cell(s, 8))
                         .unwrap_or_else(|| "-".into());
-                    let git_state = if crate::services::worktree::git_worktree_is_dirty(&entry.path).unwrap_or(false) {
-                        "dirty"
-                    } else {
-                        "clean"
-                    };
+                    let git_state =
+                        if macc_core::service::worktree::git_worktree_is_dirty(&entry.path)
+                            .unwrap_or(false)
+                        {
+                            "dirty"
+                        } else {
+                            "clean"
+                        };
                     let session = session_map
-                        .get(&crate::services::worktree::canonicalize_path_fallback(&entry.path))
+                        .get(&macc_core::service::worktree::canonicalize_path_fallback(
+                            &entry.path,
+                        ))
                         .cloned()
                         .unwrap_or_else(|| "-".into());
                     println!(
                         "{:<54} {:<12} {:<24} {:<8} {:<10} {:<16} {:<8} {:<8}",
-                        crate::services::worktree::truncate_cell(&entry.path.display().to_string(), 54),
-                        crate::services::worktree::truncate_cell(&tool, 12),
-                        crate::services::worktree::truncate_cell(&branch, 24),
+                        macc_core::service::worktree::truncate_cell(
+                            &entry.path.display().to_string(),
+                            54
+                        ),
+                        macc_core::service::worktree::truncate_cell(&tool, 12),
+                        macc_core::service::worktree::truncate_cell(&branch, 24),
                         scope,
                         git_state,
-                        crate::services::worktree::truncate_cell(&session, 16),
+                        macc_core::service::worktree::truncate_cell(&session, 16),
                         if entry.locked { "yes" } else { "no" },
                         if entry.prunable { "yes" } else { "no" }
                     );
@@ -188,7 +299,8 @@ impl<'a> Command for WorktreeCommand<'a> {
                 terminal,
             } => {
                 let paths = self.app.project_paths()?;
-                let worktree_path = crate::services::worktree::resolve_worktree_path(&paths.root, id)?;
+                let worktree_path =
+                    macc_core::service::worktree::resolve_worktree_path(&paths.root, id)?;
                 if !worktree_path.exists() {
                     return Err(macc_core::MaccError::Validation(format!(
                         "Worktree path does not exist: {}",
@@ -197,12 +309,12 @@ impl<'a> Command for WorktreeCommand<'a> {
                 }
 
                 if *terminal {
-                    crate::services::worktree::open_in_terminal(&worktree_path)?;
+                    open_in_terminal(&worktree_path)?;
                 }
                 if let Some(cmd) = editor {
-                    crate::services::worktree::open_in_editor(&worktree_path, cmd)?;
+                    open_in_editor(&worktree_path, cmd)?;
                 } else {
-                    crate::services::worktree::open_in_editor(&worktree_path, "code")?;
+                    open_in_editor(&worktree_path, "code")?;
                 }
 
                 println!("Opened worktree: {}", worktree_path.display());
@@ -222,7 +334,12 @@ impl<'a> Command for WorktreeCommand<'a> {
                         if entry.path == root {
                             continue;
                         }
-                        crate::services::worktree::apply_worktree(&self.app.engine, &paths.root, &entry.path, *allow_user_scope)?;
+                        self.app.engine.worktree_apply(
+                            &CliFetchMaterializer,
+                            &paths.root,
+                            &entry.path,
+                            *allow_user_scope,
+                        )?;
                         applied += 1;
                     }
                     println!("Applied {} worktree(s).", applied);
@@ -230,18 +347,23 @@ impl<'a> Command for WorktreeCommand<'a> {
                 }
 
                 let id = id.as_ref().ok_or_else(|| {
-                    macc_core::MaccError::Validation(
-                        "worktree apply requires <ID> or --all".into(),
-                    )
+                    macc_core::MaccError::Validation("worktree apply requires <ID> or --all".into())
                 })?;
-                let worktree_path = crate::services::worktree::resolve_worktree_path(&paths.root, id)?;
-                crate::services::worktree::apply_worktree(&self.app.engine, &paths.root, &worktree_path, *allow_user_scope)?;
+                let worktree_path =
+                    macc_core::service::worktree::resolve_worktree_path(&paths.root, id)?;
+                self.app.engine.worktree_apply(
+                    &CliFetchMaterializer,
+                    &paths.root,
+                    &worktree_path,
+                    *allow_user_scope,
+                )?;
                 println!("Applied worktree: {}", worktree_path.display());
                 Ok(())
             }
             WorktreeCommands::Doctor { id } => {
                 let paths = self.app.project_paths()?;
-                let worktree_path = crate::services::worktree::resolve_worktree_path(&paths.root, id)?;
+                let worktree_path =
+                    macc_core::service::worktree::resolve_worktree_path(&paths.root, id)?;
                 if !worktree_path.exists() {
                     return Err(macc_core::MaccError::Validation(format!(
                         "Worktree path does not exist: {}",
@@ -250,12 +372,13 @@ impl<'a> Command for WorktreeCommand<'a> {
                 }
                 let worktree_paths = macc_core::ProjectPaths::from_root(&worktree_path);
                 let checks = self.app.engine.doctor(&worktree_paths);
-                crate::services::tooling::print_checks(&checks);
+                crate::print_checks(&checks);
                 Ok(())
             }
             WorktreeCommands::Run { id } => {
                 let paths = self.app.project_paths()?;
-                let worktree_path = crate::services::worktree::resolve_worktree_path(&paths.root, id)?;
+                let worktree_path =
+                    macc_core::service::worktree::resolve_worktree_path(&paths.root, id)?;
                 if !worktree_path.exists() {
                     return Err(macc_core::MaccError::Validation(format!(
                         "Worktree path does not exist: {}",
@@ -263,13 +386,25 @@ impl<'a> Command for WorktreeCommand<'a> {
                     )));
                 }
 
-                let metadata = macc_core::read_worktree_metadata(&worktree_path)?
-                    .ok_or_else(|| macc_core::MaccError::Validation("Missing .macc/worktree.json".into()))?;
-                crate::services::worktree::ensure_tool_json(&paths.root, &worktree_path, &metadata.tool)?;
+                let metadata =
+                    macc_core::read_worktree_metadata(&worktree_path)?.ok_or_else(|| {
+                        macc_core::MaccError::Validation("Missing .macc/worktree.json".into())
+                    })?;
+                macc_core::service::worktree::ensure_tool_json(
+                    &paths.root,
+                    &worktree_path,
+                    &metadata.tool,
+                )?;
                 let (task_id, prd_path) =
-                    crate::services::worktree::resolve_worktree_task_context(&paths.root, &worktree_path, &metadata.id)?;
-                let performer_path = crate::services::worktree::ensure_performer(&worktree_path)?;
-                let registry_path = crate::services::worktree::coordinator_task_registry_path(&paths.root);
+                    macc_core::service::worktree::resolve_worktree_task_context(
+                        &paths.root,
+                        &worktree_path,
+                        &metadata.id,
+                    )?;
+                let performer_path =
+                    macc_core::service::worktree::ensure_performer(&worktree_path)?;
+                let registry_path =
+                    macc_core::service::worktree::coordinator_task_registry_path(&paths.root);
                 let events_file = paths
                     .root
                     .join(".macc")
@@ -286,8 +421,14 @@ impl<'a> Command for WorktreeCommand<'a> {
 
                 let status = std::process::Command::new(&performer_path)
                     .current_dir(&worktree_path)
-                    .env("COORD_EVENTS_FILE", events_file.to_string_lossy().to_string())
-                    .env("COORDINATOR_RUN_ID", crate::services::project::ensure_coordinator_run_id())
+                    .env(
+                        "COORD_EVENTS_FILE",
+                        events_file.to_string_lossy().to_string(),
+                    )
+                    .env(
+                        "COORDINATOR_RUN_ID",
+                        self.app.engine.project_ensure_coordinator_run_id(),
+                    )
                     .env(
                         "MACC_EVENT_SOURCE",
                         format!(
@@ -325,7 +466,8 @@ impl<'a> Command for WorktreeCommand<'a> {
             }
             WorktreeCommands::Exec { id, cmd } => {
                 let paths = self.app.project_paths()?;
-                let worktree_path = crate::services::worktree::resolve_worktree_path(&paths.root, id)?;
+                let worktree_path =
+                    macc_core::service::worktree::resolve_worktree_path(&paths.root, id)?;
                 if !worktree_path.exists() {
                     return Err(macc_core::MaccError::Validation(format!(
                         "Worktree path does not exist: {}",
@@ -342,14 +484,13 @@ impl<'a> Command for WorktreeCommand<'a> {
                 if cmd.len() > 1 {
                     command.args(&cmd[1..]);
                 }
-                let status = command
-                    .current_dir(&worktree_path)
-                    .status()
-                    .map_err(|e| macc_core::MaccError::Io {
+                let status = command.current_dir(&worktree_path).status().map_err(|e| {
+                    macc_core::MaccError::Io {
                         path: worktree_path.to_string_lossy().into(),
                         action: "run worktree exec".into(),
                         source: e,
-                    })?;
+                    }
+                })?;
                 if !status.success() {
                     return Err(macc_core::MaccError::Validation(format!(
                         "Command failed with status: {}",
@@ -376,7 +517,11 @@ impl<'a> Command for WorktreeCommand<'a> {
                         let branch = entry.branch.clone();
                         macc_core::remove_worktree(&paths.root, &entry.path, *force)?;
                         if *remove_branch {
-                            crate::services::worktree::delete_branch(&paths.root, branch.as_deref(), *force)?;
+                            macc_core::service::worktree::delete_branch(
+                                &paths.root,
+                                branch.as_deref(),
+                                *force,
+                            )?;
                         }
                         println!("Removed worktree: {}", entry.path.display());
                         removed += 1;
@@ -405,7 +550,11 @@ impl<'a> Command for WorktreeCommand<'a> {
                     .and_then(|entry| entry.branch.clone());
                 macc_core::remove_worktree(&paths.root, &worktree_path, *force)?;
                 if *remove_branch {
-                    crate::services::worktree::delete_branch(&paths.root, branch.as_deref(), *force)?;
+                    macc_core::service::worktree::delete_branch(
+                        &paths.root,
+                        branch.as_deref(),
+                        *force,
+                    )?;
                 }
                 println!("Removed worktree: {}", worktree_path.display());
                 Ok(())

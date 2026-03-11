@@ -1,15 +1,20 @@
+use crate::coordinator_storage::{
+    CoordinatorSnapshot, CoordinatorStorage, CoordinatorStoragePaths, JsonStorage, SqliteStorage,
+};
 use crate::{
     catalog::{self, Agent, Skill},
-    coordinator,
     config::CanonicalConfig,
+    coordinator,
     doctor::{self, ToolCheck},
     plan::{self, ActionPlan, PlannedOp},
     resolve::{self, CliOverrides, MaterializedFetchUnit},
     tool::{ToolDescriptor, ToolDiagnostic, ToolRegistry, ToolSpecLoader},
     ApplyReport, ProjectPaths, Result, WorktreeCreateResult, WorktreeCreateSpec, WorktreeEntry,
 };
-use crate::coordinator_storage::{CoordinatorSnapshot, CoordinatorStorage, CoordinatorStoragePaths, JsonStorage, SqliteStorage};
+use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 /// The interface for UI (CLI/TUI) to interact with MACC core logic.
 pub trait Engine {
@@ -83,6 +88,304 @@ pub trait Engine {
         crate::catalog::service::install_mcp(paths, id, backend)
     }
 
+    fn tooling_install_tool(
+        &self,
+        paths: &ProjectPaths,
+        tool_id: &str,
+        assume_yes: bool,
+        reporter: &dyn crate::service::tooling::UserReporter,
+    ) -> Result<crate::service::tooling::InstallToolOutcome> {
+        crate::service::tooling::install_tool(paths, tool_id, assume_yes, reporter)
+    }
+
+    fn tooling_update_tools(
+        &self,
+        paths: &ProjectPaths,
+        options: crate::service::tooling::ToolUpdateCommandOptions<'_>,
+        reporter: &dyn crate::service::tooling::UserReporter,
+    ) -> Result<crate::service::tooling::ToolUpdateSummary> {
+        crate::service::tooling::update_tools(paths, options, reporter)
+    }
+
+    fn tooling_show_outdated(
+        &self,
+        paths: &ProjectPaths,
+        only: Option<&str>,
+        reporter: &dyn crate::service::tooling::UserReporter,
+    ) -> Result<crate::service::tooling::OutdatedToolsReport> {
+        crate::service::tooling::show_outdated_tools(paths, only, reporter)
+    }
+
+    fn project_ensure_initialized_paths(&self, start_dir: &Path) -> Result<ProjectPaths> {
+        crate::service::project::ensure_initialized_paths(start_dir)
+    }
+
+    fn project_run_doctor(
+        &self,
+        paths: &ProjectPaths,
+        fix: bool,
+        interaction: &dyn crate::service::interaction::InteractionHandler,
+    ) -> Result<()> {
+        crate::service::project::run_doctor(paths, self, fix, interaction)
+    }
+
+    fn project_ensure_coordinator_run_id(&self) -> String {
+        crate::service::project::ensure_coordinator_run_id()
+    }
+
+    fn worktree_apply(
+        &self,
+        fetch_materializer: &dyn crate::service::worktree::WorktreeFetchMaterializer,
+        repo_root: &Path,
+        worktree_root: &Path,
+        allow_user_scope: bool,
+    ) -> Result<()> {
+        crate::service::worktree::apply_worktree(
+            self,
+            fetch_materializer,
+            repo_root,
+            worktree_root,
+            allow_user_scope,
+        )
+    }
+
+    fn catalog_run_remote_search(
+        &self,
+        paths: &ProjectPaths,
+        provider: &dyn crate::catalog::service::CatalogRemoteSearchProvider,
+        api: &str,
+        kind: &str,
+        query: &str,
+        add: bool,
+        add_ids: Option<&str>,
+        ui: &dyn crate::service::catalog::CatalogUi,
+    ) -> Result<()> {
+        crate::service::catalog::run_remote_search(
+            self, paths, provider, api, kind, query, add, add_ids, ui,
+        )
+    }
+
+    fn catalog_list_skills(
+        &self,
+        catalog: &crate::catalog::SkillsCatalog,
+        ui: &dyn crate::service::catalog::CatalogUi,
+    ) {
+        crate::service::catalog::list_skills(catalog, ui)
+    }
+
+    fn catalog_search_skills(
+        &self,
+        catalog: &crate::catalog::SkillsCatalog,
+        query: &str,
+        ui: &dyn crate::service::catalog::CatalogUi,
+    ) {
+        crate::service::catalog::search_skills(catalog, query, ui)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn catalog_add_skill(
+        &self,
+        paths: &ProjectPaths,
+        catalog: &mut crate::catalog::SkillsCatalog,
+        id: String,
+        name: String,
+        description: String,
+        tags: Option<String>,
+        subpath: String,
+        kind: String,
+        url: String,
+        reference: String,
+        checksum: Option<String>,
+        ui: &dyn crate::service::catalog::CatalogUi,
+    ) -> Result<()> {
+        crate::service::catalog::add_skill(
+            paths,
+            catalog,
+            id,
+            name,
+            description,
+            tags,
+            subpath,
+            kind,
+            url,
+            reference,
+            checksum,
+            ui,
+        )
+    }
+
+    fn catalog_remove_skill(
+        &self,
+        paths: &ProjectPaths,
+        catalog: &mut crate::catalog::SkillsCatalog,
+        id: String,
+        ui: &dyn crate::service::catalog::CatalogUi,
+    ) -> Result<()> {
+        crate::service::catalog::remove_skill(paths, catalog, id, ui)
+    }
+
+    fn catalog_list_mcp(
+        &self,
+        catalog: &crate::catalog::McpCatalog,
+        ui: &dyn crate::service::catalog::CatalogUi,
+    ) {
+        crate::service::catalog::list_mcp(catalog, ui)
+    }
+
+    fn catalog_search_mcp(
+        &self,
+        catalog: &crate::catalog::McpCatalog,
+        query: &str,
+        ui: &dyn crate::service::catalog::CatalogUi,
+    ) {
+        crate::service::catalog::search_mcp(catalog, query, ui)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn catalog_add_mcp(
+        &self,
+        paths: &ProjectPaths,
+        catalog: &mut crate::catalog::McpCatalog,
+        id: String,
+        name: String,
+        description: String,
+        tags: Option<String>,
+        subpath: String,
+        kind: String,
+        url: String,
+        reference: String,
+        checksum: Option<String>,
+        ui: &dyn crate::service::catalog::CatalogUi,
+    ) -> Result<()> {
+        crate::service::catalog::add_mcp(
+            paths,
+            catalog,
+            id,
+            name,
+            description,
+            tags,
+            subpath,
+            kind,
+            url,
+            reference,
+            checksum,
+            ui,
+        )
+    }
+
+    fn catalog_remove_mcp(
+        &self,
+        paths: &ProjectPaths,
+        catalog: &mut crate::catalog::McpCatalog,
+        id: String,
+        ui: &dyn crate::service::catalog::CatalogUi,
+    ) -> Result<()> {
+        crate::service::catalog::remove_mcp(paths, catalog, id, ui)
+    }
+
+    fn catalog_install_skill(
+        &self,
+        paths: &ProjectPaths,
+        tool: &str,
+        id: &str,
+        backend: &dyn crate::catalog::service::CatalogInstallBackend,
+        ui: &dyn crate::service::catalog::CatalogUi,
+    ) -> Result<()> {
+        crate::service::catalog::install_skill(paths, tool, id, self, backend, ui)
+    }
+
+    fn catalog_install_mcp(
+        &self,
+        paths: &ProjectPaths,
+        id: &str,
+        backend: &dyn crate::catalog::service::CatalogInstallBackend,
+        ui: &dyn crate::service::catalog::CatalogUi,
+    ) -> Result<()> {
+        crate::service::catalog::install_mcp(paths, id, self, backend, ui)
+    }
+
+    fn catalog_import_url(
+        &self,
+        paths: &ProjectPaths,
+        kind: &str,
+        id: String,
+        url: String,
+        name: Option<String>,
+        description: String,
+        tags: Option<String>,
+        parser: &dyn crate::service::catalog::CatalogUrlParser,
+        ui: &dyn crate::service::catalog::CatalogUi,
+    ) -> Result<()> {
+        crate::service::catalog::import_url(
+            paths,
+            kind,
+            id,
+            url,
+            name,
+            description,
+            tags,
+            parser,
+            ui,
+        )
+    }
+
+    fn backups_list(
+        &self,
+        paths: &ProjectPaths,
+        user: bool,
+        ui: &dyn crate::service::backups::BackupsUi,
+    ) -> Result<()> {
+        crate::service::backups::list(paths, user, ui)
+    }
+
+    fn backups_open(
+        &self,
+        paths: &ProjectPaths,
+        id: Option<&str>,
+        latest: bool,
+        user: bool,
+        editor: &Option<String>,
+        ui: &dyn crate::service::backups::BackupsUi,
+    ) -> Result<()> {
+        crate::service::backups::open(paths, id, latest, user, editor, ui)
+    }
+
+    fn backups_restore(
+        &self,
+        paths: &ProjectPaths,
+        user: bool,
+        id: Option<&str>,
+        latest: bool,
+        dry_run: bool,
+        yes: bool,
+        ui: &dyn crate::service::backups::BackupsUi,
+    ) -> Result<()> {
+        crate::service::backups::restore(paths, user, id, latest, dry_run, yes, ui)
+    }
+
+    fn logs_select_file(
+        &self,
+        paths: &ProjectPaths,
+        component: &str,
+        worktree_filter: Option<&str>,
+        task_filter: Option<&str>,
+    ) -> Result<std::path::PathBuf> {
+        crate::service::logs::select_log_file(paths, component, worktree_filter, task_filter)
+    }
+
+    fn logs_print_tail(
+        &self,
+        path: &Path,
+        lines: usize,
+        ui: &dyn crate::service::logs::LogsUi,
+    ) -> Result<()> {
+        crate::service::logs::print_file_tail(path, lines, ui)
+    }
+
+    fn logs_tail_follow(&self, path: &Path, lines: usize) -> Result<()> {
+        crate::service::logs::tail_file_follow(path, lines)
+    }
+
     fn coordinator_start_run(
         &self,
         backend: &mut dyn coordinator::engine::ControlPlaneBackend,
@@ -91,7 +394,9 @@ pub trait Engine {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
-            .map_err(|e| crate::MaccError::Validation(format!("build runtime for coordinator run: {}", e)))?;
+            .map_err(|e| {
+                crate::MaccError::Validation(format!("build runtime for coordinator run: {}", e))
+            })?;
         runtime.block_on(coordinator::engine::run_control_plane(backend, cfg))
     }
 
@@ -155,7 +460,9 @@ pub trait Engine {
             }
         }
 
-        if let Some(pause) = coordinator::state_runtime::read_coordinator_pause_file(&project_paths.root)? {
+        if let Some(pause) =
+            coordinator::state_runtime::read_coordinator_pause_file(&project_paths.root)?
+        {
             counts.paused = true;
             counts.pause_reason = pause
                 .get("reason")
@@ -172,6 +479,255 @@ pub trait Engine {
         }
 
         Ok(counts)
+    }
+
+    fn coordinator_storage_import_json_to_sqlite(&self, paths: &ProjectPaths) -> Result<()> {
+        crate::coordinator_storage::coordinator_storage_import_json_to_sqlite(paths)
+    }
+
+    fn coordinator_storage_export_sqlite_to_json(&self, paths: &ProjectPaths) -> Result<()> {
+        crate::coordinator_storage::coordinator_storage_export_sqlite_to_json(paths)
+    }
+
+    fn coordinator_storage_verify_parity(&self, paths: &ProjectPaths) -> Result<()> {
+        crate::coordinator_storage::coordinator_storage_verify_parity(paths)
+    }
+
+    fn coordinator_aggregate_performer_logs(&self, repo_root: &Path) -> Result<usize> {
+        crate::coordinator::logs::aggregate_performer_logs(repo_root)
+    }
+
+    fn coordinator_sync_registry_from_prd(&self, repo_root: &Path, prd_file: &Path) -> Result<()> {
+        crate::coordinator::control_plane::sync_registry_from_prd_native(repo_root, prd_file, None)
+    }
+
+    fn coordinator_sync_registry_from_prd_with_logger(
+        &self,
+        repo_root: &Path,
+        prd_file: &Path,
+        logger: Option<&dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Result<()> {
+        crate::coordinator::control_plane::sync_registry_from_prd_native(
+            repo_root, prd_file, logger,
+        )
+    }
+
+    fn coordinator_dispatch_ready_tasks_native<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        canonical: &'a crate::config::CanonicalConfig,
+        coordinator: Option<&'a crate::config::CoordinatorConfig>,
+        env_cfg: &'a crate::coordinator::types::CoordinatorEnvConfig,
+        prd_file: &'a Path,
+        state: &'a mut crate::coordinator::runtime::CoordinatorRunState,
+        logger: Option<&'a dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Pin<Box<dyn Future<Output = Result<usize>> + 'a>> {
+        Box::pin(
+            crate::coordinator::control_plane::dispatch_ready_tasks_native(
+                repo_root,
+                canonical,
+                coordinator,
+                env_cfg,
+                prd_file,
+                state,
+                logger,
+            ),
+        )
+    }
+
+    fn coordinator_monitor_active_jobs_native<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        env_cfg: &'a crate::coordinator::types::CoordinatorEnvConfig,
+        state: &'a mut crate::coordinator::runtime::CoordinatorRunState,
+        max_attempts: usize,
+        phase_timeout_seconds: usize,
+        logger: Option<&'a dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(
+            crate::coordinator::control_plane::monitor_active_jobs_native(
+                repo_root,
+                env_cfg,
+                state,
+                max_attempts,
+                phase_timeout_seconds,
+                logger,
+            ),
+        )
+    }
+
+    fn coordinator_advance_tasks_native<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        coordinator_tool_override: Option<&'a str>,
+        phase_runner_max_attempts: usize,
+        state: &'a mut crate::coordinator::runtime::CoordinatorRunState,
+        logger: Option<&'a dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::coordinator::engine::AdvanceResult>> + 'a>> {
+        Box::pin(crate::coordinator::control_plane::advance_tasks_native(
+            repo_root,
+            coordinator_tool_override,
+            phase_runner_max_attempts,
+            state,
+            logger,
+        ))
+    }
+
+    fn coordinator_run_phase_for_task_native(
+        &self,
+        repo_root: &Path,
+        task: &serde_json::Value,
+        phase: &str,
+        coordinator_tool_override: Option<&str>,
+        max_attempts: usize,
+        logger: Option<&dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Result<std::result::Result<String, String>> {
+        crate::coordinator::control_plane::run_phase_for_task_native(
+            repo_root,
+            task,
+            phase,
+            coordinator_tool_override,
+            max_attempts,
+            logger,
+        )
+    }
+
+    fn coordinator_run_review_phase_for_task_native(
+        &self,
+        repo_root: &Path,
+        task: &serde_json::Value,
+        coordinator_tool_override: Option<&str>,
+        max_attempts: usize,
+        logger: Option<&dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Result<std::result::Result<crate::coordinator::engine::ReviewVerdict, String>> {
+        crate::coordinator::control_plane::run_review_phase_for_task_native(
+            repo_root,
+            task,
+            coordinator_tool_override,
+            max_attempts,
+            logger,
+        )
+    }
+
+    fn coordinator_state_apply_transition(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        crate::coordinator::state::coordinator_state_apply_transition(repo_root, args)
+    }
+
+    fn coordinator_state_set_runtime(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        crate::coordinator::state::coordinator_state_set_runtime(repo_root, args)
+    }
+
+    fn coordinator_state_task_field(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        crate::coordinator::state::coordinator_state_task_field(repo_root, args)
+    }
+
+    fn coordinator_state_task_exists(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        crate::coordinator::state::coordinator_state_task_exists(repo_root, args)
+    }
+
+    fn coordinator_state_counts(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        crate::coordinator::state::coordinator_state_counts(repo_root, args)
+    }
+
+    fn coordinator_state_locks(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        crate::coordinator::state::coordinator_state_locks(repo_root, args)
+    }
+
+    fn coordinator_state_set_merge_pending(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        crate::coordinator::state::coordinator_state_set_merge_pending(repo_root, args)
+    }
+
+    fn coordinator_state_set_merge_processed(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        crate::coordinator::state::coordinator_state_set_merge_processed(repo_root, args)
+    }
+
+    fn coordinator_state_increment_retries(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        crate::coordinator::state::coordinator_state_increment_retries(repo_root, args)
+    }
+
+    fn coordinator_state_upsert_slo_warning(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        crate::coordinator::state::coordinator_state_upsert_slo_warning(repo_root, args)
+    }
+
+    fn coordinator_state_slo_metric(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        crate::coordinator::state::coordinator_state_slo_metric(repo_root, args)
+    }
+
+    fn coordinator_state_snapshot(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+    ) -> Result<crate::coordinator_storage::CoordinatorSnapshot> {
+        crate::coordinator::state::coordinator_state_snapshot(repo_root, args)
+    }
+
+    fn coordinator_state_save_snapshot(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+        snapshot: &crate::coordinator_storage::CoordinatorSnapshot,
+    ) -> Result<()> {
+        crate::coordinator::state::coordinator_state_save_snapshot(repo_root, args, snapshot)
+    }
+
+    fn coordinator_state_unlock_resource(
+        &self,
+        repo_root: &Path,
+        args: &BTreeMap<String, String>,
+        resource: Option<&str>,
+        clear_all: bool,
+    ) -> Result<usize> {
+        crate::coordinator::state::coordinator_state_unlock_resource(
+            repo_root, args, resource, clear_all,
+        )
+    }
+
+    fn coordinator_state_reset_runtime_to_idle(&self, task: &mut serde_json::Value) {
+        crate::coordinator::state::reset_runtime_to_idle(task)
     }
 }
 

@@ -83,11 +83,7 @@ pub fn read_coordinator_pause_file(repo_root: &Path) -> Result<Option<serde_json
     Ok(Some(value))
 }
 
-pub fn set_task_paused_for_integrate(
-    repo_root: &Path,
-    task_id: &str,
-    reason: &str,
-) -> Result<()> {
+pub fn set_task_paused_for_integrate(repo_root: &Path, task_id: &str, reason: &str) -> Result<()> {
     let mut args = BTreeMap::new();
     args.insert("task-id".to_string(), task_id.to_string());
     args.insert("runtime-status".to_string(), "paused".to_string());
@@ -356,7 +352,11 @@ pub fn reconcile_registry_native(repo_root: &Path) -> Result<()> {
         cleanup_dead_runtime_tasks_in_registry(&mut registry, "reconcile", None, Some(repo_root))?;
     recompute_resource_locks_from_tasks(&mut registry);
     set_registry_updated_at(&mut registry);
-    crate::coordinator::state::coordinator_state_registry_save(repo_root, &BTreeMap::new(), &registry)
+    crate::coordinator::state::coordinator_state_registry_save(
+        repo_root,
+        &BTreeMap::new(),
+        &registry,
+    )
 }
 
 pub fn cleanup_registry_native(repo_root: &Path) -> Result<()> {

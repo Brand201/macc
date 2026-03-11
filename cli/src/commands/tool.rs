@@ -1,5 +1,5 @@
-use crate::commands::Command;
 use crate::commands::AppContext;
+use crate::commands::Command;
 use crate::ToolCommands;
 use macc_core::Result;
 pub struct ToolCommand<'a> {
@@ -16,8 +16,14 @@ impl<'a> ToolCommand<'a> {
 impl<'a> Command for ToolCommand<'a> {
     fn run(&self) -> Result<()> {
         let paths = self.app.ensure_initialized_paths()?;
+        let reporter = crate::services::interaction::CliInteraction;
         match self.command {
-            ToolCommands::Install { tool_id, yes } => crate::services::tooling::install_tool(&paths, tool_id, *yes),
+            ToolCommands::Install { tool_id, yes } => {
+                self.app
+                    .engine
+                    .tooling_install_tool(&paths, tool_id, *yes, &reporter)?;
+                Ok(())
+            }
             ToolCommands::Update {
                 tool_id,
                 all,
@@ -26,19 +32,28 @@ impl<'a> Command for ToolCommand<'a> {
                 yes,
                 force,
                 rollback_on_fail,
-            } => crate::services::tooling::update_tools(
-                &paths,
-                crate::services::tooling::ToolUpdateCommandOptions {
-                    tool_id: tool_id.as_deref(),
-                    all: *all,
-                    only: only.as_deref(),
-                    check: *check,
-                    assume_yes: *yes,
-                    force: *force,
-                    rollback_on_fail: *rollback_on_fail,
-                },
-            ),
-            ToolCommands::Outdated { only } => crate::services::tooling::show_outdated_tools(&paths, only.as_deref()),
+            } => {
+                self.app.engine.tooling_update_tools(
+                    &paths,
+                    macc_core::service::tooling::ToolUpdateCommandOptions {
+                        tool_id: tool_id.as_deref(),
+                        all: *all,
+                        only: only.as_deref(),
+                        check: *check,
+                        assume_yes: *yes,
+                        force: *force,
+                        rollback_on_fail: *rollback_on_fail,
+                    },
+                    &reporter,
+                )?;
+                Ok(())
+            }
+            ToolCommands::Outdated { only } => {
+                self.app
+                    .engine
+                    .tooling_show_outdated(&paths, only.as_deref(), &reporter)?;
+                Ok(())
+            }
         }
     }
 }

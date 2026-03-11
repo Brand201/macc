@@ -1,6 +1,6 @@
 use crate::coordinator::engine::ReviewVerdict;
-use crate::{MaccError, Result};
 use crate::git;
+use crate::{MaccError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
@@ -303,7 +303,10 @@ pub fn spawn_performer_job(
         .join("events.jsonl");
     run_cmd
         .current_dir(repo_root)
-        .env("COORD_EVENTS_FILE", events_file.to_string_lossy().to_string())
+        .env(
+            "COORD_EVENTS_FILE",
+            events_file.to_string_lossy().to_string(),
+        )
         .env(
             "COORDINATOR_RUN_ID",
             std::env::var("COORDINATOR_RUN_ID").unwrap_or_else(|_| {
@@ -383,7 +386,11 @@ struct ErrorDetails {
     error_message: Option<String>,
 }
 
-fn read_last_error_details(events_file: &Path, task_id: &str, event_source: &str) -> Option<ErrorDetails> {
+fn read_last_error_details(
+    events_file: &Path,
+    task_id: &str,
+    event_source: &str,
+) -> Option<ErrorDetails> {
     let content = std::fs::read_to_string(events_file).ok()?;
     let mut failed_candidate: Option<ErrorDetails> = None;
     let mut saw_terminal_success_before_failed = false;
@@ -461,7 +468,10 @@ fn read_last_error_details(events_file: &Path, task_id: &str, event_source: &str
         return None;
     }
     failed_candidate.and_then(|details| {
-        if details.error_code.is_some() || details.error_origin.is_some() || details.error_message.is_some() {
+        if details.error_code.is_some()
+            || details.error_origin.is_some()
+            || details.error_message.is_some()
+        {
             Some(details)
         } else {
             None
@@ -752,9 +762,9 @@ where
         &["diff", "--name-only", "--diff-filter=U"],
         "list merge conflict files",
     )
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().replace('\n', ","))
-        .unwrap_or_default();
+    .ok()
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().replace('\n', ","))
+    .unwrap_or_default();
 
     let mut hook_output = String::new();
     let allow_ai_fix = is_truthy_env("COORDINATOR_MERGE_AI_FIX", false);
@@ -821,11 +831,10 @@ where
                 &["diff", "--name-only", "--diff-filter=U"],
                 "list unresolved merge conflict files",
             )
-                .ok()
-                .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-                .unwrap_or(true);
-            let in_merge =
-                git::rev_parse_verify(repo_root, "MERGE_HEAD").unwrap_or(false);
+            .ok()
+            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(true);
+            let in_merge = git::rev_parse_verify(repo_root, "MERGE_HEAD").unwrap_or(false);
             if !unresolved && !in_merge {
                 return Ok(Ok(()));
             }
@@ -834,11 +843,8 @@ where
 
     let in_merge = git::rev_parse_verify(repo_root, "MERGE_HEAD").unwrap_or(false);
     if in_merge {
-        let _ = git::run_git_output_mapped(
-            repo_root,
-            &["merge", "--abort"],
-            "abort conflicted merge",
-        );
+        let _ =
+            git::run_git_output_mapped(repo_root, &["merge", "--abort"], "abort conflicted merge");
     }
 
     let report_file = log_dir.join(format!(
@@ -934,7 +940,10 @@ fn append_branch_cleanup_queue_entry(
         })?;
     }
     let line = serde_json::to_string(entry).map_err(|e| {
-        MaccError::Validation(format!("Failed to serialize branch cleanup queue entry: {}", e))
+        MaccError::Validation(format!(
+            "Failed to serialize branch cleanup queue entry: {}",
+            e
+        ))
     })?;
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
@@ -1000,7 +1009,10 @@ fn save_branch_cleanup_queue(repo_root: &Path, entries: &[BranchCleanupQueueEntr
     let mut out = String::new();
     for entry in entries {
         let line = serde_json::to_string(entry).map_err(|e| {
-            MaccError::Validation(format!("Failed to serialize branch cleanup queue entry: {}", e))
+            MaccError::Validation(format!(
+                "Failed to serialize branch cleanup queue entry: {}",
+                e
+            ))
         })?;
         out.push_str(&line);
         out.push('\n');
@@ -1107,7 +1119,9 @@ fn find_worktree_using_branch(repo_root: &Path, branch: &str) -> Result<Option<P
             continue;
         }
         if let Some(found_branch) = trimmed.strip_prefix("branch ") {
-            let normalized = found_branch.strip_prefix("refs/heads/").unwrap_or(found_branch);
+            let normalized = found_branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(found_branch);
             if normalized == branch {
                 return Ok(current_path);
             }
@@ -1137,14 +1151,7 @@ pub fn report_branch_cleanup_outcome<FE, FW>(
                 "branch cleanup success context={} task={} branch={} base={}",
                 context, task_ref, branch, base
             );
-            emit_event(
-                "branch_cleanup",
-                task_ref,
-                phase,
-                "success",
-                &msg,
-                "info",
-            );
+            emit_event("branch_cleanup", task_ref, phase, "success", &msg, "info");
         }
         Ok(BranchCleanupResult::Skipped { reason }) => {
             let msg = format!(

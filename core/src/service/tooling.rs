@@ -1,6 +1,9 @@
-use macc_core::config::CanonicalConfig;
-use macc_core::tool::ToolSpec;
-use macc_core::{load_canonical_config, MaccError, Result};
+use crate::config::CanonicalConfig;
+use crate::doctor::{run_checks, ToolCheck, ToolStatus};
+use crate::service::interaction::InteractionHandler;
+use crate::tool::ToolDiagnostic;
+use crate::tool::{DoctorCheckKind, ToolInstallCommand, ToolSpec, ToolSpecLoader};
+use crate::{load_canonical_config, MaccError, ProjectPaths, Result};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ToolUpdateCommandOptions<'a> {
@@ -14,16 +17,16 @@ pub struct ToolUpdateCommandOptions<'a> {
 }
 
 #[derive(Debug, Clone)]
-struct ToolUpdateStatus {
-    id: String,
-    installed: bool,
-    current_version: Option<String>,
-    latest_version: Option<String>,
-    source: String,
+pub struct ToolUpdateStatus {
+    pub id: String,
+    pub installed: bool,
+    pub current_version: Option<String>,
+    pub latest_version: Option<String>,
+    pub source: String,
 }
 
 impl ToolUpdateStatus {
-    fn is_outdated(&self) -> bool {
+    pub fn is_outdated(&self) -> bool {
         match (&self.current_version, &self.latest_version) {
             (Some(current), Some(latest)) => current != latest,
             _ => false,
@@ -31,8 +34,62 @@ impl ToolUpdateStatus {
     }
 }
 
-pub fn install_tool(paths: &macc_core::ProjectPaths, tool_id: &str, assume_yes: bool) -> Result<()> {
-    let specs = load_toolspecs_with_diagnostics(paths)?;
+#[derive(Debug, Clone)]
+pub struct InstallToolOutcome {
+    pub tool_id: String,
+    pub check_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ToolUpdateSummary {
+    pub checked: bool,
+    pub updated: usize,
+    pub already_latest: usize,
+    pub skipped: usize,
+    pub failed_tools: Vec<String>,
+    pub statuses: Vec<ToolUpdateStatus>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OutdatedToolsReport {
+    pub statuses: Vec<ToolUpdateStatus>,
+    pub outdated_count: usize,
+}
+
+pub struct NoopReporter;
+
+impl InteractionHandler for NoopReporter {}
+
+pub trait UserReporter: InteractionHandler {
+    fn report_diagnostics(&self, diagnostics: &[ToolDiagnostic]) {
+        for diagnostic in diagnostics {
+            if let Some(line) = diagnostic.line {
+                self.warn(&format!(
+                    "Warning: ToolSpec {}:{}:{}",
+                    diagnostic.path.display(),
+                    line,
+                    diagnostic.column.unwrap_or(0),
+                ));
+            } else {
+                self.warn(&format!(
+                    "Warning: ToolSpec {}: {}",
+                    diagnostic.path.display(),
+                    diagnostic.error
+                ));
+            }
+        }
+    }
+}
+
+impl<T: InteractionHandler + ?Sized> UserReporter for T {}
+
+pub fn install_tool(
+    paths: &ProjectPaths,
+    tool_id: &str,
+    assume_yes: bool,
+    reporter: &dyn UserReporter,
+) -> Result<InstallToolOutcome> {
+    let specs = load_toolspecs_with_diagnostics(paths, reporter)?;
     let spec = specs
         .into_iter()
         .find(|s| s.id == tool_id)
@@ -55,19 +112,19 @@ pub fn install_tool(paths: &macc_core::ProjectPaths, tool_id: &str, assume_yes: 
             .to_string()
     });
     if !assume_yes {
-        println!("{}", confirm_message);
-        if !confirm_yes_no("Proceed [y/N]? ")? {
+        reporter.info(&confirm_message);
+        if !reporter.confirm_yes_no("Proceed [y/N]? ")? {
             return Err(MaccError::Validation("Installation cancelled.".into()));
         }
     }
 
-    println!("Installing tool '{}'.", tool_id);
+    reporter.info(&format!("Installing tool '{}'.", tool_id));
     for command in &install.commands {
         run_install_command(&paths.root, command, false)?;
     }
 
     let initial_checks = run_tool_health_checks(&spec);
-    print_checks(&initial_checks);
+    reporter.info(&format_checks_table(&initial_checks));
     if !checks_all_installed(&initial_checks) {
         return Err(MaccError::Validation(format!(
             "Install completed but doctor checks are still failing for '{}'.",
@@ -76,12 +133,12 @@ pub fn install_tool(paths: &macc_core::ProjectPaths, tool_id: &str, assume_yes: 
     }
 
     if let Some(post_install) = &install.post_install {
-        println!("Running post-install setup for '{}'.", tool_id);
+        reporter.info(&format!("Running post-install setup for '{}'.", tool_id));
         run_install_command(&paths.root, post_install, true)?;
     }
 
     let final_checks = run_tool_health_checks(&spec);
-    print_checks(&final_checks);
+    reporter.info(&format_checks_table(&final_checks));
     if !checks_all_installed(&final_checks) {
         return Err(MaccError::Validation(format!(
             "Post-install validation failed for '{}'.",
@@ -89,12 +146,19 @@ pub fn install_tool(paths: &macc_core::ProjectPaths, tool_id: &str, assume_yes: 
         )));
     }
 
-    println!("Tool '{}' is installed and healthy.", tool_id);
-    Ok(())
+    reporter.info(&format!("Tool '{}' is installed and healthy.", tool_id));
+    Ok(InstallToolOutcome {
+        tool_id: tool_id.to_string(),
+        check_count: final_checks.len(),
+    })
 }
 
-pub fn update_tools(paths: &macc_core::ProjectPaths, opts: ToolUpdateCommandOptions<'_>) -> Result<()> {
-    let specs = load_toolspecs_with_diagnostics(paths)?;
+pub fn update_tools(
+    paths: &ProjectPaths,
+    opts: ToolUpdateCommandOptions<'_>,
+    reporter: &dyn UserReporter,
+) -> Result<ToolUpdateSummary> {
+    let specs = load_toolspecs_with_diagnostics(paths, reporter)?;
     let canonical = load_canonical_config(&paths.config_path)?;
     let selected = select_tools_for_update(&specs, &canonical, opts.tool_id, opts.all, opts.only)?;
     if selected.is_empty() {
@@ -103,10 +167,10 @@ pub fn update_tools(paths: &macc_core::ProjectPaths, opts: ToolUpdateCommandOpti
         ));
     }
 
-    let mut updated = 0usize;
-    let mut already_latest = 0usize;
-    let mut skipped = 0usize;
-    let mut failed: Vec<String> = Vec::new();
+    let mut summary = ToolUpdateSummary {
+        checked: opts.check,
+        ..ToolUpdateSummary::default()
+    };
 
     for spec in selected {
         let status = get_tool_update_status(&spec);
@@ -120,121 +184,159 @@ pub fn update_tools(paths: &macc_core::ProjectPaths, opts: ToolUpdateCommandOpti
             .unwrap_or_else(|| "unknown".to_string());
 
         if !status.installed && !opts.force {
-            println!(
+            reporter.info(&format!(
                 "Skipping '{}': not currently installed (run `macc tool install {}`).",
                 spec.id, spec.id
-            );
-            skipped += 1;
+            ));
+            summary.skipped += 1;
+            summary.statuses.push(status);
             continue;
         }
         if !opts.force && status.latest_version.is_some() && !status.is_outdated() {
-            println!(
+            reporter.info(&format!(
                 "Skipping '{}': already latest (current={}, latest={}).",
                 spec.id, current_display, latest_display
-            );
-            already_latest += 1;
+            ));
+            summary.already_latest += 1;
+            summary.statuses.push(status);
             continue;
         }
         if opts.check {
-            println!(
+            reporter.info(&format!(
                 "[check] tool={} installed={} current={} latest={} source={}",
                 spec.id, status.installed, current_display, latest_display, status.source
-            );
+            ));
+            summary.statuses.push(status);
             continue;
         }
 
-        match update_single_tool(paths, &spec, opts.assume_yes, opts.rollback_on_fail) {
+        match update_single_tool(
+            paths,
+            &spec,
+            opts.assume_yes,
+            opts.rollback_on_fail,
+            reporter,
+        ) {
             Ok(()) => {
-                println!("Updated '{}'.", spec.id);
-                updated += 1;
+                reporter.info(&format!("Updated '{}'.", spec.id));
+                summary.updated += 1;
             }
             Err(err) => {
-                eprintln!("Failed to update '{}': {}", spec.id, err);
-                failed.push(spec.id.clone());
+                reporter.error(&format!("Failed to update '{}': {}", spec.id, err));
+                summary.failed_tools.push(spec.id.clone());
             }
         }
+        summary.statuses.push(status);
     }
 
     if opts.check {
-        return Ok(());
+        return Ok(summary);
     }
 
-    println!(
+    reporter.info(&format!(
         "Update summary: updated={} already_latest={} skipped={} failed={}",
-        updated,
-        already_latest,
-        skipped,
-        failed.len()
-    );
-    if failed.is_empty() {
-        Ok(())
+        summary.updated,
+        summary.already_latest,
+        summary.skipped,
+        summary.failed_tools.len()
+    ));
+
+    if summary.failed_tools.is_empty() {
+        Ok(summary)
     } else {
         Err(MaccError::Validation(format!(
             "Tool update failed for: {}",
-            failed.join(", ")
+            summary.failed_tools.join(", ")
         )))
     }
 }
 
-pub fn show_outdated_tools(paths: &macc_core::ProjectPaths, only: Option<&str>) -> Result<()> {
-    let specs = load_toolspecs_with_diagnostics(paths)?;
+pub fn show_outdated_tools(
+    paths: &ProjectPaths,
+    only: Option<&str>,
+    reporter: &dyn UserReporter,
+) -> Result<OutdatedToolsReport> {
+    let specs = load_toolspecs_with_diagnostics(paths, reporter)?;
     let canonical = load_canonical_config(&paths.config_path)?;
     let selected = select_tools_for_update(&specs, &canonical, None, true, only)?;
 
-    println!(
-        "{:<14} {:<10} {:<16} {:<16} {:<14}",
-        "TOOL", "INSTALLED", "CURRENT", "LATEST", "STATE"
-    );
-    println!(
-        "{:-<14} {:-<10} {:-<16} {:-<16} {:-<14}",
-        "", "", "", "", ""
-    );
-    let mut outdated_count = 0usize;
+    let mut report = OutdatedToolsReport::default();
     for spec in selected {
         let status = get_tool_update_status(&spec);
+        if status.installed && status.is_outdated() {
+            report.outdated_count += 1;
+        }
+        report.statuses.push(status);
+    }
+
+    reporter.info(&format_outdated_table(&report));
+    Ok(report)
+}
+
+pub fn format_checks_table(checks: &[ToolCheck]) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "{:<20} {:<10} {:<30}\n",
+        "CHECK", "STATUS", "TARGET"
+    ));
+    output.push_str(&format!("{:-<20} {:-<10} {:-<30}\n", "", "", ""));
+    for check in checks {
+        let status_str = match &check.status {
+            ToolStatus::Installed => "OK".to_string(),
+            ToolStatus::Missing => "MISSING".to_string(),
+            ToolStatus::Error(e) => format!("ERROR: {}", e),
+        };
+        output.push_str(&format!(
+            "{:<20} {:<10} {:<30}\n",
+            check.name, status_str, check.check_target
+        ));
+    }
+    output
+}
+
+pub fn format_outdated_table(report: &OutdatedToolsReport) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "{:<14} {:<10} {:<16} {:<16} {:<14}\n",
+        "TOOL", "INSTALLED", "CURRENT", "LATEST", "STATE"
+    ));
+    output.push_str(&format!(
+        "{:-<14} {:-<10} {:-<16} {:-<16} {:-<14}\n",
+        "", "", "", "", ""
+    ));
+    for status in &report.statuses {
         let state = if !status.installed {
             "not_installed"
         } else if status.is_outdated() {
-            outdated_count += 1;
             "outdated"
         } else if status.latest_version.is_some() {
             "up_to_date"
         } else {
             "unknown"
         };
-        println!(
-            "{:<14} {:<10} {:<16} {:<16} {:<14}",
+        output.push_str(&format!(
+            "{:<14} {:<10} {:<16} {:<16} {:<14}\n",
             status.id,
             if status.installed { "yes" } else { "no" },
-            status.current_version.unwrap_or_else(|| "-".to_string()),
-            status.latest_version.unwrap_or_else(|| "-".to_string()),
+            status
+                .current_version
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+            status
+                .latest_version
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
             state
-        );
+        ));
     }
-    println!();
-    println!("Outdated tools: {}", outdated_count);
-    Ok(())
-}
-
-pub fn print_checks(checks: &[macc_core::doctor::ToolCheck]) {
-    println!("{:<20} {:<10} {:<30}", "CHECK", "STATUS", "TARGET");
-    println!("{:-<20} {:-<10} {:-<30}", "", "", "");
-    for check in checks {
-        let status_str = match &check.status {
-            macc_core::doctor::ToolStatus::Installed => "OK".to_string(),
-            macc_core::doctor::ToolStatus::Missing => "MISSING".to_string(),
-            macc_core::doctor::ToolStatus::Error(e) => format!("ERROR: {}", e),
-        };
-        println!(
-            "{:<20} {:<10} {:<30}",
-            check.name, status_str, check.check_target
-        );
-    }
+    output.push('\n');
+    output.push_str(&format!("Outdated tools: {}", report.outdated_count));
+    output
 }
 
 fn run_install_command(
     cwd: &std::path::Path,
-    command: &macc_core::tool::ToolInstallCommand,
+    command: &ToolInstallCommand,
     interactive: bool,
 ) -> Result<()> {
     let mut cmd = std::process::Command::new(&command.command);
@@ -260,44 +362,47 @@ fn run_install_command(
     Ok(())
 }
 
-fn run_tool_health_checks(spec: &ToolSpec) -> Vec<macc_core::doctor::ToolCheck> {
+fn run_tool_health_checks(spec: &ToolSpec) -> Vec<ToolCheck> {
     let mut checks = Vec::new();
     if let Some(doctor_specs) = &spec.doctor {
         for check_spec in doctor_specs {
-            checks.push(macc_core::doctor::ToolCheck {
+            checks.push(ToolCheck {
                 name: spec.display_name.clone(),
                 tool_id: Some(spec.id.clone()),
                 check_target: check_spec.value.clone(),
                 kind: check_spec.kind.clone(),
-                status: macc_core::doctor::ToolStatus::Missing,
+                status: ToolStatus::Missing,
                 severity: check_spec.severity.clone(),
             });
         }
     } else {
-        checks.push(macc_core::doctor::ToolCheck {
+        checks.push(ToolCheck {
             name: spec.display_name.clone(),
             tool_id: Some(spec.id.clone()),
             check_target: spec.id.clone(),
-            kind: macc_core::tool::DoctorCheckKind::Which,
-            status: macc_core::doctor::ToolStatus::Missing,
-            severity: macc_core::tool::CheckSeverity::Warning,
+            kind: DoctorCheckKind::Which,
+            status: ToolStatus::Missing,
+            severity: crate::tool::CheckSeverity::Warning,
         });
     }
-    macc_core::doctor::run_checks(&mut checks);
+    run_checks(&mut checks);
     checks
 }
 
-fn checks_all_installed(checks: &[macc_core::doctor::ToolCheck]) -> bool {
+fn checks_all_installed(checks: &[ToolCheck]) -> bool {
     checks
         .iter()
-        .all(|check| matches!(check.status, macc_core::doctor::ToolStatus::Installed))
+        .all(|check| matches!(check.status, ToolStatus::Installed))
 }
 
-fn load_toolspecs_with_diagnostics(paths: &macc_core::ProjectPaths) -> Result<Vec<ToolSpec>> {
-    let search_paths = macc_core::tool::ToolSpecLoader::default_search_paths(&paths.root);
-    let loader = macc_core::tool::ToolSpecLoader::new(search_paths);
+fn load_toolspecs_with_diagnostics(
+    paths: &ProjectPaths,
+    reporter: &dyn UserReporter,
+) -> Result<Vec<ToolSpec>> {
+    let search_paths = ToolSpecLoader::default_search_paths(&paths.root);
+    let loader = ToolSpecLoader::new(search_paths);
     let (specs, diagnostics) = loader.load_all_with_embedded();
-    crate::services::project::report_diagnostics(&diagnostics);
+    reporter.report_diagnostics(&diagnostics);
     Ok(specs)
 }
 
@@ -331,7 +436,9 @@ fn select_tools_for_update(
     selected.retain(|spec| spec.install.is_some());
     if let Some(filter) = only {
         match filter {
-            "enabled" => selected.retain(|spec| canonical.tools.enabled.iter().any(|id| id == &spec.id)),
+            "enabled" => {
+                selected.retain(|spec| canonical.tools.enabled.iter().any(|id| id == &spec.id))
+            }
             "installed" => selected.retain(|spec| get_tool_update_status(spec).installed),
             _ => {}
         }
@@ -351,7 +458,11 @@ fn get_tool_update_status(spec: &ToolSpec) -> ToolUpdateStatus {
             format!(
                 "{}{}",
                 vs.current.command,
-                if vs.latest.is_some() { " (+latest)" } else { "" }
+                if vs.latest.is_some() {
+                    " (+latest)"
+                } else {
+                    ""
+                }
             ),
         )
     } else {
@@ -366,7 +477,7 @@ fn get_tool_update_status(spec: &ToolSpec) -> ToolUpdateStatus {
     }
 }
 
-pub(crate) fn run_version_command(cmd_spec: &macc_core::tool::ToolInstallCommand) -> Option<String> {
+pub fn run_version_command(cmd_spec: &ToolInstallCommand) -> Option<String> {
     let output = std::process::Command::new(&cmd_spec.command)
         .args(&cmd_spec.args)
         .output()
@@ -386,10 +497,9 @@ pub(crate) fn run_version_command(cmd_spec: &macc_core::tool::ToolInstallCommand
     extract_version_token(&text)
 }
 
-pub(crate) fn extract_version_token(text: &str) -> Option<String> {
+pub fn extract_version_token(text: &str) -> Option<String> {
     for raw in text.split_whitespace() {
-        let token =
-            raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
+        let token = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
         let normalized = token.trim_start_matches('v');
         if normalized
             .chars()
@@ -404,10 +514,11 @@ pub(crate) fn extract_version_token(text: &str) -> Option<String> {
 }
 
 fn update_single_tool(
-    paths: &macc_core::ProjectPaths,
+    paths: &ProjectPaths,
     spec: &ToolSpec,
     assume_yes: bool,
     rollback_on_fail: bool,
+    reporter: &dyn UserReporter,
 ) -> Result<()> {
     let update_spec = spec
         .update
@@ -426,16 +537,13 @@ fn update_single_tool(
         )));
     }
     if !assume_yes {
-        println!(
-            "{}",
-            update_spec.confirm_message.unwrap_or_else(|| {
-                format!(
-                    "This will run update commands for '{}'. Continue?",
-                    spec.display_name
-                )
-            })
-        );
-        if !confirm_yes_no("Proceed [y/N]? ")? {
+        reporter.info(&update_spec.confirm_message.unwrap_or_else(|| {
+            format!(
+                "This will run update commands for '{}'. Continue?",
+                spec.display_name
+            )
+        }));
+        if !reporter.confirm_yes_no("Proceed [y/N]? ")? {
             return Err(MaccError::Validation("Update cancelled.".into()));
         }
     }
@@ -448,7 +556,7 @@ fn update_single_tool(
             run_install_command(&paths.root, post_install, true)?;
         }
         let final_checks = run_tool_health_checks(spec);
-        print_checks(&final_checks);
+        reporter.info(&format_checks_table(&final_checks));
         if !checks_all_installed(&final_checks) {
             return Err(MaccError::Validation(format!(
                 "Post-update validation failed for '{}'.",
@@ -461,27 +569,9 @@ fn update_single_tool(
     if update_result.is_ok() || !rollback_on_fail {
         return update_result;
     }
-    eprintln!(
+    reporter.warn(&format!(
         "Rollback requested for '{}' but no generic rollback contract is defined. Configure tool-specific rollback in ToolSpec before enabling this in production.",
         spec.id
-    );
+    ));
     update_result
-}
-
-fn confirm_yes_no(prompt: &str) -> Result<bool> {
-    use std::io::{self, Write};
-    print!("{}", prompt);
-    io::stdout().flush().map_err(|e| MaccError::Io {
-        path: "stdout".into(),
-        action: "flush prompt".into(),
-        source: e,
-    })?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).map_err(|e| MaccError::Io {
-        path: "stdin".into(),
-        action: "read confirmation".into(),
-        source: e,
-    })?;
-    let value = input.trim().to_ascii_lowercase();
-    Ok(value == "y" || value == "yes")
 }

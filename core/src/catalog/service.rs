@@ -66,8 +66,8 @@ pub fn execute_remote_search(
     add: bool,
     add_ids: Option<&str>,
 ) -> Result<RemoteSearchOutcome> {
-    let whitelist: Option<Vec<String>> = add_ids
-        .map(|s| s.split(',').map(|i| i.trim().to_string()).collect());
+    let whitelist: Option<Vec<String>> =
+        add_ids.map(|s| s.split(',').map(|i| i.trim().to_string()).collect());
     let should_save = add || whitelist.is_some();
 
     match kind {
@@ -163,8 +163,12 @@ pub trait CatalogInstallBackend {
         paths: &ProjectPaths,
         fetch_unit: FetchUnit,
     ) -> Result<MaterializedFetchUnit>;
-    fn apply(&self, paths: &ProjectPaths, plan: &mut ActionPlan, allow_user_scope: bool)
-        -> Result<ApplyReport>;
+    fn apply(
+        &self,
+        paths: &ProjectPaths,
+        plan: &mut ActionPlan,
+        allow_user_scope: bool,
+    ) -> Result<ApplyReport>;
 }
 
 #[derive(Debug, Clone)]
@@ -186,11 +190,10 @@ pub fn install_skill(
     backend: &dyn CatalogInstallBackend,
 ) -> Result<InstallSkillOutcome> {
     let catalog = load_effective_skills_catalog(paths)?;
-    let entry = catalog
-        .entries
-        .iter()
-        .find(|e| e.id == id)
-        .ok_or_else(|| MaccError::Validation(format!("Skill '{}' not found in catalog.", id)))?;
+    let entry =
+        catalog.entries.iter().find(|e| e.id == id).ok_or_else(|| {
+            MaccError::Validation(format!("Skill '{}' not found in catalog.", id))
+        })?;
 
     let (descriptors, diagnostics) = backend.list_tools(paths);
     let tool_title = descriptors
@@ -237,11 +240,9 @@ pub fn install_mcp(
     backend: &dyn CatalogInstallBackend,
 ) -> Result<InstallMcpOutcome> {
     let catalog = load_effective_mcp_catalog(paths)?;
-    let entry = catalog
-        .entries
-        .iter()
-        .find(|e| e.id == id)
-        .ok_or_else(|| MaccError::Validation(format!("MCP server '{}' not found in catalog.", id)))?;
+    let entry = catalog.entries.iter().find(|e| e.id == id).ok_or_else(|| {
+        MaccError::Validation(format!("MCP server '{}' not found in catalog.", id))
+    })?;
 
     let mut source = entry.source.clone();
     if !entry.selector.subpath.is_empty() && entry.selector.subpath != "." {
@@ -296,7 +297,11 @@ pub fn build_mcp_entry(input: CatalogEntryInput) -> Result<McpEntry> {
     crate::domain::catalog::build_mcp_entry(input)
 }
 
-pub fn upsert_skill(paths: &ProjectPaths, catalog: &mut SkillsCatalog, entry: SkillEntry) -> Result<()> {
+pub fn upsert_skill(
+    paths: &ProjectPaths,
+    catalog: &mut SkillsCatalog,
+    entry: SkillEntry,
+) -> Result<()> {
     crate::domain::catalog::upsert_skill(paths, catalog, entry)
 }
 

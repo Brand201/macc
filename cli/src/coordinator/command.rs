@@ -1,31 +1,23 @@
-use crate::{
-    coordinator,
-    coordinator_runtime_status_from_event_action, coordinator_select_ready_task_action,
-    coordinator_storage_sync_action, load_canonical_config, remove_all_worktrees,
-    stop_coordinator_process_groups,
-    validate_coordinator_runtime_transition_action, validate_coordinator_transition_action,
-    CoordinatorRunState, NativeCoordinatorLogger,
-};
 use crate::coordinator::helpers::now_iso_coordinator;
 use crate::coordinator::state_runtime::{
-    cleanup_registry_native,
-    reconcile_registry_native, set_task_paused_for_integrate,
+    cleanup_registry_native, reconcile_registry_native, set_task_paused_for_integrate,
     write_coordinator_pause_file,
 };
+use crate::{
+    coordinator_runtime_status_from_event_action, coordinator_select_ready_task_action,
+    coordinator_storage_sync_action, load_canonical_config, remove_all_worktrees,
+    stop_coordinator_process_groups, validate_coordinator_runtime_transition_action,
+    validate_coordinator_transition_action, CoordinatorRunState, NativeCoordinatorLogger,
+};
+use macc_core::coordinator::args::parse_coordinator_extra_kv_args;
 use macc_core::coordinator::engine as coordinator_engine;
 use macc_core::coordinator::runtime as coordinator_runtime;
-use macc_core::coordinator::WorkflowState;
-use macc_core::coordinator::args::parse_coordinator_extra_kv_args;
 use macc_core::coordinator::types::CoordinatorEnvConfig;
-use macc_core::coordinator_storage::{
-    coordinator_storage_export_sqlite_to_json, coordinator_storage_import_json_to_sqlite,
-    coordinator_storage_verify_parity, CoordinatorStorageMode,
-};
+use macc_core::coordinator::WorkflowState;
+use macc_core::coordinator_storage::CoordinatorStorageMode;
 use macc_core::{MaccError, Result};
 use std::path::Path;
 use std::str::FromStr;
-
-use crate::services::project::ensure_initialized_paths;
 
 fn build_native_logger(
     repo_root: &Path,
@@ -172,8 +164,11 @@ struct ProjectContext {
 }
 
 impl ProjectContext {
-    fn load(absolute_cwd: &Path) -> Result<Self> {
-        let paths = ensure_initialized_paths(absolute_cwd)?;
+    fn load(
+        absolute_cwd: &Path,
+        engine: &crate::services::engine_provider::SharedEngine,
+    ) -> Result<Self> {
+        let paths = engine.project_ensure_initialized_paths(absolute_cwd)?;
         let canonical = load_canonical_config(&paths.config_path)?;
         let coordinator_cfg = canonical.automation.coordinator.clone();
         Ok(Self {
@@ -209,7 +204,7 @@ pub fn handle(
     }
     if action == CoordinatorAction::StorageImport {
         let paths = macc_core::ProjectPaths::from_root(absolute_cwd);
-        coordinator_storage_import_json_to_sqlite(&paths)?;
+        engine.coordinator_storage_import_json_to_sqlite(&paths)?;
         println!("Coordinator storage import complete (json -> sqlite).");
         return Ok(());
     }
@@ -218,7 +213,7 @@ pub fn handle(
         CoordinatorAction::StorageExport | CoordinatorAction::EventsExport
     ) {
         let paths = macc_core::ProjectPaths::from_root(absolute_cwd);
-        coordinator_storage_export_sqlite_to_json(&paths)?;
+        engine.coordinator_storage_export_sqlite_to_json(&paths)?;
         println!(
             "Coordinator storage export complete (sqlite -> json): {}",
             paths
@@ -233,7 +228,7 @@ pub fn handle(
     }
     if action == CoordinatorAction::StorageVerify {
         let paths = macc_core::ProjectPaths::from_root(absolute_cwd);
-        coordinator_storage_verify_parity(&paths)?;
+        engine.coordinator_storage_verify_parity(&paths)?;
         println!("Coordinator storage parity OK (json == sqlite).");
         return Ok(());
     }
@@ -242,67 +237,67 @@ pub fn handle(
         return Ok(());
     }
     if action == CoordinatorAction::AggregatePerformerLogs {
-        let copied = coordinator::logs::aggregate_performer_logs(absolute_cwd)?;
+        let copied = engine.coordinator_aggregate_performer_logs(absolute_cwd)?;
         println!("Aggregated {} performer log file(s).", copied);
         return Ok(());
     }
     if action == CoordinatorAction::StateApplyTransition {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
-        coordinator::state::coordinator_state_apply_transition(absolute_cwd, &args)?;
+        engine.coordinator_state_apply_transition(absolute_cwd, &args)?;
         return Ok(());
     }
     if action == CoordinatorAction::StateSetRuntime {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
-        coordinator::state::coordinator_state_set_runtime(absolute_cwd, &args)?;
+        engine.coordinator_state_set_runtime(absolute_cwd, &args)?;
         return Ok(());
     }
     if action == CoordinatorAction::StateTaskField {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
-        coordinator::state::coordinator_state_task_field(absolute_cwd, &args)?;
+        engine.coordinator_state_task_field(absolute_cwd, &args)?;
         return Ok(());
     }
     if action == CoordinatorAction::StateTaskExists {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
-        coordinator::state::coordinator_state_task_exists(absolute_cwd, &args)?;
+        engine.coordinator_state_task_exists(absolute_cwd, &args)?;
         return Ok(());
     }
     if action == CoordinatorAction::StateCounts {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
-        coordinator::state::coordinator_state_counts(absolute_cwd, &args)?;
+        engine.coordinator_state_counts(absolute_cwd, &args)?;
         return Ok(());
     }
     if action == CoordinatorAction::StateLocks {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
-        coordinator::state::coordinator_state_locks(absolute_cwd, &args)?;
+        engine.coordinator_state_locks(absolute_cwd, &args)?;
         return Ok(());
     }
     if action == CoordinatorAction::StateSetMergePending {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
-        coordinator::state::coordinator_state_set_merge_pending(absolute_cwd, &args)?;
+        engine.coordinator_state_set_merge_pending(absolute_cwd, &args)?;
         return Ok(());
     }
     if action == CoordinatorAction::StateSetMergeProcessed {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
-        coordinator::state::coordinator_state_set_merge_processed(absolute_cwd, &args)?;
+        engine.coordinator_state_set_merge_processed(absolute_cwd, &args)?;
         return Ok(());
     }
     if action == CoordinatorAction::StateIncrementRetries {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
-        coordinator::state::coordinator_state_increment_retries(absolute_cwd, &args)?;
+        engine.coordinator_state_increment_retries(absolute_cwd, &args)?;
         return Ok(());
     }
     if action == CoordinatorAction::StateUpsertSloWarning {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
-        coordinator::state::coordinator_state_upsert_slo_warning(absolute_cwd, &args)?;
+        engine.coordinator_state_upsert_slo_warning(absolute_cwd, &args)?;
         return Ok(());
     }
     if action == CoordinatorAction::StateSloMetric {
         let args = parse_coordinator_extra_kv_args(&input.extra_args)?;
-        coordinator::state::coordinator_state_slo_metric(absolute_cwd, &args)?;
+        engine.coordinator_state_slo_metric(absolute_cwd, &args)?;
         return Ok(());
     }
 
-    let context = ProjectContext::load(absolute_cwd)?;
+    let context = ProjectContext::load(absolute_cwd, engine)?;
     let paths = context.paths;
     let canonical = context.canonical;
     let coordinator_cfg = context.coordinator_cfg;
@@ -329,24 +324,23 @@ pub fn handle(
         };
         std::env::set_var("COORDINATOR_STORAGE_MODE", mode_raw);
     }
-    if let Some(debounce_ms) = input
-        .env_cfg
-        .mirror_json_debounce_ms
-        .or_else(|| coordinator_cfg.as_ref().and_then(|c| c.mirror_json_debounce_ms))
-    {
-        std::env::set_var("COORDINATOR_JSON_EXPORT_DEBOUNCE_MS", debounce_ms.to_string());
+    if let Some(debounce_ms) = input.env_cfg.mirror_json_debounce_ms.or_else(|| {
+        coordinator_cfg
+            .as_ref()
+            .and_then(|c| c.mirror_json_debounce_ms)
+    }) {
+        std::env::set_var(
+            "COORDINATOR_JSON_EXPORT_DEBOUNCE_MS",
+            debounce_ms.to_string(),
+        );
     }
     if action.emits_runtime_events() {
-        ensure_coordinator_run_id();
+        let _ = engine.project_ensure_coordinator_run_id();
     }
 
     if action == CoordinatorAction::ControlPlaneRun {
-        let logger = build_native_logger(
-            &paths.root,
-            "run",
-            &input.env_cfg,
-            coordinator_cfg.as_ref(),
-        )?;
+        let logger =
+            build_native_logger(&paths.root, "run", &input.env_cfg, coordinator_cfg.as_ref())?;
         println!("Coordinator log file: {}", logger.file.display());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -367,12 +361,14 @@ pub fn handle(
 
     if action == CoordinatorAction::Stop {
         let coordinator_path = paths.automation_coordinator_path();
-        let stopped = stop_coordinator_process_groups(&paths.root, &coordinator_path, input.graceful)?;
+        let stopped =
+            stop_coordinator_process_groups(&paths.root, &coordinator_path, input.graceful)?;
         println!("Coordinator process groups signaled: {}", stopped);
         let _ = engine.coordinator_stop(&paths.root, "manual stop");
         reconcile_registry_native(&paths.root)?;
         cleanup_registry_native(&paths.root)?;
         unlock_resource_locks_native(
+            engine,
             &paths.root,
             &input.env_cfg,
             coordinator_cfg.as_ref(),
@@ -392,12 +388,8 @@ pub fn handle(
                 "Action 'run' does not accept extra args after '--'.".into(),
             ));
         }
-        let logger = build_native_logger(
-            &paths.root,
-            "run",
-            &input.env_cfg,
-            coordinator_cfg.as_ref(),
-        )?;
+        let logger =
+            build_native_logger(&paths.root, "run", &input.env_cfg, coordinator_cfg.as_ref())?;
         println!("Coordinator log file: {}", logger.file.display());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -431,7 +423,7 @@ pub fn handle(
                     .map(std::path::PathBuf::from)
             })
             .unwrap_or_else(|| paths.root.join("prd.json"));
-        coordinator::control_plane::sync_registry_from_prd_native(&paths.root, &prd_file, None)?;
+        engine.coordinator_sync_registry_from_prd(&paths.root, &prd_file)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .enable_io()
@@ -448,16 +440,17 @@ pub fn handle(
         println!("Coordinator log file: {}", logger.file.display());
         runtime.block_on(async {
             let mut state = CoordinatorRunState::new();
-            let _ = coordinator::control_plane::dispatch_ready_tasks_native(
-                &paths.root,
-                &canonical,
-                coordinator_cfg.as_ref(),
-                &input.env_cfg,
-                &prd_file,
-                &mut state,
-                Some(&logger),
-            )
-            .await?;
+            let _ = engine
+                .coordinator_dispatch_ready_tasks_native(
+                    &paths.root,
+                    &canonical,
+                    coordinator_cfg.as_ref(),
+                    &input.env_cfg,
+                    &prd_file,
+                    &mut state,
+                    Some(&LoggerAdapter(&logger)),
+                )
+                .await?;
             let max_attempts = input
                 .env_cfg
                 .phase_runner_max_attempts
@@ -478,15 +471,16 @@ pub fn handle(
                 })
                 .unwrap_or(0);
             while !state.active_jobs.is_empty() {
-                coordinator::control_plane::monitor_active_jobs_native(
-                    &paths.root,
-                    &input.env_cfg,
-                    &mut state,
-                    max_attempts,
-                    phase_timeout,
-                    Some(&logger),
-                )
-                .await?;
+                engine
+                    .coordinator_monitor_active_jobs_native(
+                        &paths.root,
+                        &input.env_cfg,
+                        &mut state,
+                        max_attempts,
+                        phase_timeout,
+                        Some(&LoggerAdapter(&logger)),
+                    )
+                    .await?;
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
             }
             Result::<()>::Ok(())
@@ -528,14 +522,15 @@ pub fn handle(
             })?;
         let advance = runtime.block_on(async {
             let mut state = CoordinatorRunState::new();
-            coordinator::control_plane::advance_tasks_native(
-                &paths.root,
-                coordinator_tool_override.as_deref(),
-                phase_runner_max_attempts,
-                &mut state,
-                Some(&logger),
-            )
-            .await
+            engine
+                .coordinator_advance_tasks_native(
+                    &paths.root,
+                    coordinator_tool_override.as_deref(),
+                    phase_runner_max_attempts,
+                    &mut state,
+                    Some(&LoggerAdapter(&logger)),
+                )
+                .await
         })?;
         if let Some((task_id, reason)) = advance.blocked_merge {
             set_task_paused_for_integrate(&paths.root, &task_id, &reason)?;
@@ -587,12 +582,12 @@ pub fn handle(
             coordinator_engine::resolve_storage_mode(&input.env_cfg, coordinator_cfg.as_ref())?;
         if storage_mode != CoordinatorStorageMode::Json {
             let storage_paths = macc_core::ProjectPaths::from_root(&paths.root);
-            coordinator_storage_import_json_to_sqlite(&storage_paths)?;
+            engine.coordinator_storage_import_json_to_sqlite(&storage_paths)?;
         }
-        coordinator::control_plane::sync_registry_from_prd_native(
+        engine.coordinator_sync_registry_from_prd_with_logger(
             &paths.root,
             &prd_file,
-            Some(&logger),
+            Some(&LoggerAdapter(&logger)),
         )?;
         if storage_mode != CoordinatorStorageMode::Json {
             let storage_paths = macc_core::ProjectPaths::from_root(&paths.root);
@@ -606,7 +601,7 @@ pub fn handle(
                 })
                 .unwrap_or(false)
             {
-                coordinator_storage_export_sqlite_to_json(&storage_paths)?;
+                engine.coordinator_storage_export_sqlite_to_json(&storage_paths)?;
             }
         }
     } else if action == CoordinatorAction::Reconcile {
@@ -647,12 +642,18 @@ pub fn handle(
                 "Action 'status' does not accept extra args in native mode.".into(),
             ));
         }
-        print_status_summary_native(engine, &paths, &paths.root, &input.env_cfg, coordinator_cfg.as_ref())?;
+        print_status_summary_native(
+            engine,
+            &paths,
+            &paths.root,
+            &input.env_cfg,
+            coordinator_cfg.as_ref(),
+        )?;
     } else if action == CoordinatorAction::Unlock {
-        let (task_id, resource, clear_all, unlock_state) =
-            parse_unlock_args(&input.extra_args)?;
+        let (task_id, resource, clear_all, unlock_state) = parse_unlock_args(&input.extra_args)?;
         if let Some(task_id) = task_id {
             unlock_task_state_native(
+                engine,
                 &paths.root,
                 &input.env_cfg,
                 coordinator_cfg.as_ref(),
@@ -661,6 +662,7 @@ pub fn handle(
             )?;
         } else {
             unlock_resource_locks_native(
+                engine,
                 &paths.root,
                 &input.env_cfg,
                 coordinator_cfg.as_ref(),
@@ -671,6 +673,7 @@ pub fn handle(
         }
     } else if action == CoordinatorAction::RetryPhase {
         handle_retry_phase_native(
+            engine,
             &paths.root,
             &canonical,
             coordinator_cfg.as_ref(),
@@ -689,22 +692,6 @@ pub fn handle(
     Ok(())
 }
 
-fn ensure_coordinator_run_id() -> String {
-    if let Ok(existing) = std::env::var("COORDINATOR_RUN_ID") {
-        let trimmed = existing.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    let generated = format!(
-        "run-{}-{}",
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
-        std::process::id()
-    );
-    std::env::set_var("COORDINATOR_RUN_ID", &generated);
-    generated
-}
-
 fn parse_unlock_args(args: &[String]) -> Result<(Option<String>, Option<String>, bool, String)> {
     let mut task_id = None;
     let mut resource = None;
@@ -715,14 +702,18 @@ fn parse_unlock_args(args: &[String]) -> Result<(Option<String>, Option<String>,
         match args[i].as_str() {
             "--task" => {
                 if i + 1 >= args.len() {
-                    return Err(MaccError::Validation("unlock --task requires a value".into()));
+                    return Err(MaccError::Validation(
+                        "unlock --task requires a value".into(),
+                    ));
                 }
                 task_id = Some(args[i + 1].clone());
                 i += 2;
             }
             "--resource" => {
                 if i + 1 >= args.len() {
-                    return Err(MaccError::Validation("unlock --resource requires a value".into()));
+                    return Err(MaccError::Validation(
+                        "unlock --resource requires a value".into(),
+                    ));
                 }
                 resource = Some(args[i + 1].clone());
                 i += 2;
@@ -752,6 +743,7 @@ fn parse_unlock_args(args: &[String]) -> Result<(Option<String>, Option<String>,
 }
 
 fn unlock_task_state_native(
+    engine: &crate::services::engine_provider::SharedEngine,
     repo_root: &Path,
     env_cfg: &CoordinatorEnvConfig,
     coordinator_cfg: Option<&macc_core::config::CoordinatorConfig>,
@@ -763,12 +755,16 @@ fn unlock_task_state_native(
     args.insert("task-id".to_string(), task_id.to_string());
     args.insert("state".to_string(), unlock_state.to_string());
     args.insert("reason".to_string(), "manual_unlock".to_string());
-    coordinator::state::coordinator_state_apply_transition(repo_root, &args)?;
-    println!("Unlocked task {} via transition to {}", task_id, unlock_state);
+    engine.coordinator_state_apply_transition(repo_root, &args)?;
+    println!(
+        "Unlocked task {} via transition to {}",
+        task_id, unlock_state
+    );
     Ok(())
 }
 
 fn unlock_resource_locks_native(
+    engine: &crate::services::engine_provider::SharedEngine,
     repo_root: &Path,
     env_cfg: &CoordinatorEnvConfig,
     coordinator_cfg: Option<&macc_core::config::CoordinatorConfig>,
@@ -779,18 +775,13 @@ fn unlock_resource_locks_native(
     let mut args = std::collections::BTreeMap::new();
     apply_storage_mode_args(&mut args, env_cfg, coordinator_cfg);
     if clear_all {
-        let removed =
-            coordinator::state::coordinator_state_unlock_resource(repo_root, &args, None, true)?;
+        let removed = engine.coordinator_state_unlock_resource(repo_root, &args, None, true)?;
         println!("Cleared all resource locks ({})", removed);
         return Ok(());
     }
     if let Some(resource) = resource {
-        let removed = coordinator::state::coordinator_state_unlock_resource(
-            repo_root,
-            &args,
-            Some(&resource),
-            false,
-        )?;
+        let removed =
+            engine.coordinator_state_unlock_resource(repo_root, &args, Some(&resource), false)?;
         if removed == 0 {
             println!("Resource lock not found: {}", resource);
         } else {
@@ -862,6 +853,7 @@ fn print_status_summary_native(
 }
 
 fn handle_retry_phase_native(
+    engine: &crate::services::engine_provider::SharedEngine,
     repo_root: &Path,
     canonical: &macc_core::config::CanonicalConfig,
     coordinator_cfg: Option<&macc_core::config::CoordinatorConfig>,
@@ -871,7 +863,7 @@ fn handle_retry_phase_native(
     let (task_id, phase, skip) = parse_retry_phase_args(args)?;
     let mut state_args = std::collections::BTreeMap::new();
     apply_storage_mode_args(&mut state_args, env_cfg, coordinator_cfg);
-    let mut snapshot = coordinator::state::coordinator_state_snapshot(repo_root, &state_args)?;
+    let mut snapshot = engine.coordinator_state_snapshot(repo_root, &state_args)?;
     let tasks = snapshot
         .registry
         .get_mut("tasks")
@@ -891,25 +883,28 @@ fn handle_retry_phase_native(
 
     if skip {
         task["state"] = serde_json::Value::String("todo".to_string());
-        coordinator::state::reset_runtime_to_idle(task);
-        snapshot.registry["updated_at"] =
-            serde_json::Value::String(now_iso_coordinator());
-        coordinator::state::coordinator_state_save_snapshot(repo_root, &state_args, &snapshot)?;
-        println!("Skipped phase '{}' for task {}; task moved back to todo.", phase, task_id);
+        engine.coordinator_state_reset_runtime_to_idle(task);
+        snapshot.registry["updated_at"] = serde_json::Value::String(now_iso_coordinator());
+        engine.coordinator_state_save_snapshot(repo_root, &state_args, &snapshot)?;
+        println!(
+            "Skipped phase '{}' for task {}; task moved back to todo.",
+            phase, task_id
+        );
         return Ok(());
     }
 
     let mut retry_args = std::collections::BTreeMap::new();
     apply_storage_mode_args(&mut retry_args, env_cfg, coordinator_cfg);
     retry_args.insert("task-id".to_string(), task_id.clone());
-    coordinator::state::coordinator_state_increment_retries(repo_root, &retry_args)?;
+    engine.coordinator_state_increment_retries(repo_root, &retry_args)?;
 
     match phase.as_str() {
         "dev" => {
-            retry_dev_phase_native(repo_root, canonical, env_cfg, task_id.as_str())?;
+            retry_dev_phase_native(engine, repo_root, canonical, env_cfg, task_id.as_str())?;
             return Ok(());
         }
         "review" | "fix" | "integrate" => retry_tool_phase_native(
+            engine,
             repo_root,
             canonical,
             coordinator_cfg,
@@ -926,7 +921,7 @@ fn handle_retry_phase_native(
         }
     }
 
-    coordinator::state::coordinator_state_save_snapshot(repo_root, &state_args, &snapshot)?;
+    engine.coordinator_state_save_snapshot(repo_root, &state_args, &snapshot)?;
     Ok(())
 }
 
@@ -967,16 +962,15 @@ fn parse_retry_phase_args(args: &[String]) -> Result<(String, String, bool)> {
             }
         }
     }
-    let task_id = task_id.ok_or_else(|| {
-        MaccError::Validation("retry-phase requires --retry-task".into())
-    })?;
-    let phase = phase.ok_or_else(|| {
-        MaccError::Validation("retry-phase requires --retry-phase".into())
-    })?;
+    let task_id =
+        task_id.ok_or_else(|| MaccError::Validation("retry-phase requires --retry-task".into()))?;
+    let phase =
+        phase.ok_or_else(|| MaccError::Validation("retry-phase requires --retry-phase".into()))?;
     Ok((task_id, phase, skip))
 }
 
 fn retry_dev_phase_native(
+    engine: &crate::services::engine_provider::SharedEngine,
     repo_root: &Path,
     canonical: &macc_core::config::CanonicalConfig,
     env_cfg: &CoordinatorEnvConfig,
@@ -1002,12 +996,14 @@ fn retry_dev_phase_native(
     let task = registry
         .get("tasks")
         .and_then(serde_json::Value::as_array)
-        .and_then(|tasks| tasks.iter().find(|t| {
-            t.get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(|id| id == task_id)
-                .unwrap_or(false)
-        }))
+        .and_then(|tasks| {
+            tasks.iter().find(|t| {
+                t.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|id| id == task_id)
+                    .unwrap_or(false)
+            })
+        })
         .ok_or_else(|| MaccError::Validation("Task missing for retry".into()))?;
     let worktree_path = task
         .get("worktree")
@@ -1016,8 +1012,12 @@ fn retry_dev_phase_native(
         .ok_or_else(|| MaccError::Validation("retry-phase requires worktree".into()))?;
     let worktree = std::path::PathBuf::from(worktree_path);
     let mut state = CoordinatorRunState::new();
-    let logger =
-        NativeCoordinatorLogger::new_with_flush(repo_root, "retry-phase", env_cfg.log_flush_lines, env_cfg.log_flush_ms)?;
+    let logger = NativeCoordinatorLogger::new_with_flush(
+        repo_root,
+        "retry-phase",
+        env_cfg.log_flush_lines,
+        env_cfg.log_flush_ms,
+    )?;
     println!("Coordinator log file: {}", logger.file.display());
     let current_exe = std::env::current_exe().map_err(|e| {
         MaccError::Validation(format!("Failed to resolve current executable path: {}", e))
@@ -1052,15 +1052,16 @@ fn retry_dev_phase_native(
         .map_err(|e| MaccError::Validation(format!("Failed to init tokio: {}", e)))?;
     runtime.block_on(async {
         while !state.active_jobs.is_empty() {
-            coordinator::control_plane::monitor_active_jobs_native(
-                repo_root,
-                env_cfg,
-                &mut state,
-                1,
-                env_cfg.stale_in_progress_seconds.unwrap_or(0),
-                Some(&logger),
-            )
-            .await?;
+            engine
+                .coordinator_monitor_active_jobs_native(
+                    repo_root,
+                    env_cfg,
+                    &mut state,
+                    1,
+                    env_cfg.stale_in_progress_seconds.unwrap_or(0),
+                    Some(&LoggerAdapter(&logger)),
+                )
+                .await?;
             tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         }
         Result::<()>::Ok(())
@@ -1070,6 +1071,7 @@ fn retry_dev_phase_native(
 }
 
 fn retry_tool_phase_native(
+    engine: &crate::services::engine_provider::SharedEngine,
     repo_root: &Path,
     canonical: &macc_core::config::CanonicalConfig,
     coordinator_cfg: Option<&macc_core::config::CoordinatorConfig>,
@@ -1082,12 +1084,14 @@ fn retry_tool_phase_native(
         .registry
         .get("tasks")
         .and_then(serde_json::Value::as_array)
-        .and_then(|tasks| tasks.iter().find(|t| {
-            t.get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(|id| id == task_id)
-                .unwrap_or(false)
-        }))
+        .and_then(|tasks| {
+            tasks.iter().find(|t| {
+                t.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|id| id == task_id)
+                    .unwrap_or(false)
+            })
+        })
         .ok_or_else(|| MaccError::Validation("Task missing for retry".into()))?
         .clone();
     let logger = build_native_logger(repo_root, "retry-phase", env_cfg, coordinator_cfg)?;
@@ -1102,12 +1106,12 @@ fn retry_tool_phase_native(
         .unwrap_or(1)
         .max(1);
     if phase == "review" {
-        let verdict = coordinator::control_plane::run_review_phase_for_task_native(
+        let verdict = engine.coordinator_run_review_phase_for_task_native(
             repo_root,
             &task,
             coordinator_tool_override.as_deref(),
             attempts,
-            Some(&logger),
+            Some(&LoggerAdapter(&logger)),
         )?;
         match verdict {
             Ok(v) => {
@@ -1129,13 +1133,13 @@ fn retry_tool_phase_native(
         }
         return Ok(());
     }
-    let result = coordinator::control_plane::run_phase_for_task_native(
+    let result = engine.coordinator_run_phase_for_task_native(
         repo_root,
         &task,
         phase,
         coordinator_tool_override.as_deref(),
         attempts,
-        Some(&logger),
+        Some(&LoggerAdapter(&logger)),
     )?;
     match result {
         Ok(_) => {
@@ -1214,7 +1218,10 @@ fn run_cutover_gate_native(repo_root: &Path) -> Result<()> {
         .join("coordinator")
         .join("events.jsonl");
     if !events_file.exists() {
-        println!("Cutover gate: no events file found at {}", events_file.display());
+        println!(
+            "Cutover gate: no events file found at {}",
+            events_file.display()
+        );
         return Ok(());
     }
     let window_events: usize = std::env::var("CUTOVER_GATE_WINDOW_EVENTS")

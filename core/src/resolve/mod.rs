@@ -262,11 +262,7 @@ pub fn resolve_fetch_units(
 
 fn collect_skill_ids(resolved: &ResolvedConfig) -> Vec<String> {
     let mut ids: Vec<String> = resolved.selections.skills.clone();
-    ids.extend(
-        crate::required_skills()
-            .iter()
-            .map(|id| (*id).to_string()),
-    );
+    ids.extend(crate::required_skills().iter().map(|id| (*id).to_string()));
 
     for value in resolved.tools.config.values() {
         ids.extend(read_string_list(value, "skills"));

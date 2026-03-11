@@ -1,4 +1,6 @@
-use crate::catalog::{McpCatalog, McpEntry, Selector, SkillEntry, SkillsCatalog, Source, SourceKind};
+use crate::catalog::{
+    McpCatalog, McpEntry, Selector, SkillEntry, SkillsCatalog, Source, SourceKind,
+};
 use crate::{is_required_skill, MaccError, ProjectPaths, Result};
 
 #[derive(Debug, Clone)]
@@ -115,7 +117,11 @@ pub fn build_mcp_entry(input: CatalogEntryInput) -> Result<McpEntry> {
     })
 }
 
-pub fn upsert_skill(paths: &ProjectPaths, catalog: &mut SkillsCatalog, entry: SkillEntry) -> Result<()> {
+pub fn upsert_skill(
+    paths: &ProjectPaths,
+    catalog: &mut SkillsCatalog,
+    entry: SkillEntry,
+) -> Result<()> {
     catalog.upsert_skill_entry(entry);
     catalog.save_atomically(paths, &paths.skills_catalog_path())
 }

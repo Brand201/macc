@@ -1,5 +1,5 @@
-use crate::commands::Command;
 use crate::commands::AppContext;
+use crate::commands::Command;
 use crate::CatalogCommands;
 use macc_core::catalog::{
     load_effective_mcp_catalog, load_effective_skills_catalog, McpCatalog, SkillsCatalog,
@@ -23,12 +23,12 @@ impl<'a> Command for CatalogCommand<'a> {
             CatalogCommands::Skills { skills_command } => match skills_command {
                 crate::CatalogSubCommands::List => {
                     let catalog = load_effective_skills_catalog(&paths)?;
-                    crate::services::catalog::list_skills(&catalog);
+                    crate::services::catalog::list_skills(&self.app.engine, &catalog);
                     Ok(())
                 }
                 crate::CatalogSubCommands::Search { query } => {
                     let catalog = load_effective_skills_catalog(&paths)?;
-                    crate::services::catalog::search_skills(&catalog, query);
+                    crate::services::catalog::search_skills(&self.app.engine, &catalog, query);
                     Ok(())
                 }
                 crate::CatalogSubCommands::Add {
@@ -44,6 +44,7 @@ impl<'a> Command for CatalogCommand<'a> {
                 } => {
                     let mut catalog = SkillsCatalog::load(&paths.skills_catalog_path())?;
                     crate::services::catalog::add_skill(
+                        &self.app.engine,
                         &paths,
                         &mut catalog,
                         id.clone(),
@@ -59,18 +60,23 @@ impl<'a> Command for CatalogCommand<'a> {
                 }
                 crate::CatalogSubCommands::Remove { id } => {
                     let mut catalog = SkillsCatalog::load(&paths.skills_catalog_path())?;
-                    crate::services::catalog::remove_skill(&paths, &mut catalog, id.clone())
+                    crate::services::catalog::remove_skill(
+                        &self.app.engine,
+                        &paths,
+                        &mut catalog,
+                        id.clone(),
+                    )
                 }
             },
             CatalogCommands::Mcp { mcp_command } => match mcp_command {
                 crate::CatalogSubCommands::List => {
                     let catalog = load_effective_mcp_catalog(&paths)?;
-                    crate::services::catalog::list_mcp(&catalog);
+                    crate::services::catalog::list_mcp(&self.app.engine, &catalog);
                     Ok(())
                 }
                 crate::CatalogSubCommands::Search { query } => {
                     let catalog = load_effective_mcp_catalog(&paths)?;
-                    crate::services::catalog::search_mcp(&catalog, query);
+                    crate::services::catalog::search_mcp(&self.app.engine, &catalog, query);
                     Ok(())
                 }
                 crate::CatalogSubCommands::Add {
@@ -86,6 +92,7 @@ impl<'a> Command for CatalogCommand<'a> {
                 } => {
                     let mut catalog = McpCatalog::load(&paths.mcp_catalog_path())?;
                     crate::services::catalog::add_mcp(
+                        &self.app.engine,
                         &paths,
                         &mut catalog,
                         id.clone(),
@@ -101,7 +108,12 @@ impl<'a> Command for CatalogCommand<'a> {
                 }
                 crate::CatalogSubCommands::Remove { id } => {
                     let mut catalog = McpCatalog::load(&paths.mcp_catalog_path())?;
-                    crate::services::catalog::remove_mcp(&paths, &mut catalog, id.clone())
+                    crate::services::catalog::remove_mcp(
+                        &self.app.engine,
+                        &paths,
+                        &mut catalog,
+                        id.clone(),
+                    )
                 }
             },
             CatalogCommands::ImportUrl {
@@ -112,6 +124,7 @@ impl<'a> Command for CatalogCommand<'a> {
                 description,
                 tags,
             } => crate::services::catalog::import_url(
+                &self.app.engine,
                 &paths,
                 kind,
                 id.clone(),

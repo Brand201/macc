@@ -1,5 +1,5 @@
-use crate::commands::Command;
 use crate::commands::AppContext;
+use crate::commands::Command;
 use macc_core::Result;
 
 pub struct MigrateCommand {
@@ -19,7 +19,10 @@ impl Command for MigrateCommand {
         let canonical = self.app.canonical_config()?;
 
         let (descriptors, diagnostics) = self.app.engine.list_tools(&paths);
-        crate::services::project::report_diagnostics(&diagnostics);
+        macc_core::service::project::report_diagnostics(
+            &diagnostics,
+            &crate::services::interaction::CliInteraction,
+        );
         let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
         let result = macc_core::migrate::migrate_with_known_tools(canonical, &allowed_tools);
 

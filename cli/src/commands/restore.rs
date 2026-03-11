@@ -1,5 +1,5 @@
-use crate::commands::Command;
 use crate::commands::AppContext;
+use crate::commands::Command;
 use macc_core::Result;
 pub struct RestoreCommand<'a> {
     app: AppContext,
@@ -19,7 +19,14 @@ impl<'a> RestoreCommand<'a> {
         dry_run: bool,
         yes: bool,
     ) -> Self {
-        Self { app, latest, user, backup, dry_run, yes }
+        Self {
+            app,
+            latest,
+            user,
+            backup,
+            dry_run,
+            yes,
+        }
     }
 }
 
@@ -32,6 +39,7 @@ impl<'a> Command for RestoreCommand<'a> {
             ));
         }
         crate::services::backups::restore(
+            &self.app.engine,
             &paths,
             self.user,
             self.backup,

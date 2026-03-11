@@ -43,7 +43,10 @@ fn parse_flag_kv_pairs(
             )));
         }
         let normalized = key.trim_start_matches("--");
-        if !allowed_keys.iter().any(|candidate| candidate == &normalized) {
+        if !allowed_keys
+            .iter()
+            .any(|candidate| candidate == &normalized)
+        {
             return Err(MaccError::Validation(format!(
                 "Unknown arg '{}'. Usage: {}",
                 key, usage
@@ -78,8 +81,7 @@ impl TryFrom<&[String]> for RuntimeTransitionArgs {
     type Error = MaccError;
 
     fn try_from(args: &[String]) -> std::result::Result<Self, Self::Error> {
-        let usage =
-            "macc coordinator validate-runtime-transition --from <status> --to <status>";
+        let usage = "macc coordinator validate-runtime-transition --from <status> --to <status>";
         let map = parse_flag_kv_pairs(args, usage, &["from", "to"])?;
         let from = map
             .get("from")

@@ -1,5 +1,5 @@
-use crate::coordinator::runtime as coordinator_runtime;
 use crate::coordinator::model::TaskRegistry;
+use crate::coordinator::runtime as coordinator_runtime;
 use crate::coordinator_storage::append_event_sqlite;
 use crate::{MaccError, Result};
 use std::collections::HashSet;
@@ -158,7 +158,10 @@ fn can_reuse_worktree_slot(registry: &serde_json::Value, worktree_path: &Path) -
     seen && all_merged
 }
 
-fn has_in_progress_or_queued_on_worktree(registry: &serde_json::Value, worktree_path: &Path) -> bool {
+fn has_in_progress_or_queued_on_worktree(
+    registry: &serde_json::Value,
+    worktree_path: &Path,
+) -> bool {
     if let Ok(typed) = TaskRegistry::from_value(registry) {
         return typed.has_in_progress_or_queued_on_worktree(&worktree_path.to_string_lossy());
     }
@@ -304,12 +307,14 @@ pub fn find_reusable_worktree_native(
             ));
             continue;
         }
-        let merge_head = crate::git::rev_parse_verify(&entry.path, "MERGE_HEAD")
-            .unwrap_or(false);
+        let merge_head = crate::git::rev_parse_verify(&entry.path, "MERGE_HEAD").unwrap_or(false);
         if merge_head {
             last_prepare_error = Some((
                 "merge_head_present".to_string(),
-                format!("worktree {} has unresolved MERGE_HEAD", entry.path.display()),
+                format!(
+                    "worktree {} has unresolved MERGE_HEAD",
+                    entry.path.display()
+                ),
             ));
             continue;
         }
@@ -381,7 +386,9 @@ pub fn find_reusable_worktree_native(
             ));
             continue;
         }
-        if !previous_branch.is_empty() && previous_branch != base_branch && previous_branch != branch
+        if !previous_branch.is_empty()
+            && previous_branch != base_branch
+            && previous_branch != branch
         {
             coordinator_runtime::report_branch_cleanup_outcome(
                 repo_root,
@@ -405,8 +412,8 @@ pub fn find_reusable_worktree_native(
         }
         let last_commit = crate::git::head_commit(&entry.path).unwrap_or_default();
 
-        let existing = crate::read_worktree_metadata(&entry.path)?.unwrap_or(
-            crate::WorktreeMetadata {
+        let existing =
+            crate::read_worktree_metadata(&entry.path)?.unwrap_or(crate::WorktreeMetadata {
                 id: entry
                     .path
                     .file_name()
@@ -418,8 +425,7 @@ pub fn find_reusable_worktree_native(
                 feature: None,
                 base: base_branch.to_string(),
                 branch: branch.clone(),
-            },
-        );
+            });
         let updated = crate::WorktreeMetadata {
             id: existing.id,
             tool: tool.to_string(),
@@ -429,13 +435,10 @@ pub fn find_reusable_worktree_native(
             branch: branch.clone(),
         };
         write_worktree_metadata_file(&entry.path, &updated)?;
-        return Ok((Some((
-            entry.path,
-            branch,
-            last_commit,
-            skipped_reset,
-            dirty_before,
-        )), None));
+        return Ok((
+            Some((entry.path, branch, last_commit, skipped_reset, dirty_before)),
+            None,
+        ));
     }
     Ok((None, last_prepare_error))
 }

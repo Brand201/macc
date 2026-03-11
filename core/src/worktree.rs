@@ -194,11 +194,7 @@ pub fn read_worktree_metadata(path: &Path) -> Result<Option<WorktreeMetadata>> {
     Ok(Some(metadata))
 }
 
-pub fn write_tool_json(
-    repo_root: &Path,
-    worktree_path: &Path,
-    tool_id: &str,
-) -> Result<PathBuf> {
+pub fn write_tool_json(repo_root: &Path, worktree_path: &Path, tool_id: &str) -> Result<PathBuf> {
     let search_paths = ToolSpecLoader::default_search_paths(repo_root);
     let loader = ToolSpecLoader::new(search_paths);
     let (specs, _) = loader.load_all_with_embedded();

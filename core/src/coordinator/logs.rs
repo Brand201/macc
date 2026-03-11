@@ -14,11 +14,13 @@ pub fn aggregate_performer_logs(repo_root: &Path) -> Result<usize> {
 pub async fn aggregate_performer_logs_async(repo_root: &Path) -> Result<usize> {
     let worktrees_root = repo_root.join(".macc").join("worktree");
     let target_root = repo_root.join(".macc").join("log").join("performer");
-    fs::create_dir_all(&target_root).await.map_err(|e| MaccError::Io {
-        path: target_root.to_string_lossy().into(),
-        action: "create performer log aggregation directory".into(),
-        source: e,
-    })?;
+    fs::create_dir_all(&target_root)
+        .await
+        .map_err(|e| MaccError::Io {
+            path: target_root.to_string_lossy().into(),
+            action: "create performer log aggregation directory".into(),
+            source: e,
+        })?;
 
     let mut entries = Vec::new();
     if !worktrees_root.exists() {
@@ -27,22 +29,33 @@ pub async fn aggregate_performer_logs_async(repo_root: &Path) -> Result<usize> {
     }
 
     let mut copied = 0usize;
-    let mut worktree_entries = fs::read_dir(&worktrees_root).await.map_err(|e| MaccError::Io {
-        path: worktrees_root.to_string_lossy().into(),
-        action: "read worktree root for performer logs".into(),
-        source: e,
-    })?;
-    while let Some(wt) = worktree_entries.next_entry().await.map_err(|e| MaccError::Io {
-        path: worktrees_root.to_string_lossy().into(),
-        action: "iterate worktree root for performer logs".into(),
-        source: e,
-    })? {
-        let wt_path = wt.path();
-        if !wt.file_type().await.map_err(|e| MaccError::Io {
-            path: wt_path.to_string_lossy().into(),
-            action: "read worktree entry type".into(),
+    let mut worktree_entries = fs::read_dir(&worktrees_root)
+        .await
+        .map_err(|e| MaccError::Io {
+            path: worktrees_root.to_string_lossy().into(),
+            action: "read worktree root for performer logs".into(),
             source: e,
-        })?.is_dir() {
+        })?;
+    while let Some(wt) = worktree_entries
+        .next_entry()
+        .await
+        .map_err(|e| MaccError::Io {
+            path: worktrees_root.to_string_lossy().into(),
+            action: "iterate worktree root for performer logs".into(),
+            source: e,
+        })?
+    {
+        let wt_path = wt.path();
+        if !wt
+            .file_type()
+            .await
+            .map_err(|e| MaccError::Io {
+                path: wt_path.to_string_lossy().into(),
+                action: "read worktree entry type".into(),
+                source: e,
+            })?
+            .is_dir()
+        {
             continue;
         }
         let wt_name = wt_path
@@ -54,11 +67,13 @@ pub async fn aggregate_performer_logs_async(repo_root: &Path) -> Result<usize> {
             continue;
         }
 
-        let mut log_entries = fs::read_dir(&performer_dir).await.map_err(|e| MaccError::Io {
-            path: performer_dir.to_string_lossy().into(),
-            action: "read performer worktree log dir".into(),
-            source: e,
-        })?;
+        let mut log_entries = fs::read_dir(&performer_dir)
+            .await
+            .map_err(|e| MaccError::Io {
+                path: performer_dir.to_string_lossy().into(),
+                action: "read performer worktree log dir".into(),
+                source: e,
+            })?;
         while let Some(file) = log_entries.next_entry().await.map_err(|e| MaccError::Io {
             path: performer_dir.to_string_lossy().into(),
             action: "iterate performer worktree log dir".into(),

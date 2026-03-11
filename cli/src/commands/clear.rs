@@ -1,5 +1,5 @@
-use crate::commands::Command;
 use crate::commands::AppContext;
+use crate::commands::Command;
 use macc_core::Result;
 pub struct ClearCommand {
     app: AppContext,
@@ -17,10 +17,10 @@ impl Command for ClearCommand {
         println!("This will:");
         println!("  1) Remove all non-root worktrees (equivalent to: macc worktree remove --all --force)");
         println!("  2) Remove MACC-managed files/directories in this project (macc clear)");
-        if !crate::services::project::confirm_yes_no("Continue [y/N]? ")? {
+        if !crate::confirm_yes_no("Continue [y/N]? ")? {
             return Err(macc_core::MaccError::Validation("Clear cancelled.".into()));
         }
-        let removed = crate::services::worktree::remove_all_worktrees(&paths.root, false)?;
+        let removed = macc_core::service::worktree::remove_all_worktrees(&paths.root, false)?;
         macc_core::prune_worktrees(&paths.root)?;
         println!("Removed worktrees: {}", removed);
         let report = macc_core::clear(&paths)?;

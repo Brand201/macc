@@ -13,6 +13,7 @@ pub mod packages;
 pub mod plan;
 pub mod resolve;
 pub mod security;
+pub mod service;
 pub mod skills;
 mod structured_merge;
 pub mod tool;
@@ -34,10 +35,9 @@ use thiserror::Error;
 pub use tool::{FieldKind, ToolAdapter, ToolDescriptor, ToolField, ToolRegistry};
 pub use user_backup::{find_user_home, UserBackupEntry, UserBackupManager, UserBackupReport};
 pub use worktree::{
-    collect_context_targets,
-    create_worktrees, current_worktree, list_worktrees, prune_worktrees, read_worktree_metadata,
-    remove_worktree, resolve_worktree_task_context, write_tool_json,
-    sync_context_files_from_root, ensure_performer, WorktreeCreateResult, WorktreeCreateSpec,
+    collect_context_targets, create_worktrees, current_worktree, ensure_performer, list_worktrees,
+    prune_worktrees, read_worktree_metadata, remove_worktree, resolve_worktree_task_context,
+    sync_context_files_from_root, write_tool_json, WorktreeCreateResult, WorktreeCreateSpec,
     WorktreeEntry, WorktreeMetadata,
 };
 
@@ -218,7 +218,6 @@ impl ProjectPaths {
     pub fn automation_coordinator_path(&self) -> PathBuf {
         self.automation_dir().join("coordinator.sh")
     }
-
 
     pub fn automation_merge_worker_path(&self) -> PathBuf {
         self.automation_dir().join("merge_worker.sh")

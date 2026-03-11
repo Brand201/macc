@@ -56,11 +56,7 @@ fn run_git_status(current_dir: &Path, args: &[&str], action: &str) -> Result<Exi
         })
 }
 
-pub fn run_git_output_mapped(
-    current_dir: &Path,
-    args: &[&str],
-    action: &str,
-) -> Result<Output> {
+pub fn run_git_output_mapped(current_dir: &Path, args: &[&str], action: &str) -> Result<Output> {
     run_git_output(current_dir, args, action)
 }
 
@@ -168,24 +164,17 @@ pub fn reset_hard(repo_or_worktree: &Path, target: &str) -> Result<bool> {
 }
 
 pub async fn reset_hard_async(repo_or_worktree: &Path, target: &str) -> Result<bool> {
-    Ok(
-        run_git_status_async(
-            repo_or_worktree,
-            &["reset", "--hard", target],
-            "run git reset --hard",
-        )
-        .await?
-        .success(),
+    Ok(run_git_status_async(
+        repo_or_worktree,
+        &["reset", "--hard", target],
+        "run git reset --hard",
     )
+    .await?
+    .success())
 }
 
 pub fn clean_fd(repo_or_worktree: &Path) -> Result<bool> {
-    Ok(run_git_status(
-        repo_or_worktree,
-        &["clean", "-fd"],
-        "run git clean -fd",
-    )?
-    .success())
+    Ok(run_git_status(repo_or_worktree, &["clean", "-fd"], "run git clean -fd")?.success())
 }
 
 pub async fn clean_fd_async(repo_or_worktree: &Path) -> Result<bool> {
@@ -292,25 +281,25 @@ pub fn current_branch(repo_or_worktree: &Path) -> Result<String> {
 }
 
 pub fn rev_parse_verify(repo_or_worktree: &Path, reference: &str) -> Result<bool> {
-    Ok(
-        run_git_status(
-            repo_or_worktree,
-            &["rev-parse", "--verify", reference],
-            "run git rev-parse --verify",
-        )?
-        .success(),
-    )
+    Ok(run_git_status(
+        repo_or_worktree,
+        &["rev-parse", "--verify", reference],
+        "run git rev-parse --verify",
+    )?
+    .success())
 }
 
-pub fn merge_base_is_ancestor(repo_or_worktree: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
-    Ok(
-        run_git_status(
-            repo_or_worktree,
-            &["merge-base", "--is-ancestor", ancestor, descendant],
-            "run git merge-base --is-ancestor",
-        )?
-        .success(),
-    )
+pub fn merge_base_is_ancestor(
+    repo_or_worktree: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool> {
+    Ok(run_git_status(
+        repo_or_worktree,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        "run git merge-base --is-ancestor",
+    )?
+    .success())
 }
 
 pub fn checkout_new_branch_from_base(
@@ -318,26 +307,22 @@ pub fn checkout_new_branch_from_base(
     branch: &str,
     base_branch: &str,
 ) -> Result<bool> {
-    Ok(
-        run_git_status(
-            repo_or_worktree,
-            &["checkout", "-B", branch, base_branch],
-            "create branch from base",
-        )?
-        .success(),
-    )
+    Ok(run_git_status(
+        repo_or_worktree,
+        &["checkout", "-B", branch, base_branch],
+        "create branch from base",
+    )?
+    .success())
 }
 
 pub async fn merge_ff_only_async(repo_or_worktree: &Path, reference: &str) -> Result<bool> {
-    Ok(
-        run_git_status_async(
-            repo_or_worktree,
-            &["merge", "--ff-only", reference],
-            "run git merge --ff-only",
-        )
-        .await?
-        .success(),
+    Ok(run_git_status_async(
+        repo_or_worktree,
+        &["merge", "--ff-only", reference],
+        "run git merge --ff-only",
     )
+    .await?
+    .success())
 }
 
 pub async fn head_commit_async(repo_or_worktree: &Path) -> Result<String> {

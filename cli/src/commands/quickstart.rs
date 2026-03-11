@@ -1,5 +1,5 @@
-use crate::commands::Command;
 use crate::commands::AppContext;
+use crate::commands::Command;
 use macc_core::Result;
 
 pub struct QuickstartCommand {
@@ -10,12 +10,7 @@ pub struct QuickstartCommand {
 }
 
 impl QuickstartCommand {
-    pub fn new(
-        app: AppContext,
-        yes: bool,
-        apply: bool,
-        no_tui: bool,
-    ) -> Self {
+    pub fn new(app: AppContext, yes: bool, apply: bool, no_tui: bool) -> Self {
         Self {
             app,
             yes,
@@ -27,11 +22,6 @@ impl QuickstartCommand {
 
 impl Command for QuickstartCommand {
     fn run(&self) -> Result<()> {
-        crate::services::lifecycle::quickstart(
-            &self.app,
-            self.yes,
-            self.apply,
-            self.no_tui,
-        )
+        crate::services::lifecycle::quickstart(&self.app, self.yes, self.apply, self.no_tui)
     }
 }

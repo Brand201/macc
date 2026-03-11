@@ -1,5 +1,5 @@
-use crate::commands::Command;
 use crate::commands::AppContext;
+use crate::commands::Command;
 use macc_core::Result;
 
 pub struct ContextCommand<'a> {
@@ -18,7 +18,13 @@ impl<'a> ContextCommand<'a> {
         dry_run: bool,
         print_prompt: bool,
     ) -> Self {
-        Self { app, tool, from_files, dry_run, print_prompt }
+        Self {
+            app,
+            tool,
+            from_files,
+            dry_run,
+            print_prompt,
+        }
     }
 }
 

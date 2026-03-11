@@ -1177,7 +1177,11 @@ pub async fn run_native_control_plane(
         .prd
         .as_ref()
         .map(PathBuf::from)
-        .or_else(|| coordinator.and_then(|c| c.prd_file.clone()).map(PathBuf::from))
+        .or_else(|| {
+            coordinator
+                .and_then(|c| c.prd_file.clone())
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| repo_root.join("prd.json"));
     if !prd_file.exists() {
         return Err(MaccError::Validation(format!(

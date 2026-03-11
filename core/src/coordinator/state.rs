@@ -1,11 +1,10 @@
 use crate::coordinator_storage::{
-    coordinator_storage_export_sqlite_to_json,
+    apply_transition_sqlite_with_event, coordinator_storage_export_sqlite_to_json,
     increment_retries_sqlite, set_merge_pending_sqlite, set_merge_processed_sqlite,
-    upsert_slo_warning_sqlite, CoordinatorSnapshot, CoordinatorStorage, CoordinatorStorageMode,
-    CoordinatorStoragePaths, EventMutation, JsonStorage, MergePendingMutation,
-    MergeProcessedMutation, RetryIncrementMutation, RuntimeMutation, SloWarningMutation,
-    SqliteStorage, TransitionMutation, apply_transition_sqlite_with_event,
-    set_runtime_sqlite_with_event,
+    set_runtime_sqlite_with_event, upsert_slo_warning_sqlite, CoordinatorSnapshot,
+    CoordinatorStorage, CoordinatorStorageMode, CoordinatorStoragePaths, EventMutation,
+    JsonStorage, MergePendingMutation, MergeProcessedMutation, RetryIncrementMutation,
+    RuntimeMutation, SloWarningMutation, SqliteStorage, TransitionMutation,
 };
 use crate::{MaccError, ProjectPaths, Result};
 use serde_json::{json, Value};
@@ -397,7 +396,11 @@ pub fn coordinator_state_unlock_resource(
         locks.clear();
         count
     } else if let Some(name) = resource {
-        if locks.remove(name).is_some() { 1 } else { 0 }
+        if locks.remove(name).is_some() {
+            1
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -746,8 +749,7 @@ fn mirror_json_debounce_ms(args: &BTreeMap<String, String>) -> u64 {
         .unwrap_or(0)
 }
 
-fn mirror_export_guard(
-) -> &'static Mutex<std::collections::HashMap<std::path::PathBuf, Instant>> {
+fn mirror_export_guard() -> &'static Mutex<std::collections::HashMap<std::path::PathBuf, Instant>> {
     static LAST_EXPORT: OnceLock<Mutex<std::collections::HashMap<std::path::PathBuf, Instant>>> =
         OnceLock::new();
     LAST_EXPORT.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
@@ -792,9 +794,9 @@ fn load_snapshot_view(
             let sqlite = SqliteStorage::new(store_paths.clone()).load_snapshot();
             match sqlite {
                 Ok(snapshot) => Ok(snapshot),
-                Err(sql_err) if allow_legacy_json_fallback(args) => {
-                    JsonStorage::new(store_paths).load_snapshot().or(Err(sql_err))
-                }
+                Err(sql_err) if allow_legacy_json_fallback(args) => JsonStorage::new(store_paths)
+                    .load_snapshot()
+                    .or(Err(sql_err)),
                 Err(sql_err) => Err(sql_err),
             }
         }
@@ -905,9 +907,8 @@ fn parse_optional_event_mutation(
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "coordinator:native:state".to_string());
     let payload = match args.get("event-payload-json").cloned() {
-        Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<Value>(&raw).map_err(|e| {
-            MaccError::Validation(format!("Invalid --event-payload-json: {}", e))
-        })?,
+        Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<Value>(&raw)
+            .map_err(|e| MaccError::Validation(format!("Invalid --event-payload-json: {}", e)))?,
         _ => {
             let msg = args.get("event-message").cloned().unwrap_or_default();
             if msg.is_empty() {

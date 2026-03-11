@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use commands::Command;
 use macc_core::coordinator::{
-    is_valid_runtime_transition, is_valid_workflow_transition,
-    runtime as coordinator_runtime, runtime_status_from_event,
+    is_valid_runtime_transition, is_valid_workflow_transition, runtime as coordinator_runtime,
+    runtime_status_from_event,
 };
 #[cfg(test)]
 use macc_core::coordinator::{RuntimeStatus, WorkflowState};
@@ -10,9 +10,10 @@ use macc_core::coordinator_storage::{
     coordinator_storage_export_sqlite_to_json, coordinator_storage_import_json_to_sqlite,
     coordinator_storage_verify_parity, CoordinatorStorageTransfer,
 };
-use macc_core::engine::{Engine, MaccEngine};
-use macc_core::resolve::{resolve, resolve_fetch_units, CliOverrides};
+use macc_core::engine::MaccEngine;
 use macc_core::tool::{ToolPerformerSpec, ToolSpec, ToolSpecLoader};
+#[cfg(test)]
+use macc_core::Engine;
 use macc_core::{load_canonical_config, MaccError, Result};
 use std::process::exit;
 use tracing::{debug, error, info};
@@ -23,13 +24,13 @@ mod services;
 #[cfg(test)]
 mod test_support;
 
+#[cfg(test)]
+use crate::coordinator::state_runtime::{cleanup_registry_native, reconcile_registry_native};
 use macc_core::coordinator::args::{
     parse_coordinator_extra_kv_args, RuntimeStatusFromEventArgs, RuntimeTransitionArgs,
     StorageSyncArgs, WorkflowTransitionArgs,
 };
 use macc_core::coordinator::types::CoordinatorEnvConfig;
-#[cfg(test)]
-use crate::coordinator::state_runtime::{cleanup_registry_native, reconcile_registry_native};
 
 #[derive(Parser)]
 #[command(name = "macc")]
@@ -640,16 +641,11 @@ fn run_with_engine_provider(
     let app = commands::AppContext::new(absolute_cwd.clone(), engine.clone());
 
     match &cli.command {
-        Some(Commands::Init { force, wizard }) =>
-            commands::init::InitCommand::new(app.clone(), *force, *wizard).run(),
+        Some(Commands::Init { force, wizard }) => {
+            commands::init::InitCommand::new(app.clone(), *force, *wizard).run()
+        }
         Some(Commands::Quickstart { yes, apply, no_tui }) => {
-            commands::quickstart::QuickstartCommand::new(
-                app.clone(),
-                *yes,
-                *apply,
-                *no_tui,
-            )
-            .run()
+            commands::quickstart::QuickstartCommand::new(app.clone(), *yes, *apply, *no_tui).run()
         }
         Some(Commands::Plan {
             tools,
@@ -674,13 +670,11 @@ fn run_with_engine_provider(
         Some(Commands::Catalog { catalog_command }) => {
             commands::catalog::CatalogCommand::new(app.clone(), catalog_command).run()
         }
-        Some(Commands::Install { install_command }) => commands::install::InstallCommand::new(
-            app.clone(),
-            install_command,
-        )
-        .run(),
+        Some(Commands::Install { install_command }) => {
+            commands::install::InstallCommand::new(app.clone(), install_command).run()
+        }
         Some(Commands::Tui) => {
-            let paths = services::project::ensure_initialized_paths(&absolute_cwd)?;
+            let paths = engine.project_ensure_initialized_paths(&absolute_cwd)?;
             std::env::set_current_dir(&paths.root).map_err(|e| MaccError::Io {
                 path: paths.root.to_string_lossy().into(),
                 action: "set current_dir for tui".into(),
@@ -695,16 +689,19 @@ fn run_with_engine_provider(
         Some(Commands::Tool { tool_command }) => {
             commands::tool::ToolCommand::new(app.clone(), tool_command).run()
         }
-        Some(Commands::Context { tool, from_files, dry_run, print_prompt }) => {
-            commands::context::ContextCommand::new(
-                app.clone(),
-                tool.as_deref(),
-                from_files,
-                *dry_run,
-                *print_prompt,
-            )
-            .run()
-        }
+        Some(Commands::Context {
+            tool,
+            from_files,
+            dry_run,
+            print_prompt,
+        }) => commands::context::ContextCommand::new(
+            app.clone(),
+            tool.as_deref(),
+            from_files,
+            *dry_run,
+            *print_prompt,
+        )
+        .run(),
         Some(Commands::Doctor { fix }) => {
             commands::doctor::DoctorCommand::new(app.clone(), *fix).run()
         }
@@ -714,17 +711,21 @@ fn run_with_engine_provider(
         Some(Commands::Backups { backups_command }) => {
             commands::backups::BackupsCommand::new(app.clone(), backups_command).run()
         }
-        Some(Commands::Restore { latest, user, backup, dry_run, yes }) => {
-            commands::restore::RestoreCommand::new(
-                app.clone(),
-                *latest,
-                *user,
-                backup.as_deref(),
-                *dry_run,
-                *yes,
-            )
-            .run()
-        }
+        Some(Commands::Restore {
+            latest,
+            user,
+            backup,
+            dry_run,
+            yes,
+        }) => commands::restore::RestoreCommand::new(
+            app.clone(),
+            *latest,
+            *user,
+            backup.as_deref(),
+            *dry_run,
+            *yes,
+        )
+        .run(),
         Some(Commands::Clear) => commands::clear::ClearCommand::new(app.clone()).run(),
         Some(Commands::Worktree { worktree_command }) => {
             commands::worktree::WorktreeCommand::new(app.clone(), worktree_command).run()
@@ -794,7 +795,7 @@ fn run_with_engine_provider(
         )
         .run(),
         None => {
-            let paths = services::project::ensure_initialized_paths(&absolute_cwd)?;
+            let paths = engine.project_ensure_initialized_paths(&absolute_cwd)?;
             std::env::set_current_dir(&paths.root).map_err(|e| MaccError::Io {
                 path: paths.root.to_string_lossy().into(),
                 action: "set current_dir for tui".into(),
@@ -808,7 +809,6 @@ fn run_with_engine_provider(
         }
     }
 }
-
 
 #[cfg(test)]
 pub(crate) const COORDINATOR_TASK_REGISTRY_REL_PATH: &str =
@@ -897,14 +897,18 @@ impl NativeCoordinatorLogger {
         use std::io::Write as _;
         let line = format!("{}\n", msg.as_ref());
         tracing::info!(target: "macc.coordinator.log", "{}", msg.as_ref());
-        let mut state = self.state.lock().map_err(|_| {
-            MaccError::Validation("Coordinator logger lock poisoned".to_string())
-        })?;
-        state.writer.write_all(line.as_bytes()).map_err(|e| MaccError::Io {
-            path: self.file.to_string_lossy().into(),
-            action: "append coordinator log".into(),
-            source: e,
-        })?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MaccError::Validation("Coordinator logger lock poisoned".to_string()))?;
+        state
+            .writer
+            .write_all(line.as_bytes())
+            .map_err(|e| MaccError::Io {
+                path: self.file.to_string_lossy().into(),
+                action: "append coordinator log".into(),
+                source: e,
+            })?;
         state.pending_lines += 1;
         let should_flush = state.pending_lines >= self.flush_every_lines
             || state.last_flush.elapsed() >= self.flush_every_interval;
@@ -1369,7 +1373,6 @@ fn run_coordinator_action_with_options(
     Ok(())
 }
 
-
 #[cfg(test)]
 fn coordinator_action_hint(action: &str) -> &'static str {
     match action {
@@ -1486,7 +1489,9 @@ fn run_coordinator_full_cycle(
     let started = std::time::Instant::now();
 
     for cycle in 1..=max_cycles {
-        coordinator::control_plane::sync_registry_from_prd_native(repo_root, &prd_file, None)?;
+        macc_core::coordinator::control_plane::sync_registry_from_prd_native(
+            repo_root, &prd_file, None,
+        )?;
 
         let before = read_registry_counts(&registry_path)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1496,7 +1501,7 @@ fn run_coordinator_full_cycle(
             .map_err(|e| MaccError::Validation(format!("Failed to init tokio runtime: {}", e)))?;
         runtime.block_on(async {
             let mut state = CoordinatorRunState::new();
-            let _ = coordinator::control_plane::dispatch_ready_tasks_native(
+            let _ = macc_core::coordinator::control_plane::dispatch_ready_tasks_native(
                 repo_root,
                 canonical,
                 coordinator,
@@ -1516,7 +1521,7 @@ fn run_coordinator_full_cycle(
                 .or_else(|| coordinator.and_then(|c| c.stale_in_progress_seconds))
                 .unwrap_or(0);
             while !state.active_jobs.is_empty() {
-                coordinator::control_plane::monitor_active_jobs_native(
+                macc_core::coordinator::control_plane::monitor_active_jobs_native(
                     repo_root,
                     env_cfg,
                     &mut state,
@@ -1527,7 +1532,7 @@ fn run_coordinator_full_cycle(
                 .await?;
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
             }
-            let advance = coordinator::control_plane::advance_tasks_native(
+            let advance = macc_core::coordinator::control_plane::advance_tasks_native(
                 repo_root,
                 env_cfg.coordinator_tool.as_deref(),
                 max_attempts,
@@ -1543,9 +1548,7 @@ fn run_coordinator_full_cycle(
             }
             while !state.active_merge_jobs.is_empty() {
                 let _ = macc_core::coordinator::control_plane::monitor_merge_jobs_native(
-                    repo_root,
-                    &mut state,
-                    None,
+                    repo_root, &mut state, None,
                 )
                 .await?;
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -1555,7 +1558,9 @@ fn run_coordinator_full_cycle(
 
         reconcile_registry_native(repo_root)?;
         cleanup_registry_native(repo_root)?;
-        coordinator::control_plane::sync_registry_from_prd_native(repo_root, &prd_file, None)?;
+        macc_core::coordinator::control_plane::sync_registry_from_prd_native(
+            repo_root, &prd_file, None,
+        )?;
         let after = read_registry_counts(&registry_path)?;
 
         println!(
@@ -1738,7 +1743,7 @@ pub(crate) fn remove_all_worktrees(root: &std::path::Path, remove_branches: bool
         let branch = entry.branch.clone();
         macc_core::remove_worktree(root, &entry.path, true)?;
         if remove_branches {
-            services::worktree::delete_branch(root, branch.as_deref(), true)?;
+            macc_core::service::worktree::delete_branch(root, branch.as_deref(), true)?;
         }
         removed += 1;
     }
@@ -1757,7 +1762,10 @@ pub(crate) fn run_context_generation(
     let canonical = load_canonical_config(&paths.config_path)?;
     let loader = ToolSpecLoader::new(ToolSpecLoader::default_search_paths(&paths.root));
     let (specs, diagnostics) = loader.load_all_with_embedded();
-    services::project::report_diagnostics(&diagnostics);
+    macc_core::service::project::report_diagnostics(
+        &diagnostics,
+        &crate::services::interaction::CliInteraction,
+    );
 
     let selected_tools: Vec<String> = if let Some(tool_id) = tool_filter {
         vec![tool_id.to_string()]
@@ -1995,7 +2003,9 @@ fn build_context_prompt(
     );
     prompt.push_str("7. Synthesis: produce a context file that is immediately usable.\n\n");
 
-    prompt.push_str("Mandatory skill-routing section (must be present in the generated context file)\n");
+    prompt.push_str(
+        "Mandatory skill-routing section (must be present in the generated context file)\n",
+    );
     prompt.push_str("Add a dedicated `# Project Mandates` section and keep it deterministic.\n");
     prompt.push_str("Separate clearly:\n");
     prompt.push_str("- Global mandates (always valid)\n");
@@ -2484,42 +2494,15 @@ fn confirm_user_scope_apply(
     Ok(())
 }
 
-fn apply_worktree(
-    engine: &dyn Engine,
-    repo_root: &std::path::Path,
-    worktree_root: &std::path::Path,
-    allow_user_scope: bool,
-) -> Result<()> {
-    let paths = macc_core::ProjectPaths::from_root(worktree_root);
-    let canonical = load_canonical_config(&paths.config_path)?;
-    let metadata = macc_core::read_worktree_metadata(worktree_root)?
-        .ok_or_else(|| MaccError::Validation("Missing .macc/worktree.json".into()))?;
-
-    let (descriptors, diagnostics) = engine.list_tools(&paths);
-    services::project::report_diagnostics(&diagnostics);
-    let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
-    let overrides = CliOverrides::from_tools_csv(metadata.tool.as_str(), &allowed_tools)?;
-
-    let resolved = resolve(&canonical, &overrides);
-    let fetch_units = resolve_fetch_units(&paths, &resolved)?;
-    let materialized_units =
-        macc_adapter_shared::fetch::materialize_fetch_units(&paths, fetch_units)?;
-
-    let mut plan = engine.plan(&paths, &canonical, &materialized_units, &overrides)?;
-    let _ = engine.apply(&paths, &mut plan, allow_user_scope)?;
-    macc_core::sync_context_files_from_root(repo_root, worktree_root, &canonical)?;
-    Ok(())
-}
-
 // ... existing catalog functions (run_remote_search, list_skills, etc) ...
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::tooling::{extract_version_token, run_version_command};
     use crate::test_support::run_git_ok;
-    use macc_core::{MaccError, McpCatalog, SkillsCatalog};
+    use macc_core::service::tooling::{extract_version_token, run_version_command};
     use macc_core::TestEngine;
+    use macc_core::{MaccError, McpCatalog, SkillsCatalog};
     use std::fs;
     use std::io;
     use std::net::TcpListener;
@@ -2713,7 +2696,9 @@ mod tests {
     #[test]
     fn test_parse_coordinator_storage_sync_args() {
         let args = vec!["--direction".to_string(), "import".to_string()];
-        let direction = StorageSyncArgs::try_from(args.as_slice()).unwrap().direction;
+        let direction = StorageSyncArgs::try_from(args.as_slice())
+            .unwrap()
+            .direction;
         assert_eq!(direction, CoordinatorStorageTransfer::ImportJsonToSqlite);
     }
 
@@ -3050,7 +3035,7 @@ mod tests {
         };
 
         let err = run_coordinator_full_cycle(&root, &canonical, Some(&coordinator_cfg), &env_cfg)
-        .expect_err("stalling coordinator should fail");
+            .expect_err("stalling coordinator should fail");
         let msg = err.to_string();
         assert!(
             msg.contains("no progress"),
@@ -3115,7 +3100,9 @@ mod tests {
                 .enable_time()
                 .enable_io()
                 .build()
-                .map_err(|e| MaccError::Validation(format!("Failed to initialize tokio runtime: {}", e)))?;
+                .map_err(|e| {
+                    MaccError::Validation(format!("Failed to initialize tokio runtime: {}", e))
+                })?;
             runtime.block_on(macc_core::coordinator::engine::run_native_control_plane(
                 root,
                 &canonical,
@@ -3905,7 +3892,10 @@ fi
         .unwrap();
 
         run_git_ok(&mcp_source_dir, &["init", "-b", "main"]);
-        run_git_ok(&mcp_source_dir, &["config", "user.email", "test@example.com"]);
+        run_git_ok(
+            &mcp_source_dir,
+            &["config", "user.email", "test@example.com"],
+        );
         run_git_ok(&mcp_source_dir, &["config", "user.name", "Test"]);
         run_git_ok(&mcp_source_dir, &["add", "."]);
         run_git_ok(&mcp_source_dir, &["commit", "-m", "initial"]);
