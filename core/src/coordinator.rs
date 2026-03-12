@@ -116,6 +116,7 @@ pub enum RuntimeStatus {
     Idle,
     Dispatched,
     Running,
+    WaitingForUser,
     PhaseDone,
     Failed,
     Stale,
@@ -128,6 +129,7 @@ impl RuntimeStatus {
             RuntimeStatus::Idle => "idle",
             RuntimeStatus::Dispatched => "dispatched",
             RuntimeStatus::Running => "running",
+            RuntimeStatus::WaitingForUser => "waiting_for_user",
             RuntimeStatus::PhaseDone => "phase_done",
             RuntimeStatus::Failed => "failed",
             RuntimeStatus::Stale => "stale",
@@ -144,6 +146,7 @@ impl FromStr for RuntimeStatus {
             "idle" => Ok(RuntimeStatus::Idle),
             "dispatched" => Ok(RuntimeStatus::Dispatched),
             "running" => Ok(RuntimeStatus::Running),
+            "waiting_for_user" => Ok(RuntimeStatus::WaitingForUser),
             "phase_done" => Ok(RuntimeStatus::PhaseDone),
             "failed" => Ok(RuntimeStatus::Failed),
             "stale" => Ok(RuntimeStatus::Stale),
@@ -198,6 +201,11 @@ pub fn is_valid_runtime_transition(from: RuntimeStatus, to: RuntimeStatus) -> bo
             | (RuntimeStatus::Running, RuntimeStatus::Failed)
             | (RuntimeStatus::Running, RuntimeStatus::Stale)
             | (RuntimeStatus::Running, RuntimeStatus::Paused)
+            | (RuntimeStatus::Running, RuntimeStatus::WaitingForUser)
+            | (RuntimeStatus::WaitingForUser, RuntimeStatus::Running)
+            | (RuntimeStatus::WaitingForUser, RuntimeStatus::Failed)
+            | (RuntimeStatus::WaitingForUser, RuntimeStatus::Paused)
+            | (RuntimeStatus::WaitingForUser, RuntimeStatus::Idle)
             | (RuntimeStatus::PhaseDone, RuntimeStatus::Running)
             | (RuntimeStatus::PhaseDone, RuntimeStatus::Idle)
             | (RuntimeStatus::PhaseDone, RuntimeStatus::Failed)
@@ -220,6 +228,7 @@ pub fn runtime_status_from_event(event_type: &str, status: &str) -> RuntimeStatu
     match status_norm.as_str() {
         "started" | "dispatched" => RuntimeStatus::Dispatched,
         "running" | "progress" | "heartbeat" => RuntimeStatus::Running,
+        "waiting_for_user" | "input_required" => RuntimeStatus::WaitingForUser,
         "done" | "phase_done" => RuntimeStatus::PhaseDone,
         "failed" | "error" => RuntimeStatus::Failed,
         "stale" => RuntimeStatus::Stale,
@@ -227,6 +236,7 @@ pub fn runtime_status_from_event(event_type: &str, status: &str) -> RuntimeStatu
         _ => match event_norm.as_str() {
             "started" => RuntimeStatus::Dispatched,
             "progress" | "heartbeat" => RuntimeStatus::Running,
+            "input_required" => RuntimeStatus::WaitingForUser,
             "phase_result" => RuntimeStatus::Running,
             "failed" => RuntimeStatus::Failed,
             _ => RuntimeStatus::Running,
@@ -303,6 +313,10 @@ mod tests {
         assert_eq!(
             runtime_status_from_event("heartbeat", "running"),
             RuntimeStatus::Running
+        );
+        assert_eq!(
+            runtime_status_from_event("input_required", "waiting_for_user"),
+            RuntimeStatus::WaitingForUser
         );
         assert_eq!(
             runtime_status_from_event("phase_result", "phase_done"),
