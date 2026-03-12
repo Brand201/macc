@@ -12,6 +12,12 @@ pub trait WorktreeFetchMaterializer {
     ) -> Result<Vec<crate::resolve::MaterializedFetchUnit>>;
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WorktreeSetupOptions {
+    pub skip_apply: bool,
+    pub allow_user_scope: bool,
+}
+
 pub fn coordinator_task_registry_path(root: &Path) -> PathBuf {
     crate::domain::worktree::coordinator_task_registry_path(root)
 }
@@ -94,4 +100,79 @@ pub fn apply_worktree(
     let _ = engine.apply(&paths, &mut plan, allow_user_scope)?;
     crate::sync_context_files_from_root(repo_root, worktree_root, &canonical)?;
     Ok(())
+}
+
+pub fn apply_all_worktrees(
+    engine: &(impl Engine + ?Sized),
+    fetch_materializer: &dyn WorktreeFetchMaterializer,
+    repo_root: &Path,
+    allow_user_scope: bool,
+) -> Result<usize> {
+    let entries = crate::list_worktrees(repo_root)?;
+    let root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut applied = 0usize;
+    for entry in entries {
+        if entry.path == root {
+            continue;
+        }
+        apply_worktree(
+            engine,
+            fetch_materializer,
+            repo_root,
+            &entry.path,
+            allow_user_scope,
+        )?;
+        applied += 1;
+    }
+    Ok(applied)
+}
+
+pub fn setup_worktrees_workflow(
+    engine: &(impl Engine + ?Sized),
+    fetch_materializer: &dyn WorktreeFetchMaterializer,
+    repo_root: &Path,
+    spec: &crate::WorktreeCreateSpec,
+    options: WorktreeSetupOptions,
+) -> Result<Vec<crate::WorktreeCreateResult>> {
+    let repo_paths = crate::ProjectPaths::from_root(repo_root);
+    let canonical = load_canonical_config(&repo_paths.config_path)?;
+    let yaml = canonical.to_yaml().map_err(|e| {
+        MaccError::Validation(format!("Failed to serialize config for worktree: {}", e))
+    })?;
+
+    let created = crate::create_worktrees(repo_root, spec)?;
+    for entry in &created {
+        let worktree_paths = crate::ProjectPaths::from_root(&entry.path);
+        crate::init(&worktree_paths, false)?;
+        crate::atomic_write(
+            &worktree_paths,
+            &worktree_paths.config_path,
+            yaml.as_bytes(),
+        )?;
+
+        let tool_id = crate::read_worktree_metadata(&entry.path)?
+            .and_then(|m| {
+                if m.tool.is_empty() {
+                    None
+                } else {
+                    Some(m.tool)
+                }
+            })
+            .unwrap_or_else(|| spec.tool.clone());
+        write_tool_json(repo_root, &entry.path, &tool_id)?;
+
+        if !options.skip_apply {
+            apply_worktree(
+                engine,
+                fetch_materializer,
+                repo_root,
+                &entry.path,
+                options.allow_user_scope,
+            )?;
+        }
+    }
+
+    Ok(created)
 }

@@ -37,6 +37,26 @@ pub enum CoordinatorManagedPoll {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatorManagedActionState {
+    Idle,
+    Running {
+        action: String,
+        elapsed_secs: u64,
+    },
+    Succeeded {
+        action: String,
+        elapsed_secs: u64,
+    },
+    Failed {
+        action: String,
+        elapsed_secs: u64,
+        reason: String,
+        task_id: Option<String>,
+        phase: Option<String>,
+    },
+}
+
 struct ManagedCoordinatorProcess {
     child: Child,
 }
@@ -132,6 +152,53 @@ pub fn coordinator_poll_managed_action_process(
                 success,
                 code,
                 elapsed_secs,
+            })
+        }
+    }
+}
+
+pub fn coordinator_poll_managed_action_state(
+    paths: &ProjectPaths,
+) -> Result<CoordinatorManagedActionState> {
+    match coordinator_poll_managed_action_process(paths)? {
+        CoordinatorManagedPoll::Idle => Ok(CoordinatorManagedActionState::Idle),
+        CoordinatorManagedPoll::Running {
+            action,
+            elapsed_secs,
+        } => Ok(CoordinatorManagedActionState::Running {
+            action,
+            elapsed_secs,
+        }),
+        CoordinatorManagedPoll::Exited {
+            action,
+            success,
+            code,
+            elapsed_secs,
+        } => {
+            if success {
+                return Ok(CoordinatorManagedActionState::Succeeded {
+                    action,
+                    elapsed_secs,
+                });
+            }
+            let failure = crate::service::diagnostic::analyze_last_failure(paths)?;
+            let reason = failure
+                .as_ref()
+                .map(|f| f.message.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "Coordinator '{}' failed ({})",
+                        action,
+                        code.map(|v| format!("exit status: {}", v))
+                            .unwrap_or_else(|| "unknown exit status".to_string())
+                    )
+                });
+            Ok(CoordinatorManagedActionState::Failed {
+                action,
+                elapsed_secs,
+                reason,
+                task_id: failure.as_ref().and_then(|f| f.task_id.clone()),
+                phase: failure.as_ref().and_then(|f| f.phase.clone()),
             })
         }
     }

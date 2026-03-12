@@ -8,6 +8,7 @@ pub mod diagnostic;
 pub mod interaction;
 pub mod lifecycle;
 pub mod logs;
+pub mod migrate;
 pub mod project;
 pub mod task_runner;
 pub mod tooling;

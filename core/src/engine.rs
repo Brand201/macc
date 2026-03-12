@@ -148,6 +148,17 @@ pub trait Engine {
         crate::service::project::run_doctor(paths, self, fix, interaction)
     }
 
+    fn migrate_project(
+        &self,
+        paths: &ProjectPaths,
+        canonical: crate::config::CanonicalConfig,
+        allowed_tools: &[String],
+        apply: bool,
+        ui: &dyn crate::service::interaction::InteractionHandler,
+    ) -> Result<crate::service::migrate::MigrateOutcome> {
+        crate::service::migrate::migrate_project(paths, canonical, allowed_tools, apply, ui)
+    }
+
     fn project_ensure_coordinator_run_id(&self) -> String {
         crate::service::project::ensure_coordinator_run_id()
     }
@@ -165,6 +176,36 @@ pub trait Engine {
             repo_root,
             worktree_root,
             allow_user_scope,
+        )
+    }
+
+    fn worktree_apply_all(
+        &self,
+        fetch_materializer: &dyn crate::service::worktree::WorktreeFetchMaterializer,
+        repo_root: &Path,
+        allow_user_scope: bool,
+    ) -> Result<usize> {
+        crate::service::worktree::apply_all_worktrees(
+            self,
+            fetch_materializer,
+            repo_root,
+            allow_user_scope,
+        )
+    }
+
+    fn worktree_setup_workflow(
+        &self,
+        fetch_materializer: &dyn crate::service::worktree::WorktreeFetchMaterializer,
+        repo_root: &Path,
+        spec: &crate::WorktreeCreateSpec,
+        options: crate::service::worktree::WorktreeSetupOptions,
+    ) -> Result<Vec<crate::WorktreeCreateResult>> {
+        crate::service::worktree::setup_worktrees_workflow(
+            self,
+            fetch_materializer,
+            repo_root,
+            spec,
+            options,
         )
     }
 
@@ -414,6 +455,9 @@ pub trait Engine {
         worktree_filter: Option<&str>,
         task_filter: Option<&str>,
     ) -> Result<std::path::PathBuf> {
+        if component.eq_ignore_ascii_case("all") || component.eq_ignore_ascii_case("performer") {
+            let _ = self.coordinator_aggregate_performer_logs(&paths.root);
+        }
         crate::service::logs::select_log_file(paths, component, worktree_filter, task_filter)
     }
 
@@ -447,6 +491,9 @@ pub trait Engine {
         component: &str,
         worktree_filter: Option<&str>,
     ) -> Result<String> {
+        if component.eq_ignore_ascii_case("all") || component.eq_ignore_ascii_case("performer") {
+            let _ = self.coordinator_aggregate_performer_logs(&paths.root);
+        }
         crate::service::logs::read_log_content(paths, component, worktree_filter, None)
     }
 
@@ -525,6 +572,13 @@ pub trait Engine {
         paths: &ProjectPaths,
     ) -> Result<crate::service::coordinator::CoordinatorManagedPoll> {
         crate::service::coordinator::coordinator_poll_managed_action_process(paths)
+    }
+
+    fn coordinator_poll_managed_action_state(
+        &self,
+        paths: &ProjectPaths,
+    ) -> Result<crate::service::coordinator::CoordinatorManagedActionState> {
+        crate::service::coordinator::coordinator_poll_managed_action_state(paths)
     }
 
     fn coordinator_stop_managed_action_process(

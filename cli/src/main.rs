@@ -1244,6 +1244,37 @@ mod tests {
     }
 
     #[test]
+    fn test_tui_has_no_direct_process_management() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let tui_src = manifest_dir.join("../tui/src");
+        let patterns = [
+            "std::process::Child",
+            "std::process::Command",
+            "tokio::process::Child",
+            "tokio::process::Command",
+        ];
+
+        let mut files = Vec::new();
+        collect_rs_files(&tui_src, &mut files);
+
+        let mut violations = Vec::new();
+        for file in files {
+            let Ok(content) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            if patterns.iter().any(|p| content.contains(p)) {
+                violations.push(file.display().to_string());
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "Direct process management in TUI detected; route via Engine coordinator/task-runner APIs instead: {:?}",
+            violations
+        );
+    }
+
+    #[test]
     fn test_parse_coordinator_validate_transition_args() {
         let args = vec![
             "--from".to_string(),

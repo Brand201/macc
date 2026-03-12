@@ -10,7 +10,7 @@ use macc_core::doctor::ToolCheck;
 use macc_core::engine::CoordinatorEvent;
 use macc_core::plan::{render_diff, ActionPlan, DiffView, PlannedOp, Scope};
 use macc_core::resolve::{resolve, resolve_fetch_units, CliOverrides};
-use macc_core::service::coordinator::CoordinatorManagedPoll;
+use macc_core::service::coordinator::CoordinatorManagedActionState;
 use macc_core::tool::{ActionKind, FieldDefault, FieldKind, ToolDescriptor, ToolField};
 use macc_core::{find_project_root, Engine, ProjectPaths};
 use serde_json::{Map, Value};
@@ -122,12 +122,6 @@ pub struct CoordinatorActiveTask {
 enum CoordinatorPauseNextAction {
     RetryPhaseAndRun,
     ResumeRun,
-}
-
-struct CoordinatorFailureContext {
-    message: String,
-    task_id: Option<String>,
-    phase: Option<String>,
 }
 
 pub struct AppState {
@@ -1134,43 +1128,6 @@ impl AppState {
         self.coordinator_paused
     }
 
-    #[cfg(test)]
-    fn is_blocking_failure_event(event: &str, status: &str, severity: &str) -> bool {
-        let normalized_severity = if severity.is_empty() {
-            if matches!(event, "command_error" | "task_blocked" | "failed")
-                || (event == "phase_result" && matches!(status, "failed" | "error"))
-            {
-                "blocking"
-            } else {
-                "info"
-            }
-        } else {
-            severity
-        };
-        normalized_severity.eq_ignore_ascii_case("blocking")
-            && (matches!(
-                event,
-                "command_error" | "task_blocked" | "failed" | "phase_result"
-            ) || matches!(status, "failed" | "error"))
-    }
-
-    fn parse_coordinator_failure_context(&self) -> Option<CoordinatorFailureContext> {
-        let paths = self.project_paths.as_ref()?;
-        let report = self.engine.analyze_last_failure(paths).ok()??;
-        Some(CoordinatorFailureContext {
-            message: report.message,
-            task_id: report.task_id,
-            phase: report.phase,
-        })
-    }
-
-    fn parse_retry_context_from_diagnostic(&self) -> Option<(String, String)> {
-        let context = self.parse_coordinator_failure_context()?;
-        let task_id = context.task_id?;
-        let phase = context.phase.unwrap_or_else(|| "dev".to_string());
-        Some((task_id, phase))
-    }
-
     pub fn retry_after_coordinator_pause(&mut self) {
         let Some(task_id) = self.coordinator_pause_task_id.clone() else {
             self.resume_after_coordinator_pause();
@@ -1297,63 +1254,59 @@ impl AppState {
         let mut finished_message: Option<(UiStatusLevel, String)> = None;
         let mut post_success_action: Option<CoordinatorPauseNextAction> = None;
         if let Some(paths) = self.project_paths.as_ref() {
-            match self.engine.coordinator_poll_managed_action_process(paths) {
-                Ok(CoordinatorManagedPoll::Exited {
+            match self.engine.coordinator_poll_managed_action_state(paths) {
+                Ok(CoordinatorManagedActionState::Succeeded {
                     action,
-                    success,
-                    code,
                     elapsed_secs: elapsed,
                 }) => {
-                    if success {
-                        finished_message = Some((
-                            UiStatusLevel::Success,
-                            format!(
-                                "Coordinator '{}' finished in {}.",
-                                action,
-                                format_hms(elapsed)
-                            ),
-                        ));
-                        post_success_action = self.coordinator_pause_next_action.take();
-                        self.coordinator_pause_error = None;
-                        self.coordinator_pause_action = None;
+                    finished_message = Some((
+                        UiStatusLevel::Success,
+                        format!(
+                            "Coordinator '{}' finished in {}.",
+                            action,
+                            format_hms(elapsed)
+                        ),
+                    ));
+                    post_success_action = self.coordinator_pause_next_action.take();
+                    self.coordinator_pause_error = None;
+                    self.coordinator_pause_action = None;
+                    self.coordinator_pause_task_id = None;
+                    self.coordinator_pause_phase = None;
+                    self.coordinator_last_result = Some(
+                        finished_message
+                            .as_ref()
+                            .map(|(_, msg)| msg.clone())
+                            .unwrap_or_default(),
+                    );
+                    self.coordinator_running_action = None;
+                    self.coordinator_running_elapsed_secs = None;
+                    self.refresh_coordinator_snapshot();
+                    self.refresh_coordinator_events();
+                }
+                Ok(CoordinatorManagedActionState::Failed {
+                    action,
+                    elapsed_secs: elapsed,
+                    reason,
+                    task_id,
+                    phase,
+                }) => {
+                    let msg = format!(
+                        "Coordinator '{}' failed in {}.\n\nCause: {}",
+                        action,
+                        format_hms(elapsed),
+                        reason.trim()
+                    );
+                    finished_message = Some((UiStatusLevel::Error, msg.clone()));
+                    self.coordinator_pause_error = Some(msg);
+                    self.coordinator_pause_action = Some(action);
+                    self.coordinator_pause_next_action = None;
+                    if let Some(task_id) = task_id {
+                        self.coordinator_pause_task_id = Some(task_id);
+                        self.coordinator_pause_phase =
+                            Some(phase.unwrap_or_else(|| "dev".to_string()));
+                    } else {
                         self.coordinator_pause_task_id = None;
                         self.coordinator_pause_phase = None;
-                    } else {
-                        let status_text = code
-                            .map(|v| format!("exit status: {}", v))
-                            .unwrap_or_else(|| "unknown exit status".to_string());
-                        let mut msg = format!(
-                            "Coordinator '{}' failed in {} (status {}).",
-                            action,
-                            format_hms(elapsed),
-                            status_text
-                        );
-                        let mut task_phase: Option<(String, String)> = None;
-                        if let Some(context) = self.parse_coordinator_failure_context() {
-                            if !context.message.trim().is_empty() {
-                                msg = format!("{}\n\nCause: {}", msg, context.message.trim());
-                            }
-                            if let Some(task_id) = context.task_id {
-                                task_phase = Some((
-                                    task_id,
-                                    context.phase.unwrap_or_else(|| "dev".to_string()),
-                                ));
-                            }
-                        }
-                        if task_phase.is_none() {
-                            task_phase = self.parse_retry_context_from_diagnostic();
-                        }
-                        finished_message = Some((UiStatusLevel::Error, msg.clone()));
-                        self.coordinator_pause_error = Some(msg);
-                        self.coordinator_pause_action = Some(action);
-                        self.coordinator_pause_next_action = None;
-                        if let Some((task_id, phase)) = task_phase {
-                            self.coordinator_pause_task_id = Some(task_id);
-                            self.coordinator_pause_phase = Some(phase);
-                        } else {
-                            self.coordinator_pause_task_id = None;
-                            self.coordinator_pause_phase = None;
-                        }
                     }
                     self.coordinator_last_result = Some(
                         finished_message
@@ -1366,7 +1319,7 @@ impl AppState {
                     self.refresh_coordinator_snapshot();
                     self.refresh_coordinator_events();
                 }
-                Ok(CoordinatorManagedPoll::Running {
+                Ok(CoordinatorManagedActionState::Running {
                     action,
                     elapsed_secs,
                 }) => {
@@ -1381,7 +1334,7 @@ impl AppState {
                         self.refresh_coordinator_events();
                     }
                 }
-                Ok(CoordinatorManagedPoll::Idle) => {
+                Ok(CoordinatorManagedActionState::Idle) => {
                     self.coordinator_running_action = None;
                     self.coordinator_running_elapsed_secs = None;
                 }
@@ -3594,12 +3547,12 @@ mod tests {
 
     #[test]
     fn test_non_blocking_failed_event_does_not_trigger_pause_context() {
-        assert!(!AppState::is_blocking_failure_event(
+        assert!(!macc_core::service::diagnostic::is_blocking_failure_event(
             "branch_cleanup",
             "failed",
             "warning"
         ));
-        assert!(!AppState::is_blocking_failure_event(
+        assert!(!macc_core::service::diagnostic::is_blocking_failure_event(
             "branch_cleanup",
             "failed",
             "info"
@@ -3608,13 +3561,15 @@ mod tests {
 
     #[test]
     fn test_blocking_failed_event_triggers_pause_context() {
-        assert!(AppState::is_blocking_failure_event(
+        assert!(macc_core::service::diagnostic::is_blocking_failure_event(
             "phase_result",
             "failed",
             "blocking"
         ));
         // Backward compatibility when severity is missing.
-        assert!(AppState::is_blocking_failure_event("failed", "failed", ""));
+        assert!(macc_core::service::diagnostic::is_blocking_failure_event(
+            "failed", "failed", ""
+        ));
     }
 
     #[test]

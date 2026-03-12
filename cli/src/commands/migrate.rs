@@ -1,5 +1,6 @@
 use crate::commands::AppContext;
 use crate::commands::Command;
+use crate::services::interaction::CliInteraction;
 use macc_core::Result;
 
 pub struct MigrateCommand {
@@ -19,12 +20,15 @@ impl Command for MigrateCommand {
         let canonical = self.app.canonical_config()?;
 
         let (descriptors, diagnostics) = self.app.engine.list_tools(&paths);
-        macc_core::service::project::report_diagnostics(
-            &diagnostics,
-            &crate::services::interaction::CliInteraction,
-        );
+        macc_core::service::project::report_diagnostics(&diagnostics, &CliInteraction);
         let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
-        let result = macc_core::migrate::migrate_with_known_tools(canonical, &allowed_tools);
+        let result = self.app.engine.migrate_project(
+            &paths,
+            canonical,
+            &allowed_tools,
+            self.apply,
+            &CliInteraction,
+        )?;
 
         if result.warnings.is_empty() {
             println!("No legacy configuration found. Your config is up to date.");
@@ -36,23 +40,20 @@ impl Command for MigrateCommand {
             println!("  - {}", warning);
         }
 
-        if self.apply {
-            let yaml = result.config.to_yaml().map_err(|e| {
-                macc_core::MaccError::Validation(format!(
-                    "Failed to serialize migrated config: {}",
-                    e
-                ))
-            })?;
-            macc_core::atomic_write(&paths, &paths.config_path, yaml.as_bytes())?;
+        if result.wrote_config {
             println!(
                 "\nMigrated configuration written to {}",
                 paths.config_path.display()
             );
         } else {
-            println!("\nDry-run: use --apply to write the migrated configuration to disk.");
+            println!(
+                "\nMigration not written. Use --apply to force write, or confirm when prompted."
+            );
             println!("Preview of migrated config:");
             println!("---");
-            println!("{}", result.config.to_yaml().unwrap());
+            if let Some(preview) = result.preview_yaml {
+                println!("{}", preview);
+            }
             println!("---");
         }
 

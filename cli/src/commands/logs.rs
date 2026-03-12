@@ -32,14 +32,6 @@ impl<'a> Command for LogsCommand<'a> {
                 lines,
                 follow,
             } => {
-                if component.eq_ignore_ascii_case("all")
-                    || component.eq_ignore_ascii_case("performer")
-                {
-                    let _ = self
-                        .app
-                        .engine
-                        .coordinator_aggregate_performer_logs(&paths.root);
-                }
                 let file = self.app.engine.logs_select_file(
                     &paths,
                     component.as_str(),

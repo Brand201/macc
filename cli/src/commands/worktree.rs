@@ -40,7 +40,6 @@ impl<'a> Command for WorktreeCommand<'a> {
                 allow_user_scope,
             } => {
                 let paths = self.app.project_paths()?;
-                let canonical = self.app.canonical_config()?;
 
                 let spec = macc_core::WorktreeCreateSpec {
                     slug: slug.clone(),
@@ -51,57 +50,15 @@ impl<'a> Command for WorktreeCommand<'a> {
                     scope: scope.clone(),
                     feature: feature.clone(),
                 };
-                let created = macc_core::create_worktrees(&paths.root, &spec)?;
-
-                let (descriptors, diagnostics) = self.app.engine.list_tools(&paths);
-                macc_core::service::project::report_diagnostics(
-                    &diagnostics,
-                    &crate::services::interaction::CliInteraction,
-                );
-                let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
-                let overrides = macc_core::resolve::CliOverrides::from_tools_csv(
-                    tool.as_str(),
-                    &allowed_tools,
+                let created = self.app.engine.worktree_setup_workflow(
+                    &CliFetchMaterializer,
+                    &paths.root,
+                    &spec,
+                    macc_core::service::worktree::WorktreeSetupOptions {
+                        skip_apply: *skip_apply,
+                        allow_user_scope: *allow_user_scope,
+                    },
                 )?;
-
-                let yaml = canonical.to_yaml().map_err(|e| {
-                    macc_core::MaccError::Validation(format!(
-                        "Failed to serialize config for worktree: {}",
-                        e
-                    ))
-                })?;
-
-                for entry in &created {
-                    let worktree_paths = macc_core::ProjectPaths::from_root(&entry.path);
-                    macc_core::init(&worktree_paths, false)?;
-                    macc_core::atomic_write(
-                        &worktree_paths,
-                        &worktree_paths.config_path,
-                        yaml.as_bytes(),
-                    )?;
-                    macc_core::service::worktree::write_tool_json(&paths.root, &entry.path, tool)?;
-
-                    if !*skip_apply {
-                        let resolved = macc_core::resolve::resolve(&canonical, &overrides);
-                        let fetch_units =
-                            macc_core::resolve::resolve_fetch_units(&worktree_paths, &resolved)?;
-                        let materialized_units =
-                            macc_adapter_shared::fetch::materialize_fetch_units(
-                                &worktree_paths,
-                                fetch_units,
-                            )?;
-                        let mut plan = self.app.engine.plan(
-                            &worktree_paths,
-                            &canonical,
-                            &materialized_units,
-                            &overrides,
-                        )?;
-                        let _ =
-                            self.app
-                                .engine
-                                .apply(&worktree_paths, &mut plan, *allow_user_scope)?;
-                    }
-                }
 
                 println!("Created {} worktree(s):", created.len());
                 for entry in created {
@@ -248,21 +205,11 @@ impl<'a> Command for WorktreeCommand<'a> {
             } => {
                 let paths = self.app.project_paths()?;
                 if *all {
-                    let entries = macc_core::list_worktrees(&paths.root)?;
-                    let root = paths.root.canonicalize().unwrap_or(paths.root.clone());
-                    let mut applied = 0;
-                    for entry in entries {
-                        if entry.path == root {
-                            continue;
-                        }
-                        self.app.engine.worktree_apply(
-                            &CliFetchMaterializer,
-                            &paths.root,
-                            &entry.path,
-                            *allow_user_scope,
-                        )?;
-                        applied += 1;
-                    }
+                    let applied = self.app.engine.worktree_apply_all(
+                        &CliFetchMaterializer,
+                        &paths.root,
+                        *allow_user_scope,
+                    )?;
                     println!("Applied {} worktree(s).", applied);
                     return Ok(());
                 }

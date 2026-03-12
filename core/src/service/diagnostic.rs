@@ -171,7 +171,7 @@ fn infer_phase_from_status(status: &str) -> Option<String> {
     }
 }
 
-fn is_blocking_failure_event(event: &str, status: &str, severity: &str) -> bool {
+pub fn is_blocking_failure_event(event: &str, status: &str, severity: &str) -> bool {
     let normalized_severity = if severity.is_empty() {
         if matches!(event, "command_error" | "task_blocked" | "failed")
             || (event == "phase_result" && matches!(status, "failed" | "error"))
