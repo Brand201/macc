@@ -50,7 +50,7 @@ impl<'a> Command for WorktreeCommand<'a> {
                     scope: scope.clone(),
                     feature: feature.clone(),
                 };
-                let created = self.app.engine.worktree_setup_workflow(
+                let created = self.app.engine.setup_worktree_workflow(
                     &CliFetchMaterializer,
                     &paths.root,
                     &spec,

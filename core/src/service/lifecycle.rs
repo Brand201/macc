@@ -205,14 +205,14 @@ pub fn quickstart(
             "No .git directory found in {}.",
             paths.root.display()
         ));
-        if !assume_yes && !ui.confirm_yes_no("Continue anyway [y/N]? ")? {
+        if !assume_yes && !ui.confirm("Continue anyway [y/N]? ")? {
             return Err(MaccError::Validation("Quickstart cancelled.".into()));
         }
     }
 
     if !paths.macc_dir.exists() && !assume_yes {
         ui.info(".macc/ was not found in this project.");
-        if !ui.confirm_yes_no("Run 'macc init' now [y/N]? ")? {
+        if !ui.confirm("Run 'macc init' now [y/N]? ")? {
             return Err(MaccError::Validation(
                 "Quickstart requires initialization. Cancelled.".into(),
             ));
@@ -262,7 +262,7 @@ fn run_plan_then_optional_apply(
         plan.actions.len()
     ));
 
-    if !assume_yes && !ui.confirm_yes_no("Apply this plan now [y/N]? ")? {
+    if !assume_yes && !ui.confirm("Apply this plan now [y/N]? ")? {
         ui.info("Plan generated only. Run 'macc apply' when ready.");
         return Ok(());
     }

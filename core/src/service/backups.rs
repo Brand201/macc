@@ -74,7 +74,7 @@ pub fn restore(
         return Ok(());
     }
 
-    if !yes && !ui.confirm_yes_no("Proceed with restore [y/N]? ")? {
+    if !yes && !ui.confirm("Proceed with restore [y/N]? ")? {
         return Err(MaccError::Validation("Restore cancelled.".into()));
     }
 

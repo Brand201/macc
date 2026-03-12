@@ -24,7 +24,7 @@ pub fn migrate_project(
     let mut wrote_config = false;
     let mut preview_yaml = None;
 
-    if apply || ui.confirm_yes_no("Write migrated configuration to disk now [y/N]? ")? {
+    if apply || ui.confirm("Write migrated configuration to disk now [y/N]? ")? {
         let yaml = result.config.to_yaml().map_err(|e| {
             MaccError::Validation(format!("Failed to serialize migrated config: {}", e))
         })?;

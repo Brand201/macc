@@ -209,6 +209,22 @@ pub trait Engine {
         )
     }
 
+    fn setup_worktree_workflow(
+        &self,
+        fetch_materializer: &dyn crate::service::worktree::WorktreeFetchMaterializer,
+        repo_root: &Path,
+        spec: &crate::WorktreeCreateSpec,
+        options: crate::service::worktree::WorktreeSetupOptions,
+    ) -> Result<Vec<crate::WorktreeCreateResult>> {
+        crate::service::worktree::setup_worktree_workflow(
+            self,
+            fetch_materializer,
+            repo_root,
+            spec,
+            options,
+        )
+    }
+
     fn worktree_run_task(&self, paths: &ProjectPaths, id: &str) -> Result<()> {
         crate::service::task_runner::worktree_run_task(paths, id)
     }

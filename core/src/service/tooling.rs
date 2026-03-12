@@ -113,7 +113,7 @@ pub fn install_tool(
     });
     if !assume_yes {
         reporter.info(&confirm_message);
-        if !reporter.confirm_yes_no("Proceed [y/N]? ")? {
+        if !reporter.confirm("Proceed [y/N]? ")? {
             return Err(MaccError::Validation("Installation cancelled.".into()));
         }
     }
@@ -543,7 +543,7 @@ fn update_single_tool(
                 spec.display_name
             )
         }));
-        if !reporter.confirm_yes_no("Proceed [y/N]? ")? {
+        if !reporter.confirm("Proceed [y/N]? ")? {
             return Err(MaccError::Validation("Update cancelled.".into()));
         }
     }

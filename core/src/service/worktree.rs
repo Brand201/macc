@@ -176,3 +176,13 @@ pub fn setup_worktrees_workflow(
 
     Ok(created)
 }
+
+pub fn setup_worktree_workflow(
+    engine: &(impl Engine + ?Sized),
+    fetch_materializer: &dyn WorktreeFetchMaterializer,
+    repo_root: &Path,
+    spec: &crate::WorktreeCreateSpec,
+    options: WorktreeSetupOptions,
+) -> Result<Vec<crate::WorktreeCreateResult>> {
+    setup_worktrees_workflow(engine, fetch_materializer, repo_root, spec, options)
+}

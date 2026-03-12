@@ -18,7 +18,7 @@ pub fn clear_project(
     );
     ui.info("  2) Remove MACC-managed files/directories in this project (macc clear)");
 
-    if !force && !ui.confirm_yes_no("Continue [y/N]? ")? {
+    if !force && !ui.confirm("Continue [y/N]? ")? {
         return Err(MaccError::Validation("Clear cancelled.".into()));
     }
 
