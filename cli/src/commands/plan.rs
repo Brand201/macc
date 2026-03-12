@@ -22,6 +22,11 @@ impl PlanCommand {
 
 impl Command for PlanCommand {
     fn run(&self) -> Result<()> {
-        crate::services::lifecycle::plan(&self.app, self.tools.as_deref(), self.json, self.explain)
+        crate::commands::lifecycle_support::plan(
+            &self.app,
+            self.tools.as_deref(),
+            self.json,
+            self.explain,
+        )
     }
 }

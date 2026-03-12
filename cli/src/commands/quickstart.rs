@@ -22,6 +22,6 @@ impl QuickstartCommand {
 
 impl Command for QuickstartCommand {
     fn run(&self) -> Result<()> {
-        crate::services::lifecycle::quickstart(&self.app, self.yes, self.apply, self.no_tui)
+        crate::commands::lifecycle_support::quickstart(&self.app, self.yes, self.apply, self.no_tui)
     }
 }

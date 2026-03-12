@@ -1,3 +1,4 @@
+use crate::commands::catalog_support::{CliCatalogInstallBackend, CliCatalogUi};
 use crate::commands::AppContext;
 use crate::commands::Command;
 use crate::InstallCommands;
@@ -17,12 +18,17 @@ impl<'a> InstallCommand<'a> {
 impl<'a> Command for InstallCommand<'a> {
     fn run(&self) -> Result<()> {
         let paths = self.app.project_paths()?;
+        let backend = CliCatalogInstallBackend { app: &self.app };
         match self.command {
             InstallCommands::Skill { tool, id } => {
-                crate::services::catalog::install_skill(&paths, tool, id, &self.app.engine)
+                self.app
+                    .engine
+                    .catalog_install_skill(&paths, tool, id, &backend, &CliCatalogUi)
             }
             InstallCommands::Mcp { id } => {
-                crate::services::catalog::install_mcp(&paths, id, &self.app.engine)
+                self.app
+                    .engine
+                    .catalog_install_mcp(&paths, id, &backend, &CliCatalogUi)
             }
         }
     }

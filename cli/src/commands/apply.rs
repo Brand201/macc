@@ -33,7 +33,7 @@ impl ApplyCommand {
 
 impl Command for ApplyCommand {
     fn run(&self) -> Result<()> {
-        crate::services::lifecycle::apply(
+        crate::commands::lifecycle_support::apply(
             &self.app,
             self.tools.as_deref(),
             self.dry_run,

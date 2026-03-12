@@ -16,6 +16,6 @@ impl InitCommand {
 
 impl Command for InitCommand {
     fn run(&self) -> Result<()> {
-        crate::services::lifecycle::init(&self.app, self.force, self.wizard)
+        crate::commands::lifecycle_support::init(&self.app, self.force, self.wizard)
     }
 }

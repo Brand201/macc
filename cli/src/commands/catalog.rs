@@ -1,3 +1,7 @@
+use crate::commands::catalog_support::{
+    list_mcp, list_skills, search_mcp, search_skills, CliCatalogUi, CliCatalogUrlParser,
+    CliRemoteSearchProvider,
+};
 use crate::commands::AppContext;
 use crate::commands::Command;
 use crate::CatalogCommands;
@@ -23,12 +27,12 @@ impl<'a> Command for CatalogCommand<'a> {
             CatalogCommands::Skills { skills_command } => match skills_command {
                 crate::CatalogSubCommands::List => {
                     let catalog = load_effective_skills_catalog(&paths)?;
-                    crate::services::catalog::list_skills(&self.app.engine, &catalog);
+                    list_skills(&self.app, &catalog);
                     Ok(())
                 }
                 crate::CatalogSubCommands::Search { query } => {
                     let catalog = load_effective_skills_catalog(&paths)?;
-                    crate::services::catalog::search_skills(&self.app.engine, &catalog, query);
+                    search_skills(&self.app, &catalog, query);
                     Ok(())
                 }
                 crate::CatalogSubCommands::Add {
@@ -43,8 +47,7 @@ impl<'a> Command for CatalogCommand<'a> {
                     checksum,
                 } => {
                     let mut catalog = SkillsCatalog::load(&paths.skills_catalog_path())?;
-                    crate::services::catalog::add_skill(
-                        &self.app.engine,
+                    self.app.engine.catalog_add_skill(
                         &paths,
                         &mut catalog,
                         id.clone(),
@@ -56,27 +59,28 @@ impl<'a> Command for CatalogCommand<'a> {
                         url.clone(),
                         reference.clone(),
                         checksum.clone(),
+                        &CliCatalogUi,
                     )
                 }
                 crate::CatalogSubCommands::Remove { id } => {
                     let mut catalog = SkillsCatalog::load(&paths.skills_catalog_path())?;
-                    crate::services::catalog::remove_skill(
-                        &self.app.engine,
+                    self.app.engine.catalog_remove_skill(
                         &paths,
                         &mut catalog,
                         id.clone(),
+                        &CliCatalogUi,
                     )
                 }
             },
             CatalogCommands::Mcp { mcp_command } => match mcp_command {
                 crate::CatalogSubCommands::List => {
                     let catalog = load_effective_mcp_catalog(&paths)?;
-                    crate::services::catalog::list_mcp(&self.app.engine, &catalog);
+                    list_mcp(&self.app, &catalog);
                     Ok(())
                 }
                 crate::CatalogSubCommands::Search { query } => {
                     let catalog = load_effective_mcp_catalog(&paths)?;
-                    crate::services::catalog::search_mcp(&self.app.engine, &catalog, query);
+                    search_mcp(&self.app, &catalog, query);
                     Ok(())
                 }
                 crate::CatalogSubCommands::Add {
@@ -91,8 +95,7 @@ impl<'a> Command for CatalogCommand<'a> {
                     checksum,
                 } => {
                     let mut catalog = McpCatalog::load(&paths.mcp_catalog_path())?;
-                    crate::services::catalog::add_mcp(
-                        &self.app.engine,
+                    self.app.engine.catalog_add_mcp(
                         &paths,
                         &mut catalog,
                         id.clone(),
@@ -104,15 +107,16 @@ impl<'a> Command for CatalogCommand<'a> {
                         url.clone(),
                         reference.clone(),
                         checksum.clone(),
+                        &CliCatalogUi,
                     )
                 }
                 crate::CatalogSubCommands::Remove { id } => {
                     let mut catalog = McpCatalog::load(&paths.mcp_catalog_path())?;
-                    crate::services::catalog::remove_mcp(
-                        &self.app.engine,
+                    self.app.engine.catalog_remove_mcp(
                         &paths,
                         &mut catalog,
                         id.clone(),
+                        &CliCatalogUi,
                     )
                 }
             },
@@ -123,8 +127,7 @@ impl<'a> Command for CatalogCommand<'a> {
                 name,
                 description,
                 tags,
-            } => crate::services::catalog::import_url(
-                &self.app.engine,
+            } => self.app.engine.catalog_import_url(
                 &paths,
                 kind,
                 id.clone(),
@@ -132,6 +135,8 @@ impl<'a> Command for CatalogCommand<'a> {
                 name.clone(),
                 description.clone(),
                 tags.clone(),
+                &CliCatalogUrlParser,
+                &CliCatalogUi,
             ),
             CatalogCommands::SearchRemote {
                 api,
@@ -139,14 +144,15 @@ impl<'a> Command for CatalogCommand<'a> {
                 q,
                 add,
                 add_ids,
-            } => crate::services::catalog::run_remote_search(
-                &self.app.engine,
+            } => self.app.engine.catalog_run_remote_search(
                 &paths,
-                api.clone(),
-                kind.clone(),
-                q.clone(),
+                &CliRemoteSearchProvider,
+                api,
+                kind,
+                q,
                 *add,
-                add_ids.clone(),
+                add_ids.as_deref(),
+                &CliCatalogUi,
             ),
         }
     }

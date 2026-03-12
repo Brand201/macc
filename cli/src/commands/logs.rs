@@ -2,6 +2,14 @@ use crate::commands::AppContext;
 use crate::commands::Command;
 use crate::LogsCommands;
 use macc_core::Result;
+
+struct CliLogsUi;
+
+impl macc_core::service::logs::LogsUi for CliLogsUi {
+    fn print_line(&self, line: &str) {
+        println!("{}", line);
+    }
+}
 pub struct LogsCommand<'a> {
     app: AppContext,
     command: &'a LogsCommands,
@@ -27,10 +35,12 @@ impl<'a> Command for LogsCommand<'a> {
                 if component.eq_ignore_ascii_case("all")
                     || component.eq_ignore_ascii_case("performer")
                 {
-                    let _ = crate::coordinator::logs::aggregate_performer_logs(&paths.root);
+                    let _ = self
+                        .app
+                        .engine
+                        .coordinator_aggregate_performer_logs(&paths.root);
                 }
-                let file = crate::services::logs::select_log_file(
-                    &self.app.engine,
+                let file = self.app.engine.logs_select_file(
                     &paths,
                     component.as_str(),
                     worktree.as_deref(),
@@ -38,9 +48,9 @@ impl<'a> Command for LogsCommand<'a> {
                 )?;
                 println!("Log file: {}", file.display());
                 if *follow {
-                    crate::services::logs::tail_file_follow(&self.app.engine, &file, *lines)?;
+                    self.app.engine.logs_tail_follow(&file, *lines)?;
                 } else {
-                    crate::services::logs::print_file_tail(&self.app.engine, &file, *lines)?;
+                    self.app.engine.logs_print_tail(&file, *lines, &CliLogsUi)?;
                 }
                 Ok(())
             }

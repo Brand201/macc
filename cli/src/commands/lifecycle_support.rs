@@ -2,7 +2,7 @@ use crate::commands::AppContext;
 use macc_core::service::interaction::InteractionHandler;
 use macc_core::{MaccError, ProjectPaths, Result};
 
-struct CliFetchMaterializer;
+pub(crate) struct CliFetchMaterializer;
 
 impl macc_core::service::lifecycle::LifecycleFetchMaterializer for CliFetchMaterializer {
     fn materialize_fetch_units(
@@ -14,7 +14,7 @@ impl macc_core::service::lifecycle::LifecycleFetchMaterializer for CliFetchMater
     }
 }
 
-struct CliLifecycleUi;
+pub(crate) struct CliLifecycleUi;
 
 impl InteractionHandler for CliLifecycleUi {
     fn info(&self, message: &str) {
@@ -72,7 +72,7 @@ impl macc_core::service::lifecycle::LifecycleUi for CliLifecycleUi {
     }
 
     fn mark_apply_completed(&self, paths: &ProjectPaths) -> Result<()> {
-        crate::mark_apply_completed(paths)
+        macc_core::service::context::mark_apply_completed(paths)
     }
 
     fn run_tui(&self) -> Result<()> {
@@ -120,7 +120,7 @@ impl macc_core::service::lifecycle::LifecycleUi for CliLifecycleUi {
     }
 }
 
-pub fn init(app: &AppContext, force: bool, wizard: bool) -> Result<()> {
+pub(crate) fn init(app: &AppContext, force: bool, wizard: bool) -> Result<()> {
     macc_core::service::lifecycle::init(
         &app.cwd,
         app.engine.as_ref(),
@@ -130,7 +130,7 @@ pub fn init(app: &AppContext, force: bool, wizard: bool) -> Result<()> {
     )
 }
 
-pub fn plan(app: &AppContext, tools: Option<&str>, json: bool, explain: bool) -> Result<()> {
+pub(crate) fn plan(app: &AppContext, tools: Option<&str>, json: bool, explain: bool) -> Result<()> {
     macc_core::service::lifecycle::plan(
         &app.cwd,
         app.engine.as_ref(),
@@ -142,7 +142,7 @@ pub fn plan(app: &AppContext, tools: Option<&str>, json: bool, explain: bool) ->
     )
 }
 
-pub fn apply(
+pub(crate) fn apply(
     app: &AppContext,
     tools: Option<&str>,
     dry_run: bool,
@@ -163,7 +163,12 @@ pub fn apply(
     )
 }
 
-pub fn quickstart(app: &AppContext, assume_yes: bool, apply: bool, no_tui: bool) -> Result<()> {
+pub(crate) fn quickstart(
+    app: &AppContext,
+    assume_yes: bool,
+    apply: bool,
+    no_tui: bool,
+) -> Result<()> {
     macc_core::service::lifecycle::quickstart(
         &app.cwd,
         app.engine.as_ref(),

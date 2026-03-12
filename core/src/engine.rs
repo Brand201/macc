@@ -116,6 +116,25 @@ pub trait Engine {
         crate::service::tooling::show_outdated_tools(paths, only, reporter)
     }
 
+    fn context_generate(
+        &self,
+        paths: &ProjectPaths,
+        tool_filter: Option<&str>,
+        from_files: &[String],
+        dry_run: bool,
+        print_prompt: bool,
+        reporter: &dyn crate::service::interaction::InteractionHandler,
+    ) -> Result<usize> {
+        crate::service::context::run_generation(
+            paths,
+            tool_filter,
+            from_files,
+            dry_run,
+            print_prompt,
+            reporter,
+        )
+    }
+
     fn project_ensure_initialized_paths(&self, start_dir: &Path) -> Result<ProjectPaths> {
         crate::service::project::ensure_initialized_paths(start_dir)
     }
@@ -147,6 +166,31 @@ pub trait Engine {
             worktree_root,
             allow_user_scope,
         )
+    }
+
+    fn worktree_run_task(&self, paths: &ProjectPaths, id: &str) -> Result<()> {
+        crate::service::task_runner::worktree_run_task(paths, id)
+    }
+
+    fn worktree_exec_task(&self, paths: &ProjectPaths, id: &str, cmd: &[String]) -> Result<()> {
+        crate::service::task_runner::worktree_exec(paths, id, cmd)
+    }
+
+    fn worktree_open_in_editor(&self, path: &Path, command: &str) -> Result<()> {
+        crate::service::task_runner::open_in_editor(path, command)
+    }
+
+    fn worktree_open_in_terminal(&self, path: &Path) -> Result<()> {
+        crate::service::task_runner::open_in_terminal(path)
+    }
+
+    fn clear_project(
+        &self,
+        paths: &ProjectPaths,
+        force: bool,
+        ui: &dyn crate::service::interaction::InteractionHandler,
+    ) -> Result<crate::service::clear::ClearExecutionReport> {
+        crate::service::clear::clear_project(paths, force, ui)
     }
 
     fn catalog_run_remote_search(
@@ -386,6 +430,45 @@ pub trait Engine {
         crate::service::logs::tail_file_follow(path, lines)
     }
 
+    fn logs_list_entries(
+        &self,
+        paths: &ProjectPaths,
+    ) -> Result<Vec<crate::service::logs::LogFileEntry>> {
+        crate::service::logs::list_log_entries(paths)
+    }
+
+    fn logs_read_file(&self, path: &Path) -> Result<String> {
+        crate::service::logs::read_log_file(path)
+    }
+
+    fn get_logs(
+        &self,
+        paths: &ProjectPaths,
+        component: &str,
+        worktree_filter: Option<&str>,
+    ) -> Result<String> {
+        crate::service::logs::read_log_content(paths, component, worktree_filter, None)
+    }
+
+    fn env_var(&self, key: &str) -> Option<String> {
+        std::env::var(key).ok()
+    }
+
+    fn current_dir(&self) -> std::path::PathBuf {
+        std::env::current_dir().unwrap_or_else(|_| ".".into())
+    }
+
+    fn path_exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+
+    fn analyze_last_failure(
+        &self,
+        paths: &ProjectPaths,
+    ) -> Result<Option<crate::service::diagnostic::FailureReport>> {
+        crate::service::diagnostic::analyze_last_failure(paths)
+    }
+
     fn coordinator_start_run(
         &self,
         backend: &mut dyn coordinator::engine::ControlPlaneBackend,
@@ -398,6 +481,223 @@ pub trait Engine {
                 crate::MaccError::Validation(format!("build runtime for coordinator run: {}", e))
             })?;
         runtime.block_on(coordinator::engine::run_control_plane(backend, cfg))
+    }
+
+    fn coordinator_start_action_process(
+        &self,
+        paths: &ProjectPaths,
+        action: &str,
+        args: &[String],
+        cfg: Option<&crate::config::CoordinatorConfig>,
+    ) -> Result<crate::service::coordinator::CoordinatorProcessHandle> {
+        crate::service::coordinator::coordinator_start_action_process(paths, action, args, cfg)
+    }
+
+    fn coordinator_poll_action_process(
+        &self,
+        handle: crate::service::coordinator::CoordinatorProcessHandle,
+    ) -> Result<crate::service::coordinator::CoordinatorProcessPoll> {
+        crate::service::coordinator::coordinator_poll_action_process(handle)
+    }
+
+    fn coordinator_stop_action_process(
+        &self,
+        handle: crate::service::coordinator::CoordinatorProcessHandle,
+        graceful: bool,
+    ) -> Result<crate::service::coordinator::CoordinatorStopResult> {
+        crate::service::coordinator::coordinator_stop_action_process(handle, graceful)
+    }
+
+    fn coordinator_start_managed_action_process(
+        &self,
+        paths: &ProjectPaths,
+        action: &str,
+        args: &[String],
+        cfg: Option<&crate::config::CoordinatorConfig>,
+    ) -> Result<()> {
+        crate::service::coordinator::coordinator_start_managed_action_process(
+            paths, action, args, cfg,
+        )
+    }
+
+    fn coordinator_poll_managed_action_process(
+        &self,
+        paths: &ProjectPaths,
+    ) -> Result<crate::service::coordinator::CoordinatorManagedPoll> {
+        crate::service::coordinator::coordinator_poll_managed_action_process(paths)
+    }
+
+    fn coordinator_stop_managed_action_process(
+        &self,
+        paths: &ProjectPaths,
+        graceful: bool,
+    ) -> Result<crate::service::coordinator::CoordinatorStopResult> {
+        crate::service::coordinator::coordinator_stop_managed_action_process(paths, graceful)
+    }
+
+    fn coordinator_run_workflow(
+        &self,
+        paths: &ProjectPaths,
+        cfg: Option<&crate::config::CoordinatorConfig>,
+        options: &crate::service::coordinator_workflow::CoordinatorRunOptions,
+    ) -> Result<()> {
+        crate::service::coordinator_workflow::coordinator_run(paths, cfg, options)
+    }
+
+    fn get_coordinator_status(
+        &self,
+        paths: &ProjectPaths,
+    ) -> Result<crate::service::coordinator_workflow::CoordinatorStatus> {
+        crate::service::coordinator_workflow::get_coordinator_status(paths)
+    }
+
+    fn coordinator_run_cycle_workflow(
+        &self,
+        paths: &ProjectPaths,
+        canonical: &crate::config::CanonicalConfig,
+        coordinator_cfg: Option<&crate::config::CoordinatorConfig>,
+        env_cfg: &crate::coordinator::types::CoordinatorEnvConfig,
+        logger: Option<&dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Result<()> {
+        crate::service::coordinator_workflow::coordinator_run_cycle(
+            self,
+            paths,
+            canonical,
+            coordinator_cfg,
+            env_cfg,
+            logger,
+        )
+    }
+
+    fn coordinator_perform_action_workflow(
+        &self,
+        paths: &ProjectPaths,
+        action: crate::service::coordinator_workflow::CoordinatorAction,
+        request: crate::service::coordinator_workflow::CoordinatorActionRequest<'_>,
+    ) -> Result<crate::service::coordinator_workflow::CoordinatorActionResult> {
+        crate::service::coordinator_workflow::coordinator_perform_action(
+            self, paths, action, request,
+        )
+    }
+
+    fn coordinator_run(
+        &self,
+        paths: &ProjectPaths,
+        cfg: Option<&crate::config::CoordinatorConfig>,
+        options: &crate::service::coordinator_workflow::CoordinatorRunOptions,
+    ) -> Result<()> {
+        self.coordinator_run_workflow(paths, cfg, options)
+    }
+
+    fn coordinator_stop_workflow(&self, paths: &ProjectPaths, reason: &str) -> Result<()> {
+        crate::service::coordinator_workflow::coordinator_stop(paths, reason)
+    }
+
+    fn coordinator_dispatch_workflow(
+        &self,
+        paths: &ProjectPaths,
+        canonical: &crate::config::CanonicalConfig,
+        coordinator_cfg: Option<&crate::config::CoordinatorConfig>,
+        env_cfg: &crate::coordinator::types::CoordinatorEnvConfig,
+        logger: Option<&dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Result<()> {
+        crate::service::coordinator_workflow::coordinator_dispatch(
+            self,
+            paths,
+            canonical,
+            coordinator_cfg,
+            env_cfg,
+            logger,
+        )
+    }
+
+    fn coordinator_advance_workflow(
+        &self,
+        paths: &ProjectPaths,
+        coordinator_cfg: Option<&crate::config::CoordinatorConfig>,
+        env_cfg: &crate::coordinator::types::CoordinatorEnvConfig,
+        logger: Option<&dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Result<()> {
+        crate::service::coordinator_workflow::coordinator_advance(
+            self,
+            paths,
+            coordinator_cfg,
+            env_cfg,
+            logger,
+        )
+    }
+
+    fn coordinator_reconcile_workflow(
+        &self,
+        paths: &ProjectPaths,
+        logger: Option<&dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Result<()> {
+        crate::service::coordinator_workflow::coordinator_reconcile(paths, logger)
+    }
+
+    fn coordinator_cleanup_workflow(
+        &self,
+        paths: &ProjectPaths,
+        logger: Option<&dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Result<()> {
+        crate::service::coordinator_workflow::coordinator_cleanup(paths, logger)
+    }
+
+    fn coordinator_sync_workflow(
+        &self,
+        paths: &ProjectPaths,
+        coordinator_cfg: Option<&crate::config::CoordinatorConfig>,
+        env_cfg: &crate::coordinator::types::CoordinatorEnvConfig,
+        logger: Option<&dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Result<()> {
+        crate::service::coordinator_workflow::coordinator_sync(
+            self,
+            paths,
+            coordinator_cfg,
+            env_cfg,
+            logger,
+        )
+    }
+
+    fn coordinator_unlock_workflow(
+        &self,
+        paths: &ProjectPaths,
+        coordinator_cfg: Option<&crate::config::CoordinatorConfig>,
+        env_cfg: &crate::coordinator::types::CoordinatorEnvConfig,
+        args: &[String],
+    ) -> Result<()> {
+        crate::service::coordinator_workflow::coordinator_unlock(
+            self,
+            paths,
+            coordinator_cfg,
+            env_cfg,
+            args,
+        )
+    }
+
+    fn coordinator_cutover_gate_workflow(&self, paths: &ProjectPaths) -> Result<()> {
+        crate::service::coordinator_workflow::coordinator_cutover_gate(paths)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn coordinator_retry_phase_workflow(
+        &self,
+        paths: &ProjectPaths,
+        canonical: &crate::config::CanonicalConfig,
+        coordinator_cfg: Option<&crate::config::CoordinatorConfig>,
+        env_cfg: &crate::coordinator::types::CoordinatorEnvConfig,
+        args: &[String],
+        logger: Option<&dyn crate::coordinator::control_plane::CoordinatorLog>,
+    ) -> Result<()> {
+        crate::service::coordinator_workflow::coordinator_retry_phase(
+            self,
+            paths,
+            canonical,
+            coordinator_cfg,
+            env_cfg,
+            args,
+            logger,
+        )
     }
 
     fn coordinator_stop(&self, repo_root: &Path, reason: &str) -> Result<()> {
@@ -479,6 +779,25 @@ pub trait Engine {
         }
 
         Ok(counts)
+    }
+
+    fn get_coordinator_events(
+        &self,
+        project_paths: &ProjectPaths,
+    ) -> Result<Vec<CoordinatorEvent>> {
+        let paths = CoordinatorStoragePaths::from_project_paths(project_paths);
+        let sqlite = SqliteStorage::new(paths.clone());
+        let snapshot: CoordinatorSnapshot = if sqlite.has_snapshot_data()? {
+            sqlite.load_snapshot()?
+        } else {
+            JsonStorage::new(paths).load_snapshot()?
+        };
+
+        let mut out = Vec::with_capacity(snapshot.events.len());
+        for raw in snapshot.events {
+            out.push(CoordinatorEvent::from_raw(raw));
+        }
+        Ok(out)
     }
 
     fn coordinator_storage_import_json_to_sqlite(&self, paths: &ProjectPaths) -> Result<()> {
@@ -742,6 +1061,60 @@ pub struct CoordinatorStatusSnapshot {
     pub pause_reason: Option<String>,
     pub pause_task_id: Option<String>,
     pub pause_phase: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoordinatorEvent {
+    pub event_id: Option<String>,
+    pub run_id: Option<String>,
+    pub event_type: String,
+    pub task_id: Option<String>,
+    pub phase: Option<String>,
+    pub status: Option<String>,
+    pub ts: Option<String>,
+    pub message: Option<String>,
+    pub raw: serde_json::Value,
+}
+
+impl CoordinatorEvent {
+    fn from_raw(raw: serde_json::Value) -> Self {
+        Self {
+            event_id: raw
+                .get("event_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.to_string()),
+            run_id: raw
+                .get("run_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.to_string()),
+            event_type: raw
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            task_id: raw
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.to_string()),
+            phase: raw
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.to_string()),
+            status: raw
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.to_string()),
+            ts: raw
+                .get("ts")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.to_string()),
+            message: raw
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.to_string()),
+            raw,
+        }
+    }
 }
 
 /// The standard production engine.

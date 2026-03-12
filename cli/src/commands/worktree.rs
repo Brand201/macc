@@ -15,89 +15,6 @@ impl macc_core::service::worktree::WorktreeFetchMaterializer for CliFetchMateria
     }
 }
 
-pub(crate) fn open_in_editor(path: &std::path::Path, command: &str) -> Result<()> {
-    let mut parts = command.split_whitespace();
-    let Some(bin) = parts.next() else {
-        return Ok(());
-    };
-    let mut cmd = std::process::Command::new(bin);
-    for arg in parts {
-        cmd.arg(arg);
-    }
-    let status = cmd
-        .arg(path)
-        .status()
-        .map_err(|e| macc_core::MaccError::Io {
-            path: path.to_string_lossy().into(),
-            action: "launch editor".into(),
-            source: e,
-        })?;
-    if !status.success() {
-        return Err(macc_core::MaccError::Validation(format!(
-            "Editor command failed with status: {}",
-            status
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn open_in_terminal(path: &std::path::Path) -> Result<()> {
-    if let Ok(term) = std::env::var("TERMINAL") {
-        launch_terminal(&term, path)?;
-        return Ok(());
-    }
-
-    let candidates = [
-        ("x-terminal-emulator", &["-e", "bash", "-lc"][..]),
-        ("gnome-terminal", &["--", "bash", "-lc"][..]),
-        ("konsole", &["-e", "bash", "-lc"][..]),
-        ("xterm", &["-e", "bash", "-lc"][..]),
-    ];
-    for (bin, prefix) in candidates {
-        if launch_terminal_with_prefix(bin, prefix, path).is_ok() {
-            return Ok(());
-        }
-    }
-    Err(macc_core::MaccError::Validation(
-        "No terminal launcher found (set $TERMINAL)".into(),
-    ))
-}
-
-fn launch_terminal(command: &str, path: &std::path::Path) -> Result<()> {
-    let mut parts = command.split_whitespace();
-    let Some(bin) = parts.next() else {
-        return Ok(());
-    };
-    let mut cmd = std::process::Command::new(bin);
-    for arg in parts {
-        cmd.arg(arg);
-    }
-    cmd.arg("--");
-    cmd.arg("bash");
-    cmd.arg("-lc");
-    cmd.arg(format!("cd {}; exec $SHELL", path.display()));
-    cmd.spawn().map_err(|e| macc_core::MaccError::Io {
-        path: path.to_string_lossy().into(),
-        action: "launch terminal".into(),
-        source: e,
-    })?;
-    Ok(())
-}
-
-fn launch_terminal_with_prefix(bin: &str, prefix: &[&str], path: &std::path::Path) -> Result<()> {
-    let mut cmd = std::process::Command::new(bin);
-    for arg in prefix {
-        cmd.arg(arg);
-    }
-    cmd.arg(format!("cd {}; exec $SHELL", path.display()));
-    cmd.spawn().map_err(|e| macc_core::MaccError::Io {
-        path: path.to_string_lossy().into(),
-        action: "launch terminal".into(),
-        source: e,
-    })?;
-    Ok(())
-}
-
 pub struct WorktreeCommand<'a> {
     app: AppContext,
     command: &'a WorktreeCommands,
@@ -309,12 +226,16 @@ impl<'a> Command for WorktreeCommand<'a> {
                 }
 
                 if *terminal {
-                    open_in_terminal(&worktree_path)?;
+                    self.app.engine.worktree_open_in_terminal(&worktree_path)?;
                 }
                 if let Some(cmd) = editor {
-                    open_in_editor(&worktree_path, cmd)?;
+                    self.app
+                        .engine
+                        .worktree_open_in_editor(&worktree_path, cmd)?;
                 } else {
-                    open_in_editor(&worktree_path, "code")?;
+                    self.app
+                        .engine
+                        .worktree_open_in_editor(&worktree_path, "code")?;
                 }
 
                 println!("Opened worktree: {}", worktree_path.display());
@@ -377,127 +298,11 @@ impl<'a> Command for WorktreeCommand<'a> {
             }
             WorktreeCommands::Run { id } => {
                 let paths = self.app.project_paths()?;
-                let worktree_path =
-                    macc_core::service::worktree::resolve_worktree_path(&paths.root, id)?;
-                if !worktree_path.exists() {
-                    return Err(macc_core::MaccError::Validation(format!(
-                        "Worktree path does not exist: {}",
-                        worktree_path.display()
-                    )));
-                }
-
-                let metadata =
-                    macc_core::read_worktree_metadata(&worktree_path)?.ok_or_else(|| {
-                        macc_core::MaccError::Validation("Missing .macc/worktree.json".into())
-                    })?;
-                macc_core::service::worktree::ensure_tool_json(
-                    &paths.root,
-                    &worktree_path,
-                    &metadata.tool,
-                )?;
-                let (task_id, prd_path) =
-                    macc_core::service::worktree::resolve_worktree_task_context(
-                        &paths.root,
-                        &worktree_path,
-                        &metadata.id,
-                    )?;
-                let performer_path =
-                    macc_core::service::worktree::ensure_performer(&worktree_path)?;
-                let registry_path =
-                    macc_core::service::worktree::coordinator_task_registry_path(&paths.root);
-                let events_file = paths
-                    .root
-                    .join(".macc")
-                    .join("log")
-                    .join("coordinator")
-                    .join("events.jsonl");
-                if let Some(parent) = events_file.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| macc_core::MaccError::Io {
-                        path: parent.to_string_lossy().into(),
-                        action: "create coordinator log dir for events".into(),
-                        source: e,
-                    })?;
-                }
-
-                let status = std::process::Command::new(&performer_path)
-                    .current_dir(&worktree_path)
-                    .env(
-                        "COORD_EVENTS_FILE",
-                        events_file.to_string_lossy().to_string(),
-                    )
-                    .env(
-                        "COORDINATOR_RUN_ID",
-                        self.app.engine.project_ensure_coordinator_run_id(),
-                    )
-                    .env(
-                        "MACC_EVENT_SOURCE",
-                        format!(
-                            "worktree-run:{}:{}",
-                            task_id,
-                            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-                        ),
-                    )
-                    .env("MACC_EVENT_TASK_ID", &task_id)
-                    .arg("--repo")
-                    .arg(&paths.root)
-                    .arg("--worktree")
-                    .arg(&worktree_path)
-                    .arg("--task-id")
-                    .arg(&task_id)
-                    .arg("--tool")
-                    .arg(&metadata.tool)
-                    .arg("--registry")
-                    .arg(&registry_path)
-                    .arg("--prd")
-                    .arg(&prd_path)
-                    .status()
-                    .map_err(|e| macc_core::MaccError::Io {
-                        path: performer_path.to_string_lossy().into(),
-                        action: "run worktree performer".into(),
-                        source: e,
-                    })?;
-                if !status.success() {
-                    return Err(macc_core::MaccError::Validation(format!(
-                        "Performer failed with status: {}. Inspect logs with `macc logs tail --component performer --worktree {}` and if the task is stuck run `macc coordinator unlock --task {}`.",
-                        status, metadata.id, task_id
-                    )));
-                }
-                Ok(())
+                self.app.engine.worktree_run_task(&paths, id)
             }
             WorktreeCommands::Exec { id, cmd } => {
                 let paths = self.app.project_paths()?;
-                let worktree_path =
-                    macc_core::service::worktree::resolve_worktree_path(&paths.root, id)?;
-                if !worktree_path.exists() {
-                    return Err(macc_core::MaccError::Validation(format!(
-                        "Worktree path does not exist: {}",
-                        worktree_path.display()
-                    )));
-                }
-                if cmd.is_empty() {
-                    return Err(macc_core::MaccError::Validation(
-                        "worktree exec requires a command after --".into(),
-                    ));
-                }
-
-                let mut command = std::process::Command::new(&cmd[0]);
-                if cmd.len() > 1 {
-                    command.args(&cmd[1..]);
-                }
-                let status = command.current_dir(&worktree_path).status().map_err(|e| {
-                    macc_core::MaccError::Io {
-                        path: worktree_path.to_string_lossy().into(),
-                        action: "run worktree exec".into(),
-                        source: e,
-                    }
-                })?;
-                if !status.success() {
-                    return Err(macc_core::MaccError::Validation(format!(
-                        "Command failed with status: {}",
-                        status
-                    )));
-                }
-                Ok(())
+                self.app.engine.worktree_exec_task(&paths, id, cmd)
             }
             WorktreeCommands::Remove {
                 id,

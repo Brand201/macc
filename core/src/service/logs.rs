@@ -1,4 +1,11 @@
 use crate::{MaccError, ProjectPaths, Result};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone)]
+pub struct LogFileEntry {
+    pub path: PathBuf,
+    pub relative: String,
+}
 
 pub trait LogsUi {
     fn print_line(&self, line: &str);
@@ -84,6 +91,20 @@ pub fn tail_file_follow(path: &std::path::Path, lines: usize) -> Result<()> {
     Ok(())
 }
 
+pub fn read_log_content(
+    paths: &ProjectPaths,
+    component: &str,
+    worktree_filter: Option<&str>,
+    task_filter: Option<&str>,
+) -> Result<String> {
+    let path = select_log_file(paths, component, worktree_filter, task_filter)?;
+    std::fs::read_to_string(&path).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "read log file".into(),
+        source: e,
+    })
+}
+
 fn collect_log_files(
     dir: &std::path::Path,
     task_filter: Option<&str>,
@@ -119,6 +140,56 @@ fn collect_log_files(
         files.push(path);
     }
     Ok(files)
+}
+
+pub fn list_log_entries(paths: &ProjectPaths) -> Result<Vec<LogFileEntry>> {
+    let log_root = paths.root.join(".macc/log");
+    let mut out = Vec::new();
+    collect_log_entries(&log_root, &log_root, &mut out)?;
+    out.sort_by(|a, b| b.relative.cmp(&a.relative));
+    Ok(out)
+}
+
+pub fn read_log_file(path: &std::path::Path) -> Result<String> {
+    std::fs::read_to_string(path).map_err(|e| MaccError::Io {
+        path: path.to_string_lossy().into(),
+        action: "read log file".into(),
+        source: e,
+    })
+}
+
+fn collect_log_entries(
+    dir: &std::path::Path,
+    root: &std::path::Path,
+    out: &mut Vec<LogFileEntry>,
+) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(iter) => iter,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| MaccError::Io {
+            path: dir.to_string_lossy().into(),
+            action: "iterate log directory".into(),
+            source: e,
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_log_entries(&path, root, out)?;
+            continue;
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "md" && ext != "log" && ext != "txt" {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .ok()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        out.push(LogFileEntry { path, relative });
+    }
+    Ok(())
 }
 
 fn collect_performer_worktree_logs(

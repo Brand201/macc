@@ -1,6 +1,33 @@
 use crate::commands::AppContext;
 use crate::commands::Command;
+use macc_core::service::interaction::InteractionHandler;
 use macc_core::Result;
+
+struct CliBackupsUi;
+
+impl InteractionHandler for CliBackupsUi {
+    fn info(&self, message: &str) {
+        println!("{}", message);
+    }
+
+    fn warn(&self, message: &str) {
+        eprintln!("{}", message);
+    }
+
+    fn error(&self, message: &str) {
+        eprintln!("{}", message);
+    }
+
+    fn confirm_yes_no(&self, prompt: &str) -> Result<bool> {
+        crate::confirm_yes_no(prompt)
+    }
+}
+
+impl macc_core::service::backups::BackupsUi for CliBackupsUi {
+    fn open_in_editor(&self, path: &std::path::Path, command: &str) -> Result<()> {
+        macc_core::service::task_runner::open_in_editor(path, command)
+    }
+}
 pub struct RestoreCommand<'a> {
     app: AppContext,
     latest: bool,
@@ -38,14 +65,14 @@ impl<'a> Command for RestoreCommand<'a> {
                 "restore requires --latest or --backup <id>".into(),
             ));
         }
-        crate::services::backups::restore(
-            &self.app.engine,
+        self.app.engine.backups_restore(
             &paths,
             self.user,
             self.backup,
             self.latest,
             self.dry_run,
             self.yes,
+            &CliBackupsUi,
         )
     }
 }
