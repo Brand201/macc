@@ -1,14 +1,20 @@
 pub mod automation;
 pub mod catalog;
 pub mod config;
+pub mod coordinator;
+pub mod coordinator_storage;
 pub mod doctor;
+pub mod domain;
 pub mod engine;
+pub mod git;
 pub use config::migrate;
 pub mod mcp_json;
 pub mod packages;
 pub mod plan;
 pub mod resolve;
 pub mod security;
+pub mod service;
+pub mod skills;
 mod structured_merge;
 pub mod tool;
 pub mod user_backup;
@@ -21,6 +27,7 @@ pub use config::load_canonical_config;
 pub use engine::{Engine, MaccEngine, TestEngine};
 pub use resolve::{resolve, CliOverrides, ResolvedConfig};
 pub use security::Finding;
+pub use skills::{is_required_skill, required_skills, REQUIRED_SKILLS};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use structured_merge::StructuredToolMergePolicy;
@@ -28,8 +35,10 @@ use thiserror::Error;
 pub use tool::{FieldKind, ToolAdapter, ToolDescriptor, ToolField, ToolRegistry};
 pub use user_backup::{find_user_home, UserBackupEntry, UserBackupManager, UserBackupReport};
 pub use worktree::{
-    create_worktrees, current_worktree, list_worktrees, prune_worktrees, read_worktree_metadata,
-    remove_worktree, WorktreeCreateResult, WorktreeCreateSpec, WorktreeEntry, WorktreeMetadata,
+    collect_context_targets, create_worktrees, current_worktree, ensure_performer, list_worktrees,
+    prune_worktrees, read_worktree_metadata, remove_worktree, resolve_worktree_task_context,
+    sync_context_files_from_root, write_tool_json, WorktreeCreateResult, WorktreeCreateSpec,
+    WorktreeEntry, WorktreeMetadata,
 };
 
 #[derive(Error, Debug)]
@@ -208,6 +217,14 @@ impl ProjectPaths {
 
     pub fn automation_coordinator_path(&self) -> PathBuf {
         self.automation_dir().join("coordinator.sh")
+    }
+
+    pub fn automation_merge_worker_path(&self) -> PathBuf {
+        self.automation_dir().join("merge_worker.sh")
+    }
+
+    pub fn automation_merge_fix_hook_path(&self) -> PathBuf {
+        self.automation_dir().join("hooks").join("ai-merge-fix.sh")
     }
 
     pub fn automation_runner_path(&self, tool_id: &str) -> PathBuf {
@@ -1275,7 +1292,7 @@ fn cleanup_empty_parents(paths: &ProjectPaths, removed: &[PathBuf]) {
         }
     }
 }
-pub const BASELINE_IGNORE_ENTRIES: &[&str] = &[".macc/"];
+pub const BASELINE_IGNORE_ENTRIES: &[&str] = &[".macc/", "performer.sh", "worktree.prd.json"];
 
 fn collect_tool_gitignore_entries(
     paths: &ProjectPaths,

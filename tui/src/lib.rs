@@ -24,6 +24,12 @@ use screen::Screen;
 use state::AppState;
 use ui::{compact_help_line, header_lines, panel, theme, wrapped_paragraph, HeaderContext};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    Default,
+    CoordinatorRun,
+}
+
 /// RAII guard to ensure terminal state is restored on drop.
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
@@ -49,10 +55,18 @@ impl Drop for TerminalGuard {
 }
 
 pub fn run_tui() -> Result<()> {
+    run_tui_with_launch(LaunchMode::Default)
+}
+
+pub fn run_tui_with_launch(mode: LaunchMode) -> Result<()> {
     let mut guard = TerminalGuard::new()?;
     let registry = macc_registry::default_registry();
     let engine = std::sync::Arc::new(macc_core::MaccEngine::new(registry));
     let mut state = AppState::new(engine);
+    if mode == LaunchMode::CoordinatorRun {
+        state.goto_screen(Screen::CoordinatorLive);
+        state.start_coordinator_action("run");
+    }
 
     run_app(&mut guard.terminal, &mut state)?;
 
@@ -77,7 +91,27 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: &mut AppState) -> io::
     }
 }
 
+fn format_hms(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    format!("{}:{:02}:{:02}", hours, minutes, seconds)
+}
+
 fn handle_key(state: &mut AppState, key: KeyCode) {
+    if state.has_coordinator_pause_prompt() {
+        match key {
+            KeyCode::Char('r') | KeyCode::Enter => state.retry_after_coordinator_pause(),
+            KeyCode::Char('s') => state.skip_after_coordinator_pause(),
+            KeyCode::Char('o') => state.open_logs_after_coordinator_pause(),
+            KeyCode::Char('u') => state.resume_signal_after_coordinator_pause(),
+            KeyCode::Char('k') | KeyCode::Esc => state.stop_after_coordinator_pause(),
+            KeyCode::Char('c') => state.resume_after_coordinator_pause(),
+            _ => {}
+        }
+        return;
+    }
+
     if state.help_open {
         match key {
             KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
@@ -158,6 +192,7 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         KeyCode::Char('h') => state.goto_screen(Screen::Home),
         KeyCode::Char('t') => state.push_screen(Screen::Tools),
         KeyCode::Char('o') => state.push_screen(Screen::Automation),
+        KeyCode::Char('v') => state.push_screen(Screen::CoordinatorLive),
         KeyCode::Char('m') => state.push_screen(Screen::Mcp),
         KeyCode::Char('g') => state.push_screen(Screen::Logs),
         KeyCode::Char('p') => state.open_preview(),
@@ -172,7 +207,7 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         KeyCode::Char('s') if current_screen != Screen::Apply => {
             state.save_config();
         }
-        KeyCode::Char('u') => {
+        KeyCode::Char('u') if current_screen != Screen::CoordinatorLive => {
             state.undo_config_change();
         }
         KeyCode::Char('U') => {
@@ -224,7 +259,7 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             }
         }
         KeyCode::Char('r') => {
-            if current_screen == Screen::Automation {
+            if current_screen == Screen::CoordinatorLive {
                 state.start_coordinator_action("run");
             } else if current_screen == Screen::Logs {
                 state.refresh_logs();
@@ -233,22 +268,27 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             }
         }
         KeyCode::Char('y') => {
-            if current_screen == Screen::Automation {
+            if current_screen == Screen::CoordinatorLive {
                 state.start_coordinator_action("sync");
             }
         }
         KeyCode::Char('c') => {
-            if current_screen == Screen::Automation {
+            if current_screen == Screen::CoordinatorLive {
                 state.start_coordinator_action("reconcile");
             }
         }
+        KeyCode::Char('u') => {
+            if current_screen == Screen::CoordinatorLive {
+                state.start_coordinator_action("resume");
+            }
+        }
         KeyCode::Char('k') => {
-            if current_screen == Screen::Automation {
+            if current_screen == Screen::CoordinatorLive {
                 state.stop_coordinator_action();
             }
         }
         KeyCode::Char('l') => {
-            if current_screen == Screen::Automation {
+            if current_screen == Screen::CoordinatorLive {
                 state.refresh_coordinator_snapshot();
             }
         }
@@ -314,6 +354,9 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
         project: &project_label,
         config_label: &config_status,
         errors: state.errors.len(),
+        coordinator_active: state.is_coordinator_running(),
+        coordinator_paused: state.is_coordinator_paused(),
+        coordinator_action: state.coordinator_running_action.as_deref(),
         status: state.status_line(),
         width: chunks[0].width,
     };
@@ -347,11 +390,13 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
                 .map(|index| {
                     let skill = &state.skills[*index];
                     let is_enabled = selected_skills.contains(&skill.id.to_string());
+                    let is_required = macc_core::is_required_skill(&skill.id);
                     let enabled_marker = if is_enabled { "[x]" } else { "[ ]" };
+                    let required_badge = if is_required { " [required]" } else { "" };
                     ListItem::new(Line::from(vec![
                         Span::raw(enabled_marker),
                         Span::raw(" "),
-                        Span::raw(skill.name.clone()),
+                        Span::raw(format!("{}{}", skill.name, required_badge)),
                     ]))
                 })
                 .collect();
@@ -384,6 +429,9 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
                 let mut desc_text = format!("ID: {}\n\n", current_skill.id);
                 desc_text.push_str("Description:\n");
                 desc_text.push_str(&current_skill.description);
+                if macc_core::is_required_skill(&current_skill.id) {
+                    desc_text.push_str("\n\nRequired skill: always enabled (read-only toggle).");
+                }
                 desc_text.push_str("\n\n---\nShortcuts:\n'a' - Select All\n'n' - Select None");
 
                 let desc_para = Paragraph::new(desc_text).block(panel("Details"));
@@ -1041,7 +1089,7 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
             let overview_para = wrapped_paragraph(overview, "Overview");
             f.render_widget(overview_para, body_chunks[0]);
 
-            let next_steps = "Quick actions:\n\n- Press 't' to configure tools\n- Press 'o' to configure automation/coordinator\n- Press 'm' to select MCP servers\n- Press 'p' to preview changes\n- Press 'x' to apply changes\n- Press 's' to save\n\nTip: Use '?' anywhere for full keybindings.";
+            let next_steps = "Quick actions:\n\n- Press 't' to configure tools\n- Press 'o' to configure automation settings\n- Press 'v' for Coordinator Live monitor\n- Press 'm' to select MCP servers\n- Press 'p' to preview changes\n- Press 'x' to apply changes\n- Press 's' to save\n\nTip: Use '?' anywhere for full keybindings.";
             let steps_para = wrapped_paragraph(next_steps, "Next Steps");
             f.render_widget(steps_para, body_chunks[1]);
         }
@@ -1050,10 +1098,6 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .split(chunks[1]);
-            let right_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-                .split(body_chunks[1]);
 
             let mut list_state = ListState::default();
             let automation_count = state.automation_field_count();
@@ -1098,17 +1142,30 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
             if let Some(validation) = state.current_automation_field_validation() {
                 detail.push_str(&format!("\n\nValidation:\n{}", validation));
             }
+            detail.push_str("\n\nRuntime monitoring moved to Coordinator Live.\nPress 'v' to open live status, active tasks, and events.");
             let detail_para = wrapped_paragraph(detail, "Field Info");
-            f.render_widget(detail_para, right_chunks[0]);
+            f.render_widget(detail_para, body_chunks[1]);
+        }
+        Screen::CoordinatorLive => {
+            let body_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+                .split(chunks[1]);
+            let right_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .split(body_chunks[1]);
 
-            let status_line = if state.is_coordinator_running() {
+            let status_line = if state.is_coordinator_paused() {
+                "PAUSED (awaiting resume)".to_string()
+            } else if state.is_coordinator_running() {
                 format!(
-                    "Running: {} ({}s) {}",
+                    "Running: {} ({}) {}",
                     state
                         .coordinator_running_action
                         .as_deref()
                         .unwrap_or("unknown"),
-                    state.coordinator_elapsed_seconds().unwrap_or(0),
+                    format_hms(state.coordinator_elapsed_seconds().unwrap_or(0)),
                     state.coordinator_spinner_frame()
                 )
             } else {
@@ -1124,18 +1181,90 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
             };
             let refresh_line = state
                 .coordinator_last_refresh
-                .map(|ts| format!("Last refresh: {}s ago", ts.elapsed().as_secs()))
+                .map(|ts| format!("Last refresh: {} ago", format_hms(ts.elapsed().as_secs())))
                 .unwrap_or_else(|| "Last refresh: n/a".to_string());
+            let events_rate_line = state
+                .coordinator_events_per_sec
+                .map(|v| format!("Events/sec: {:.2}", v))
+                .unwrap_or_else(|| "Events/sec: n/a".to_string());
+            let event_age_line = state
+                .coordinator_last_event_age
+                .map(|d| format!("Last event age: {}", format_hms(d.as_secs())))
+                .unwrap_or_else(|| "Last event age: n/a".to_string());
+            let run_id_line = state
+                .coordinator_current_run_id
+                .as_deref()
+                .map(|run_id| format!("Run ID: {}", run_id))
+                .unwrap_or_else(|| "Run ID: n/a".to_string());
             let result_line = state
                 .coordinator_last_result
                 .clone()
                 .unwrap_or_else(|| "Last result: n/a".to_string());
             let runtime = format!(
-                "Coordinator runtime\n\n{}\n{}\n{}\n\n{}\n\nActions:\n- r: run full cycle\n- y: sync registry\n- c: reconcile\n- k: stop (graceful)\n- l: refresh status",
-                status_line, snapshot_line, refresh_line, result_line
+                "Coordinator runtime\n\n{}\n{}\n{}\n{}\n{}\n{}\n\n{}\n\nActions:\n- r: run full cycle\n- y: sync registry\n- c: reconcile\n- u: resume paused run\n- k: stop\n- l: refresh status",
+                status_line,
+                snapshot_line,
+                refresh_line,
+                events_rate_line,
+                event_age_line,
+                run_id_line,
+                result_line
             );
-            let runtime_para = wrapped_paragraph(runtime, "Live Runtime");
-            f.render_widget(runtime_para, right_chunks[1]);
+            let runtime_para = wrapped_paragraph(runtime, "Runtime");
+            f.render_widget(runtime_para, body_chunks[0]);
+
+            let mut active_view = String::new();
+            if let Some(snapshot) = &state.coordinator_snapshot {
+                if snapshot.active_tasks.is_empty() {
+                    active_view.push_str("No active tasks.\n");
+                } else {
+                    for (idx, task) in snapshot.active_tasks.iter().take(8).enumerate() {
+                        let frames = ["|", "/", "-", "\\"];
+                        let spinner = frames
+                            [((state.coordinator_spinner_tick as usize) + idx) % frames.len()];
+                        active_view.push_str(&format!(
+                            "{} {} [{}|{}|{}] tool={} hb={} updated={}\n",
+                            spinner,
+                            task.id,
+                            task.state,
+                            task.runtime_status,
+                            task.current_phase,
+                            task.tool,
+                            task.last_heartbeat,
+                            task.updated_at
+                        ));
+                        if !task.last_error.is_empty() {
+                            active_view.push_str(&format!("    error: {}\n", task.last_error));
+                        }
+                    }
+                }
+            } else {
+                active_view.push_str("No registry snapshot.\n");
+            }
+
+            if !state.coordinator_events.is_empty() {
+                active_view.push_str("\nRecent active task events:\n");
+                for line in state.coordinator_events.iter().rev().take(8).rev() {
+                    active_view.push_str("- ");
+                    active_view.push_str(line);
+                    active_view.push('\n');
+                }
+            }
+            let active_para = wrapped_paragraph(active_view, "Live Tasks");
+            f.render_widget(active_para, right_chunks[0]);
+
+            let mut events_view = String::new();
+            if state.coordinator_events.is_empty() {
+                events_view.push_str("No coordinator events yet.\n");
+            } else {
+                for line in state.coordinator_events.iter().rev().take(18).rev() {
+                    events_view.push_str("- ");
+                    events_view.push_str(line);
+                    events_view.push('\n');
+                }
+            }
+            let events_para = wrapped_paragraph(events_view, "Essential Events");
+            f.render_widget(events_para, right_chunks[1]);
         }
         Screen::Tools => {
             let body_chunks = Layout::default()
@@ -1378,6 +1507,9 @@ fn ui(f: &mut Frame, state: &AppState, full_clear: bool) {
     .block(panel("Navigation"));
     f.render_widget(footer, chunks[2]);
 
+    if state.has_coordinator_pause_prompt() {
+        render_coordinator_pause_overlay(f, state);
+    }
     if state.help_open {
         render_help_overlay(f, state);
     }
@@ -1444,4 +1576,35 @@ fn render_help_overlay(f: &mut Frame, state: &AppState) {
         .wrap(Wrap { trim: true });
 
     f.render_widget(help_para, area);
+}
+
+fn render_coordinator_pause_overlay(f: &mut Frame, state: &AppState) {
+    let area = ui::centered_rect(75, 45, f.size());
+    f.render_widget(Clear, area);
+    let message = state
+        .coordinator_pause_error
+        .as_deref()
+        .unwrap_or("Coordinator paused due to an error.");
+    let action = state.coordinator_pause_action.as_deref().unwrap_or("run");
+    let retry_target = match (
+        state.coordinator_pause_task_id.as_deref(),
+        state.coordinator_pause_phase.as_deref(),
+    ) {
+        (Some(task), Some(phase)) => format!("task={} phase={}", task, phase),
+        (Some(task), None) => format!("task={} phase=dev", task),
+        _ => "global/blocking (no task context)".to_string(),
+    };
+    let text = format!(
+        "Coordinator Paused (blocking error)\n\n{}\n\nTarget:\n- {}\n\nFix the issue in your repo/worktree, then choose:\n\n- Press 'r' or Enter: retry failed phase, then resume run\n- Press 's': skip failed phase (move task to todo), then resume run\n- Press 'u': send manual resume signal (same as `macc coordinator resume`)\n- Press 'o': open Logs screen\n- Press 'k' or Esc: stop and keep paused state\n- Press 'c': resume run without retry\n\nAction: {}\n",
+        message, retry_target, action
+    );
+    let popup = Paragraph::new(text)
+        .block(
+            Block::default()
+                .title("Coordinator Error")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(popup, area);
 }

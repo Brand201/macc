@@ -90,7 +90,7 @@ impl CliOverrides {
             if allowed_set.contains(tool.as_str()) {
                 filtered_tools.push(tool.clone());
             } else {
-                eprintln!("Warning: Unknown tool: {}", tool);
+                tracing::warn!("Unknown tool referenced in overrides: {}", tool);
             }
         }
 
@@ -139,6 +139,9 @@ pub fn resolve(canonical: &CanonicalConfig, overrides: &CliOverrides) -> Resolve
         .as_ref()
         .map(|s| s.skills.clone())
         .unwrap_or_default();
+    for required in crate::required_skills() {
+        skills.push((*required).to_string());
+    }
     skills.sort();
     skills.dedup();
 
@@ -259,6 +262,7 @@ pub fn resolve_fetch_units(
 
 fn collect_skill_ids(resolved: &ResolvedConfig) -> Vec<String> {
     let mut ids: Vec<String> = resolved.selections.skills.clone();
+    ids.extend(crate::required_skills().iter().map(|id| (*id).to_string()));
 
     for value in resolved.tools.config.values() {
         ids.extend(read_string_list(value, "skills"));
@@ -329,7 +333,11 @@ mod tests {
 
         assert_eq!(resolved.version, "v1");
         assert_eq!(resolved.tools.enabled, vec![tool_one, tool_two]);
-        assert_eq!(resolved.selections.skills, vec!["a", "z"]);
+        assert!(resolved.selections.skills.contains(&"a".to_string()));
+        assert!(resolved.selections.skills.contains(&"z".to_string()));
+        for required in crate::required_skills() {
+            assert!(resolved.selections.skills.contains(&required.to_string()));
+        }
         assert_eq!(resolved.selections.agents, vec!["b", "y"]);
 
         // Check stable ordering of inline standards (BTreeMap)
@@ -339,6 +347,27 @@ mod tests {
             resolved.standards.inline.get("language").unwrap(),
             "English"
         );
+    }
+
+    #[test]
+    fn test_resolve_reinjects_required_skills() {
+        let canonical = CanonicalConfig {
+            version: None,
+            tools: ToolsConfig::default(),
+            standards: StandardsConfig::default(),
+            selections: Some(SelectionsConfig {
+                skills: vec![],
+                agents: vec![],
+                mcp: vec![],
+            }),
+            automation: crate::config::AutomationConfig::default(),
+            mcp_templates: Vec::new(),
+        };
+
+        let resolved = resolve(&canonical, &CliOverrides::default());
+        for required in crate::required_skills() {
+            assert!(resolved.selections.skills.contains(&required.to_string()));
+        }
     }
 
     #[test]

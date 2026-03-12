@@ -114,7 +114,7 @@ For production-like usage, the recommended sequence is:
 - Before install, users must confirm they already have account/API credentials.
 - After install, run login/API-key setup through the tool's own command flow.
 - Validate with `macc doctor`.
-- Generate/update tool-specific context files with:
+- Generate/update tool-specific context files with prompts sent to the selected AI tool (the tool edits files directly):
   - CLI: `macc context [--tool <tool_id>]`
   - TUI: `Tools` screen, press `f` on a selected tool.
 
@@ -130,6 +130,72 @@ For production-like usage, the recommended sequence is:
   - `.macc/log/coordinator/`
   - `.macc/log/performer/`
 
+#### 3.4.4.1 Coordinator mechanism (end-to-end diagram)
+
+```mermaid
+flowchart TD
+    A["macc coordinator"] --> B["TUI Coordinator Live + run loop"]
+    B --> C["Load config + PRD + registry (SQLite source of truth)"]
+    C --> D["Select ready tasks (priority/dependencies/exclusive_resources)"]
+    D --> E{"Reusable clean worktree available?"}
+    E -- Yes --> F["Reuse worktree slot"]
+    E -- No --> G["Create new worktree slot (<= Max Parallel)"]
+    F --> H["Ensure branch merged guard + checkout base + create new task branch"]
+    G --> H
+    H --> I["Write worktree.prd.json + sync context files + tool.json"]
+    I --> J["Spawn performer (phase=dev)"]
+    J --> K["Stream events (heartbeat/progress/phase_result/commit_created)"]
+    K --> L["Advance FSM: dev -> review -> fix (optional) -> integrate -> merge"]
+    L --> M{"Local merge success?"}
+    M -- Yes --> N["Task -> merged"]
+    M -- No --> O["AI merge-fix policy"]
+    O --> P{"Still failing?"}
+    P -- Yes --> Q["Pause coordinator (blocking) + wait resume signal"]
+    P -- No --> N
+    N --> R["Best-effort branch cleanup (warning if skipped/deferred)"]
+    R --> S["Maintenance queue retry for deferred cleanup"]
+    S --> T{"No todo and no active?"}
+    T -- No --> D
+    T -- Yes --> U["Run complete"]
+```
+
+```mermaid
+sequenceDiagram
+    participant U as User/TUI
+    participant C as Coordinator
+    participant W as Worktree
+    participant P as Performer
+    participant R as Reviewer
+    participant G as Git
+
+    U->>C: Start run
+    C->>C: Select ready task
+    C->>W: Reuse/create slot + create task branch from base
+    C->>W: Write worktree.prd.json + sync context files
+    C->>P: Launch dev phase
+    P-->>C: heartbeat/progress
+    P-->>C: phase_result(done) + commit_created
+    C->>R: Launch review phase on same worktree branch
+    R-->>C: review_done (OK / changes requested)
+    alt changes requested
+        C->>P: Launch fix phase
+        P-->>C: phase_result(done)
+    end
+    C->>C: integrate phase
+    C->>G: Merge task branch into base
+    alt merge conflict
+        C->>G: AI merge-fix attempt
+        alt still failing
+            C-->>U: Pause (blocking) + wait resume
+        else resolved
+            C->>C: Continue
+        end
+    else merge success
+        C->>G: Branch cleanup (best effort)
+        C->>C: Queue deferred cleanup for maintenance retry
+    end
+```
+
 #### 3.4.5 Failure recovery
 Standard recovery sequence:
 1) `macc coordinator status`
@@ -144,6 +210,38 @@ Stop flow:
 
 Project reset:
 - `macc clear` (confirmation required, worktree cleanup executed first, only MACC-managed paths removed).
+
+##### 3.4.5.1 Error codes + auto-retry (v1)
+MACC records structured error codes for failures to distinguish origin and apply consistent remediation.
+
+Error code schema (v1):
+- `E100` Runner/Tool
+  - `E101` Runner exited non-zero
+  - `E102` Tool runner not found / not executable
+  - `E103` Tool output malformed / parsing failed
+- `E200` Capability/Contract
+  - `E201` Requested unavailable tool
+  - `E202` Capability guard triggered
+- `E300` Worktree/FS
+  - `E301` Worktree missing
+  - `E302` PRD missing
+  - `E303` tool.json missing
+- `E400` Coordinator/Registry
+  - `E401` Task registry read/write failure
+  - `E402` Task state transition invalid
+- `E500` Merge
+  - `E501` Merge conflict
+  - `E502` Merge worker failed
+- `E900` Unknown/Unexpected
+  - `E901` Unknown fatal error
+
+Auto-retry controls (coordinator):
+- `ERROR_CODE_RETRY_LIST`: comma-separated list of error codes eligible for auto-retry.
+- `ERROR_CODE_RETRY_MAX`: max retries per task for eligible codes.
+
+Default policy:
+- `ERROR_CODE_RETRY_LIST=E101,E102,E103,E301,E302,E303`
+- `ERROR_CODE_RETRY_MAX=2`
 
 ---
 
@@ -426,9 +524,10 @@ MCP servers may be provided via remote packages (Git/HTTP) using §8.5. The pack
 ### 12.2 Coordinator + Performer (worktree orchestration)
 
 MACC automation is split into:
-1) `coordinator.sh` (project-level orchestrator): reads PRD, maintains `.macc/automation/task/task_registry.json`, dispatches READY tasks by constraints (`priority`, `dependencies`, `exclusive_resources`, `category`, `id`), and tracks transitions.
-2) `performer.sh` (worktree-level executor): runs in a single worktree and delegates to the tool-specific runner from `.macc/tool.json`.
-3) `runners/<tool>.performer.sh`: tool-specific execution strategy.
+1) Native Rust coordinator control-plane (primary path): reads PRD, maintains `.macc/automation/task/task_registry.json`, dispatches READY tasks by constraints (`priority`, `dependencies`, `exclusive_resources`, `category`, `id`), supervises performers asynchronously, and tracks transitions.
+2) `coordinator.sh` (thin wrapper): forwards to native Rust coordinator actions.
+3) `performer.sh` (worktree-level executor): runs in a single worktree and delegates to the tool-specific runner from `.macc/tool.json`.
+4) `runners/<tool>.performer.sh`: tool-specific execution strategy.
 
 Observability:
 - Coordinator and performer runtime logs are centralized in `.macc/log/`:
@@ -473,15 +572,50 @@ Important behavior:
 
 - `macc coordinator` runs full-cycle mode by default (`run`).
 - Full-cycle loop: `sync -> dispatch -> advance -> reconcile -> cleanup` until convergence.
-- `macc coordinator [run|dispatch|advance|sync|status|reconcile|unlock|cleanup]`
+- `macc coordinator [run|dispatch|advance|resume|sync|status|reconcile|unlock|cleanup]`
+- `run`, `dispatch`, `advance`, `reconcile`, and `cleanup` are handled natively in Rust.
+- Worktrees are reused as worker slots (not task-coupled names): once a task is merged, the slot is reset to reference, moved to a fresh branch, refreshed for the new task, then relaunched.
+- New worker worktrees are created only when no reusable slot is available; pool size is bounded by `max_parallel`.
 - CLI options can override YAML settings (`--max-dispatch`, `--max-parallel`, `--timeout-seconds`, etc.).
-- Extra raw args can be passed to the script with `--` (example: `macc coordinator unlock -- --all`).
+- Coordinator log buffering/flush can be configured without env vars:
+  - CLI: `--log-flush-lines <N>` and `--log-flush-ms <N>`
+  - YAML (`automation.coordinator`): `log_flush_lines`, `log_flush_ms`
+  - TUI (Coordinator Settings): `Log Flush Lines`, `Log Flush Interval (ms)`
+  - Precedence: CLI override -> YAML value -> env (`COORDINATOR_LOG_FLUSH_LINES` / `COORDINATOR_LOG_FLUSH_MS`) -> built-in defaults.
+- SQLite -> JSON compatibility export debounce is configurable as an official coordinator setting:
+  - CLI: `--mirror-json-debounce-ms <ms>`
+  - YAML (`automation.coordinator`): `mirror_json_debounce_ms`
+  - TUI (Coordinator Settings): `JSON Export Debounce (ms)`
+  - Env fallback remains supported: `COORDINATOR_JSON_EXPORT_DEBOUNCE_MS=<ms>`
+  - `0` keeps immediate export (legacy behavior).
+- Stale heartbeat policy is enforced during control-plane runs via env:
+  - `STALE_HEARTBEAT_SECONDS` (0 disables)
+  - `STALE_HEARTBEAT_ACTION=retry|block|requeue`
+- Extra raw args with `--` are for coordinator subcommands that require raw passthrough args.
 - Optional VCS automation hook:
   - `COORDINATOR_VCS_HOOK=/path/to/hook.sh`
   - Hook modes called by `advance`: `pr_create`, `review_status`, `ci_status`, `queue_status`, `merge_status`
   - Hook receives task context via env (`MACC_TASK_ID`, `MACC_TASK_WORKTREE`, `MACC_TASK_BRANCH`, `MACC_TASK_BASE_BRANCH`, `MACC_TASK_PR_URL`, `MACC_TASK_TOOL`).
   - Hook returns JSON object on stdout (mode-specific fields such as `pr_url`, `decision`, `status`, `reason`).
   - Without hook, coordinator can use local fallback merge when `COORDINATOR_AUTOMERGE=true`.
+
+### 12.3.1 Realtime orchestrator target (next evolution)
+
+To remove ambiguity between "task dispatched" and "task actually running", MACC targets a split model:
+
+- Workflow state remains in `task.state` (`todo`, `in_progress`, `pr_open`, ...).
+- Runtime process lifecycle moves to `task.task_runtime.status` (`dispatched`, `running`, `phase_done`, `failed`, `stale`).
+
+Migration direction:
+
+1. strict transition table in core (single source of truth),
+2. versioned event contract (JSON schema),
+3. heartbeat event consumer now updates `task_runtime.last_heartbeat` (cursor is in-memory today),
+4. control-plane loop split (scheduler / event monitor / runtime monitor),
+5. TUI live timeline + blocking error gate (Retry / Skip / Stop / Logs).
+
+Reference short design doc:
+- `docs/COORDINATOR_REALTIME.md`
 
 ---
 

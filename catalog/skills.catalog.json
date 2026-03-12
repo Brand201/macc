@@ -4,6 +4,63 @@
   "updated_at": "2026-01-30",
   "entries": [
     {
+      "id": "macc-code-reviewer",
+      "name": "macc code reviewer",
+      "description": "AI code reviewer for MACC tasks, providing feedback and validation against project standards.",
+      "tags": [
+        "macc",
+        "review",
+        "quality"
+      ],
+      "selector": {
+        "subpath": "skills/macc-code-reviewer"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/mod-one/skills.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "macc-performer",
+      "name": "macc performer",
+      "description": "Core implementation agent for MACC tasks, following the implement-act-observe cycle.",
+      "tags": [
+        "macc",
+        "performer",
+        "implementation"
+      ],
+      "selector": {
+        "subpath": "skills/macc-performer"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/mod-one/skills.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "macc-prd-planner",
+      "name": "macc prd planner",
+      "description": "High-level project planner for MACC, generating PRDs and task registries.",
+      "tags": [
+        "macc",
+        "planning",
+        "prd"
+      ],
+      "selector": {
+        "subpath": "skills/macc-prd-planner"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/mod-one/skills.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
       "id": "dfigma-implement-designc",
       "name": "figma implement design",
       "description": "This skill provides a structured workflow for translating Figma designs into production-ready code with pixel-perfect accuracy.",
@@ -144,7 +201,7 @@
         "test"
       ],
       "selector": {
-        "subpath": ".cursor/skills/python-testing"
+        "subpath": "skills/python-testing"
       },
       "source": {
         "kind": "git",
@@ -229,9 +286,7 @@
         "ref": "main",
         "checksum": null
       }
-    }
-
-    ,
+    },
     {
       "id": "helm-chart-scaffolding",
       "name": "helm chart scaffolding",
@@ -246,6 +301,130 @@
       "source": {
         "kind": "git",
         "url": "https://github.com/wshobson/agents.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "react-vendoring",
+      "name": "react-vendoring",
+      "description": "Manages React vendoring, react-server layer boundaries, and Flight API integration within the Next.js App Router.",
+      "tags": [
+        "next.js",
+        "react",
+        "vendoring",
+        "app-router",
+        "rsc",
+        "turbopack",
+        "typescript"
+      ],
+      "selector": {
+        "subpath": ".agents/skills/react-vendoring"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/vercel/next.js.git",
+        "ref": "canary",
+        "checksum": null
+      }
+    },
+    {
+      "id": "react-verify",
+      "name": "react verify",
+      "description": "A comprehensive verification tool for React contributions that automates code formatting, linting, type checking, and testing to ensure all requirements are met before committing.",
+      "tags": [
+        "react",
+        "verification",
+        "testing",
+        "linting",
+        "formatting",
+        "type-checking",
+        "ci-cd",
+        "contribution-workflow"
+      ],
+      "selector": {
+        "subpath": ".claude/skills/verify"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/facebook/react.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "fullstack-developer",
+      "name": "Full-Stack Developer",
+      "description": "Provides comprehensive expertise in modern full-stack web development, covering frontend frameworks like React and Next.js, backend services with Node.js, and database management with PostgreSQL or MongoDB.",
+      "tags": [
+        "react",
+        "node.js",
+        "typescript",
+        "next.js",
+        "full-stack",
+        "web-development",
+        "api-design",
+        "postgresql",
+        "mongodb",
+        "prisma",
+        "tailwind-css"
+      ],
+      "selector": {
+        "subpath": "awesome_agent_skills/fullstack-developer"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/Shubhamsaboo/awesome-llm-apps.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "neo-app-mode",
+      "name": "Neo App Mode",
+      "description": "Scaffolds production-ready full-stack applications with a React/Vite/Tailwind frontend and Node/Express/MongoDB backend using a structured requirement intake and MVC architecture.",
+      "tags": [
+        "full-stack",
+        "scaffolding",
+        "react",
+        "nodejs",
+        "express",
+        "mongodb",
+        "mvc",
+        "tailwind",
+        "vite",
+        "boilerplate"
+      ],
+      "selector": {
+        "subpath": "skills/chinmayagit/webappbuilder"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/openclaw/skills.git",
+        "ref": "main",
+        "checksum": null
+      }
+    },
+    {
+      "id": "frontend-gram",
+      "name": "frontend gram",
+      "description": "Provides comprehensive rules and best practices for React frontend development, emphasizing component reuse, React Query for state management, and strict adherence to the Moonshine design system.",
+      "tags": [
+        "react",
+        "frontend",
+        "typescript",
+        "tailwind-css",
+        "react-query",
+        "pnpm",
+        "design-system",
+        "component-architecture"
+      ],
+      "selector": {
+        "subpath": ".agents/skills/frontend"
+      },
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/speakeasy-api/gram.git",
         "ref": "main",
         "checksum": null
       }

@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://macc.local/schemas/coordinator-event.v1.schema.json",
+  "title": "MACC Coordinator Event v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "event_id",
+    "seq",
+    "ts",
+    "source",
+    "type",
+    "status"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "command_start",
+        "command_end",
+        "command_error",
+        "task_transition",
+        "task_dispatched",
+        "performer_complete",
+        "task_blocked",
+        "dispatch_complete",
+        "started",
+        "progress",
+        "phase_result",
+        "commit_created",
+        "review_done",
+        "integrate_done",
+        "failed",
+        "heartbeat",
+        "task_runtime_retry",
+        "task_runtime_requeue",
+        "task_runtime_stale",
+        "phase_retry",
+        "phase_skipped",
+        "events_rotated",
+        "events_compacted",
+        "storage_sync",
+        "storage_sync_ok",
+        "storage_sync_failed",
+        "storage_sync_latency_ms",
+        "storage_mismatch_count",
+        "task_phase_duration_seconds",
+        "task_retries_total",
+        "stale_runtime_total",
+        "merge_fail_total",
+        "merge_fix_attempt_total",
+        "task_retry_count",
+        "task_slo_warning",
+        "task_runtime_orphan",
+        "local_merge_failed",
+        "merge_worker_started",
+        "merge_worker_complete"
+      ]
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["dev", "review", "fix", "integrate", "merge"]
+    },
+    "status": {
+      "type": "string",
+      "minLength": 1
+    },
+    "payload": {
+      "type": "object"
+    },
+    "event": {
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "msg": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string"
+    },
+    "detail": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

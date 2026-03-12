@@ -186,6 +186,10 @@ macc coordinator
 ```
 
 `macc coordinator` runs the full loop (`sync -> dispatch -> advance -> reconcile -> cleanup`) until convergence.
+If a merge conflict stays unresolved (even after AI merge-fix hook), coordinator enters a paused state and waits for operator signal:
+```bash
+macc coordinator resume
+```
 
 Useful commands during execution:
 
@@ -194,6 +198,41 @@ macc coordinator status
 macc coordinator sync
 macc coordinator reconcile
 ```
+
+## Error codes and auto-retry
+
+MACC emits structured error codes when a performer or coordinator step fails. These codes are written into coordinator events and task runtime metadata.
+
+### Error code schema (v1)
+
+- `E100` Runner/Tool
+  - `E101` Runner exited non-zero
+  - `E102` Tool runner not found / not executable
+  - `E103` Tool output malformed / parsing failed
+- `E200` Capability/Contract
+  - `E201` Requested unavailable tool
+  - `E202` Capability guard triggered
+- `E300` Worktree/FS
+  - `E301` Worktree missing
+  - `E302` PRD missing
+  - `E303` tool.json missing
+- `E400` Coordinator/Registry
+  - `E401` Task registry read/write failure
+  - `E402` Task state transition invalid
+- `E500` Merge
+  - `E501` Merge conflict
+  - `E502` Merge worker failed
+- `E900` Unknown/Unexpected
+  - `E901` Unknown fatal error
+
+### Auto-retry policy (coordinator)
+
+Coordinator can auto-retry failed tasks based on error code:
+
+- `ERROR_CODE_RETRY_LIST` default: `E101,E102,E103,E301,E302,E303`
+- `ERROR_CODE_RETRY_MAX` default: `2`
+
+When a failed task has an error code in the allow-list and retries are below the max, the task is requeued to `todo` with an `auto_retry:<code>` reason.
 
 Logs:
 - coordinator: `.macc/log/coordinator/`
@@ -267,7 +306,7 @@ macc clear
 - `macc tool update <tool_id> [--check] [-y|--yes] [--force] [--rollback-on-fail]`: update one installed tool.
 - `macc tool update --all [--only enabled|installed] [--check] [-y|--yes] [--force] [--rollback-on-fail]`: batch update tools.
 - `macc tool outdated [--only enabled|installed]`: show installed/current/latest status and outdated tools.
-- `macc context [--tool <tool_id>] [--from <file> ...] [--dry-run] [--print-prompt]`: generate/update tool context markdown files (for example `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`) using the corresponding installed tool.
+- `macc context [--tool <tool_id>] [--from <file> ...] [--dry-run] [--print-prompt]`: sends a context prompt to the selected AI tool; the tool must edit its target context file in-place (for example `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`).
 - In TUI `Tools` screen, press `f` to generate context for the selected tool.
 - To prevent `macc apply` from overwriting existing context files, set per-tool protection in `.macc/macc.yaml`:
   - `tools.config.<tool_id>.context.protect: true`
@@ -306,10 +345,12 @@ Worktrees let MACC run multiple isolated task branches and tool sessions in para
 
 ### Coordinator
 
-Coordinator orchestrates the end-to-end automation cycle: it reads the task registry, dispatches work to tools, tracks state transitions, and reconciles/cleans up until convergence.
+Coordinator orchestrates the end-to-end automation cycle: it reads the task registry, dispatches work to tools, tracks state transitions, supervises performers, and reconciles/cleans up until convergence.
 
 - `macc coordinator` (default full cycle: sync -> dispatch -> advance -> reconcile -> cleanup in loop until convergence)
+- `macc coordinator` opens the TUI `Coordinator Live` screen and starts coordinator run.
 - `macc coordinator [run|dispatch|advance|sync|status|reconcile|unlock|cleanup|stop]`
+- `macc coordinator run --no-tui` keeps the previous headless CLI behavior.
 - `macc coordinator stop [--graceful] [--remove-worktrees] [--remove-branches]`
 - Coordinator options can override config at runtime:
   - `--prd`, `--coordinator-tool`
@@ -317,8 +358,16 @@ Coordinator orchestrates the end-to-end automation cycle: it reads the task regi
   - `--max-dispatch`, `--max-parallel`, `--timeout-seconds`
   - `--phase-runner-max-attempts`
   - `--stale-claimed-seconds`, `--stale-in-progress-seconds`, `--stale-changes-requested-seconds`, `--stale-action`
+  - Heartbeat events update `task_runtime.last_heartbeat` from `events.jsonl`.
+  - Runtime stale heartbeat policy via env: `STALE_HEARTBEAT_SECONDS`, `STALE_HEARTBEAT_ACTION=retry|block|requeue` (retry/requeue resets task to `todo`; retry also increments runtime retries).
 - Task registry path is fixed to `.macc/automation/task/task_registry.json`.
-- Use `--` to forward raw args directly to `coordinator.sh`.
+- Coordinator emits event bus lines to `.macc/log/coordinator/events.jsonl` (used by TUI live screen).
+- `run`, `dispatch`, `advance`, `reconcile`, and `cleanup` are executed by native Rust handlers (async supervision + retries/timeouts per phase).
+- Legacy shell coordinator removed; all coordinator actions run natively in Rust.
+- Worktrees are managed as a reusable worker pool (not task-named): a merged/clean slot is reset to the reference branch, switched to a fresh branch, updated (`worktree.prd.json` + apply), then reused for the next task.
+- If no reusable slot is available, coordinator creates a new worker worktree; total pool size is bounded by `--max-parallel` / `automation.coordinator.max_parallel`.
+- Realtime orchestrator target design (state model + event contract + rollout): `docs/COORDINATOR_REALTIME.md`.
+- Use `--` only for coordinator subcommands that require raw passthrough args.
 
 ## TUI overview
 
@@ -327,7 +376,8 @@ Main screens:
 - Home
 - Tools
 - Tool Settings
-- Automation / Coordinator
+- Automation / Coordinator (settings only)
+- Coordinator Live (runtime monitoring)
 - Skills
 - MCP
 - Logs
@@ -336,7 +386,7 @@ Main screens:
 
 Common keys:
 
-- Navigation: `h` Home, `t` Tools, `o` Automation, `m` MCP, `g` Logs, `p` Preview
+- Navigation: `h` Home, `t` Tools, `o` Automation, `v` Coordinator Live, `m` MCP, `g` Logs, `p` Preview
 - Save/apply: `s` Save config, `x` Apply
 - Help: `?`
 - Back: `Backspace`
@@ -383,12 +433,10 @@ Important paths:
 
 ## Automation: coordinator + performer
 
-MACC installs embedded scripts into `.macc/automation/`:
+MACC installs embedded automation assets into `.macc/automation/`:
 
-- `coordinator.sh`: orchestration loop for task registry + dispatch + sync/reconcile/cleanup/unlock.
-  - Includes `advance` phase for PR/review/CI/merge queue progression.
-  - Supports optional VCS integration hook via `COORDINATOR_VCS_HOOK` for PR create/status, review status, CI status, queue status, and merge status.
-  - If no hook is configured, local fallback can auto-progress and locally merge (`COORDINATOR_AUTOMERGE=true`).
+- Native Rust coordinator control-plane (primary runtime path for `run` + core actions).
+- `coordinator.sh`: thin wrapper for native Rust coordinator actions.
 - `performer.sh`: worktree executor.
 - `runners/<tool>.performer.sh`: tool-specific execution scripts.
 - All automation logs are written under `.macc/log/` (coordinator + performer).
@@ -422,6 +470,7 @@ Performer session management is project-level, tool-aware, and lease-based:
 
 - `docs/README.md`: documentation index (active vs historical docs).
 - `MACC.md`: full architecture/specification.
+- `docs/COORDINATOR_REALTIME.md`: short design doc for event-driven coordinator evolution.
 - `CHANGELOG.md`: release notes by version (Keep a Changelog format).
 - `SECURITY.md`: vulnerability disclosure and supported version policy.
 - `docs/CONFIG.md`: canonical config schema and semantics.

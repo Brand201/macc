@@ -1,0 +1,15 @@
+pub mod backups;
+pub mod catalog;
+pub mod clear;
+pub mod context;
+pub mod coordinator;
+pub mod coordinator_workflow;
+pub mod diagnostic;
+pub mod interaction;
+pub mod lifecycle;
+pub mod logs;
+pub mod migrate;
+pub mod project;
+pub mod task_runner;
+pub mod tooling;
+pub mod worktree;

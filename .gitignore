@@ -57,3 +57,5 @@ CLAUDE.md
 .gemini/
 GEMINI.md
 .geminiignore
+performer.sh
+worktree.prd.json

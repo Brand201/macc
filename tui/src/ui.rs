@@ -114,6 +114,9 @@ pub struct HeaderContext<'a> {
     pub project: &'a str,
     pub config_label: &'a str,
     pub errors: usize,
+    pub coordinator_active: bool,
+    pub coordinator_paused: bool,
+    pub coordinator_action: Option<&'a str>,
     pub status: Option<(UiStatusLevel, String)>,
     pub width: u16,
 }
@@ -121,22 +124,39 @@ pub struct HeaderContext<'a> {
 pub fn header_lines(ctx: &HeaderContext<'_>, t: &Theme) -> Vec<Line<'static>> {
     let max = ctx.width.saturating_sub(6) as usize;
     let project_short = truncate_middle(ctx.project, max.saturating_sub(12));
+    let mut top_line = vec![
+        Span::styled(
+            ctx.app_name.to_string(),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            ctx.screen_title.to_string(),
+            Style::default().fg(t.accent_dim),
+        ),
+        Span::raw("  "),
+        Span::styled("mode", Style::default().fg(t.muted)),
+        Span::raw(": "),
+        Span::styled(ctx.mode.to_string(), Style::default().fg(t.accent)),
+    ];
+    if ctx.coordinator_active {
+        let action = ctx.coordinator_action.unwrap_or("run");
+        top_line.push(Span::raw("  "));
+        top_line.push(Span::styled(
+            format!("[coord:{}]", action),
+            Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if ctx.coordinator_paused {
+        top_line.push(Span::raw("  "));
+        top_line.push(Span::styled(
+            "PAUSED (awaiting resume)".to_string(),
+            Style::default().fg(t.bad).add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                ctx.app_name.to_string(),
-                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                ctx.screen_title.to_string(),
-                Style::default().fg(t.accent_dim),
-            ),
-            Span::raw("  "),
-            Span::styled("mode", Style::default().fg(t.muted)),
-            Span::raw(": "),
-            Span::styled(ctx.mode.to_string(), Style::default().fg(t.accent)),
-        ]),
+        Line::from(top_line),
         Line::from(vec![
             Span::styled("project", Style::default().fg(t.muted)),
             Span::raw(": "),

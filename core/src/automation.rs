@@ -3,6 +3,8 @@ use std::path::{Component, Path, PathBuf};
 
 const EMBEDDED_PERFORMER_SH: &str = include_str!("../../automat/performer.sh");
 const EMBEDDED_COORDINATOR_SH: &str = include_str!("../../automat/coordinator.sh");
+const EMBEDDED_MERGE_WORKER_SH: &str = include_str!("../../automat/merge_worker.sh");
+const EMBEDDED_MERGE_FIX_HOOK_SH: &str = include_str!("../../automat/hooks/ai-merge-fix.sh");
 include!(concat!(env!("OUT_DIR"), "/embedded_automation_runners.rs"));
 
 pub fn ensure_embedded_automation_scripts(paths: &ProjectPaths) -> Result<Vec<PathBuf>> {
@@ -17,7 +19,13 @@ pub fn ensure_embedded_automation_scripts(paths: &ProjectPaths) -> Result<Vec<Pa
         action: "create automation runners directory".into(),
         source: e,
     })?;
-
+    if let Some(parent) = paths.automation_merge_fix_hook_path().parent() {
+        std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
+            path: parent.to_string_lossy().into(),
+            action: "create automation hooks directory".into(),
+            source: e,
+        })?;
+    }
     if write_executable_if_changed(&paths.automation_performer_path(), EMBEDDED_PERFORMER_SH)? {
         created.push(paths.automation_performer_path());
     }
@@ -26,6 +34,18 @@ pub fn ensure_embedded_automation_scripts(paths: &ProjectPaths) -> Result<Vec<Pa
         EMBEDDED_COORDINATOR_SH,
     )? {
         created.push(paths.automation_coordinator_path());
+    }
+    if write_executable_if_changed(
+        &paths.automation_merge_worker_path(),
+        EMBEDDED_MERGE_WORKER_SH,
+    )? {
+        created.push(paths.automation_merge_worker_path());
+    }
+    if write_executable_if_changed(
+        &paths.automation_merge_fix_hook_path(),
+        EMBEDDED_MERGE_FIX_HOOK_SH,
+    )? {
+        created.push(paths.automation_merge_fix_hook_path());
     }
     for (runner_ref, content) in EMBEDDED_RUNNERS {
         let local_path = local_runner_path(paths, runner_ref)?;

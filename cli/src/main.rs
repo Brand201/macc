@@ -1,19 +1,27 @@
 use clap::{Parser, Subcommand};
-use macc_adapter_shared::catalog::{remote_search, SearchKind as RemoteSearchKind};
-use macc_core::catalog::{
-    load_effective_mcp_catalog, load_effective_skills_catalog, McpCatalog, McpEntry, Selector,
-    SkillEntry, SkillsCatalog, Source, SourceKind,
-};
-use macc_core::engine::{Engine, MaccEngine};
-use macc_core::plan::builders::{plan_mcp_install, plan_skill_install};
-use macc_core::plan::ActionPlan;
-use macc_core::resolve::{
-    resolve, resolve_fetch_units, CliOverrides, FetchUnit, Selection, SelectionKind,
-};
-use macc_core::tool::{ToolPerformerSpec, ToolSpec, ToolSpecLoader};
-use macc_core::{load_canonical_config, MaccError, Result};
-use std::collections::BTreeMap;
+use commands::Command;
+#[cfg(test)]
+use macc_core::coordinator::{RuntimeStatus, WorkflowState};
+#[cfg(test)]
+use macc_core::coordinator_storage::CoordinatorStorageTransfer;
+use macc_core::engine::MaccEngine;
+#[cfg(test)]
+use macc_core::Engine;
+use macc_core::{MaccError, Result};
 use std::process::exit;
+use tracing::{debug, error, info};
+
+mod commands;
+mod coordinator;
+mod services;
+#[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
+use macc_core::coordinator::args::{
+    RuntimeStatusFromEventArgs, RuntimeTransitionArgs, StorageSyncArgs, WorkflowTransitionArgs,
+};
+use macc_core::coordinator::types::CoordinatorEnvConfig;
 
 #[derive(Parser)]
 #[command(name = "macc")]
@@ -104,7 +112,7 @@ enum Commands {
         #[command(subcommand)]
         tool_command: ToolCommands,
     },
-    /// Generate tool-specific context files using the corresponding AI tool
+    /// Ask AI tools to update their context files directly in the repo
     Context {
         /// Generate context for a single tool ID
         #[arg(long)]
@@ -112,7 +120,7 @@ enum Commands {
         /// Additional source files to include in the prompt context
         #[arg(long = "from")]
         from_files: Vec<String>,
-        /// Preview only; do not write files
+        /// Preview only; do not run tool commands
         #[arg(long)]
         dry_run: bool,
         /// Print generated prompt(s)
@@ -168,9 +176,12 @@ enum Commands {
     },
     /// Run the project coordinator automation script
     Coordinator {
-        /// Coordinator action (run, dispatch, advance, sync, status, reconcile, unlock, cleanup, stop)
+        /// Coordinator action (run, control-plane-run, dispatch, advance, resume, sync, status, reconcile, unlock, cleanup, retry-phase, cutover-gate, stop, validate-transition, validate-runtime-transition, runtime-status-from-event, storage-import, storage-export, events-export, storage-verify, storage-sync, select-ready-task, state-apply-transition, state-set-runtime, state-task-field, state-task-exists, state-counts, state-locks, state-set-merge-pending, state-set-merge-processed, state-increment-retries, state-upsert-slo-warning, state-slo-metric)
         #[arg(default_value = "run")]
         action: String,
+        /// Disable TUI live view for `macc coordinator run`
+        #[arg(long)]
+        no_tui: bool,
         /// Graceful stop (SIGTERM only, no SIGKILL escalation)
         #[arg(long)]
         graceful: bool,
@@ -210,6 +221,15 @@ enum Commands {
         /// Override PHASE_RUNNER_MAX_ATTEMPTS
         #[arg(long)]
         phase_runner_max_attempts: Option<usize>,
+        /// Flush coordinator log buffer every N lines (default: 32)
+        #[arg(long)]
+        log_flush_lines: Option<usize>,
+        /// Flush coordinator log buffer every N milliseconds (default: 1000)
+        #[arg(long)]
+        log_flush_ms: Option<u64>,
+        /// Debounce SQLite -> JSON compatibility export in milliseconds (0 disables debounce)
+        #[arg(long)]
+        mirror_json_debounce_ms: Option<u64>,
         /// Override STALE_CLAIMED_SECONDS
         #[arg(long)]
         stale_claimed_seconds: Option<usize>,
@@ -222,6 +242,9 @@ enum Commands {
         /// Override STALE_ACTION (abandon, todo, blocked)
         #[arg(long)]
         stale_action: Option<String>,
+        /// Coordinator storage mode (json, dual-write, sqlite)
+        #[arg(long)]
+        storage_mode: Option<String>,
         /// Extra args passed directly to coordinator.sh (use after --)
         #[arg(last = true)]
         extra_args: Vec<String>,
@@ -538,18 +561,32 @@ pub enum BackupsCommands {
 
 fn main() {
     let cli = Cli::parse();
+    init_tracing(cli.verbose);
 
     if cli.verbose {
-        eprintln!("Verbose mode enabled");
+        info!("Verbose mode enabled");
     }
 
     // Initialize the real engine with default registry
     let engine = MaccEngine::new(macc_registry::default_registry());
+    let provider = services::engine_provider::EngineProvider::new(engine);
 
-    if let Err(e) = run_with_engine(cli, engine) {
+    if let Err(e) = run_with_engine_provider(cli, provider) {
+        error!(error = %e, "Command failed");
         eprintln!("Error: {}", e);
         exit(get_exit_code(&e));
     }
+}
+
+fn init_tracing(verbose: bool) {
+    let fallback = if verbose { "debug" } else { "info" };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .or_else(|_| tracing_subscriber::EnvFilter::try_new(fallback))
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
 }
 
 fn get_exit_code(err: &MaccError) -> i32 {
@@ -565,7 +602,17 @@ fn get_exit_code(err: &MaccError) -> i32 {
     }
 }
 
-fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
+#[cfg(test)]
+fn run_with_engine<E: Engine + Send + Sync + 'static>(cli: Cli, engine: E) -> Result<()> {
+    let provider = services::engine_provider::EngineProvider::new(engine);
+    run_with_engine_provider(cli, provider)
+}
+
+fn run_with_engine_provider(
+    cli: Cli,
+    provider: services::engine_provider::EngineProvider,
+) -> Result<()> {
+    debug!(cwd = %cli.cwd, "Starting CLI command routing");
     let cwd = std::path::PathBuf::from(&cli.cwd);
     let absolute_cwd = if cwd.is_absolute() {
         cwd
@@ -581,288 +628,44 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
 
     // Try to canonicalize to resolve .. and symlinks if it exists
     let absolute_cwd = absolute_cwd.canonicalize().unwrap_or(absolute_cwd);
+    let engine = provider.shared();
+    let app = commands::AppContext::new(absolute_cwd.clone(), engine.clone());
 
     match &cli.command {
         Some(Commands::Init { force, wizard }) => {
-            let paths = macc_core::find_project_root(&absolute_cwd)
-                .unwrap_or_else(|_| macc_core::ProjectPaths::from_root(&absolute_cwd));
-            macc_core::init(&paths, *force)?;
-            if *wizard {
-                run_init_wizard(&paths, &engine)?;
-            }
-            let checks = engine.doctor(&paths);
-            print_checks(&checks);
-            Ok(())
+            commands::init::InitCommand::new(app.clone(), *force, *wizard).run()
         }
         Some(Commands::Quickstart { yes, apply, no_tui }) => {
-            run_quickstart(&absolute_cwd, &engine, *yes, *apply, *no_tui)
+            commands::quickstart::QuickstartCommand::new(app.clone(), *yes, *apply, *no_tui).run()
         }
         Some(Commands::Plan {
             tools,
             json,
             explain,
-        }) => {
-            let paths = macc_core::find_project_root(&absolute_cwd)?;
-            let canonical = load_canonical_config(&paths.config_path)?;
-
-            let (descriptors, diagnostics) = engine.list_tools(&paths);
-            report_diagnostics(&diagnostics);
-            let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
-
-            let migration =
-                macc_core::migrate::migrate_with_known_tools(canonical.clone(), &allowed_tools);
-            if !migration.warnings.is_empty() {
-                eprintln!("Warning: Legacy configuration detected. Run 'macc migrate' to update your config.");
-            }
-
-            let overrides = if let Some(tools_csv) = tools {
-                CliOverrides::from_tools_csv(tools_csv, &allowed_tools)?
-            } else {
-                CliOverrides::default()
-            };
-
-            let resolved = resolve(&canonical, &overrides);
-
-            let enabled_titles: Vec<String> = resolved
-                .tools
-                .enabled
-                .iter()
-                .map(|id| {
-                    descriptors
-                        .iter()
-                        .find(|d| &d.id == id)
-                        .map(|d| d.title.clone())
-                        .unwrap_or_else(|| id.clone())
-                })
-                .collect();
-
-            if !*json {
-                println!(
-                    "Core: Planning in {} with tools: {:?}",
-                    paths.root.display(),
-                    enabled_titles
-                );
-            }
-
-            let fetch_units = resolve_fetch_units(&paths, &resolved)?;
-            let materialized_units =
-                macc_adapter_shared::fetch::materialize_fetch_units(&paths, fetch_units)?;
-
-            let plan = engine.plan(&paths, &canonical, &materialized_units, &overrides)?;
-            let ops = engine.plan_operations(&paths, &plan);
-            render_plan_preview(&paths, &plan, &ops, *json, *explain)?;
-            Ok(())
-        }
+        }) => commands::plan::PlanCommand::new(app.clone(), tools.clone(), *json, *explain).run(),
         Some(Commands::Apply {
             tools,
             dry_run,
             allow_user_scope,
             json,
             explain,
-        }) => {
-            let paths = macc_core::find_project_root(&absolute_cwd)?;
-            let canonical = load_canonical_config(&paths.config_path)?;
-
-            let (descriptors, diagnostics) = engine.list_tools(&paths);
-            report_diagnostics(&diagnostics);
-            let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
-
-            let migration =
-                macc_core::migrate::migrate_with_known_tools(canonical.clone(), &allowed_tools);
-            if !migration.warnings.is_empty() {
-                eprintln!("Warning: Legacy configuration detected. Run 'macc migrate' to update your config.");
-            }
-
-            let overrides = if let Some(tools_csv) = tools {
-                CliOverrides::from_tools_csv(tools_csv, &allowed_tools)?
-            } else {
-                CliOverrides::default()
-            };
-            let resolved = resolve(&canonical, &overrides);
-
-            let enabled_titles: Vec<String> = resolved
-                .tools
-                .enabled
-                .iter()
-                .map(|id| {
-                    descriptors
-                        .iter()
-                        .find(|d| &d.id == id)
-                        .map(|d| d.title.clone())
-                        .unwrap_or_else(|| id.clone())
-                })
-                .collect();
-
-            let fetch_units = resolve_fetch_units(&paths, &resolved)?;
-            let materialized_units =
-                macc_adapter_shared::fetch::materialize_fetch_units(&paths, fetch_units)?;
-
-            if *dry_run {
-                if !*json {
-                    println!(
-                        "Core: Dry-run apply (planning) in {} with tools: {:?}",
-                        paths.root.display(),
-                        enabled_titles
-                    );
-                }
-                let plan = engine.plan(&paths, &canonical, &materialized_units, &overrides)?;
-                let ops = engine.plan_operations(&paths, &plan);
-                render_plan_preview(&paths, &plan, &ops, *json, *explain)?;
-                return Ok(());
-            }
-
-            println!(
-                "Core: Applying in {} with tools: {:?}",
-                paths.root.display(),
-                enabled_titles
-            );
-            let mut plan = engine.plan(&paths, &canonical, &materialized_units, &overrides)?;
-            let ops = engine.plan_operations(&paths, &plan);
-            if !*json {
-                print_pre_apply_summary(&paths, &plan, &ops);
-                if *explain {
-                    print_pre_apply_explanations(&ops);
-                }
-            }
-            if *allow_user_scope {
-                confirm_user_scope_apply(&paths, &ops)?;
-            }
-
-            // Use engine to apply
-            let report = engine.apply(&paths, &mut plan, *allow_user_scope)?;
-
-            println!("{}", report.render_cli());
-            mark_apply_completed(&paths)?;
-            Ok(())
-        }
+        }) => commands::apply::ApplyCommand::new(
+            app.clone(),
+            tools.clone(),
+            *dry_run,
+            *allow_user_scope,
+            *json,
+            *explain,
+        )
+        .run(),
         Some(Commands::Catalog { catalog_command }) => {
-            let paths = macc_core::find_project_root(&absolute_cwd)?;
-            match catalog_command {
-                CatalogCommands::Skills { skills_command } => match skills_command {
-                    CatalogSubCommands::List => {
-                        let catalog = load_effective_skills_catalog(&paths)?;
-                        list_skills(&catalog);
-                        Ok(())
-                    }
-                    CatalogSubCommands::Search { query } => {
-                        let catalog = load_effective_skills_catalog(&paths)?;
-                        search_skills(&catalog, query);
-                        Ok(())
-                    }
-                    CatalogSubCommands::Add {
-                        id,
-                        name,
-                        description,
-                        tags,
-                        subpath,
-                        kind,
-                        url,
-                        reference,
-                        checksum,
-                    } => {
-                        let mut catalog = SkillsCatalog::load(&paths.skills_catalog_path())?;
-                        add_skill(
-                            &paths,
-                            &mut catalog,
-                            id.clone(),
-                            name.clone(),
-                            description.clone(),
-                            tags.clone(),
-                            subpath.clone(),
-                            kind.clone(),
-                            url.clone(),
-                            reference.clone(),
-                            checksum.clone(),
-                        )
-                    }
-                    CatalogSubCommands::Remove { id } => {
-                        let mut catalog = SkillsCatalog::load(&paths.skills_catalog_path())?;
-                        remove_skill(&paths, &mut catalog, id.clone())
-                    }
-                },
-                CatalogCommands::Mcp { mcp_command } => match mcp_command {
-                    CatalogSubCommands::List => {
-                        let catalog = load_effective_mcp_catalog(&paths)?;
-                        list_mcp(&catalog);
-                        Ok(())
-                    }
-                    CatalogSubCommands::Search { query } => {
-                        let catalog = load_effective_mcp_catalog(&paths)?;
-                        search_mcp(&catalog, query);
-                        Ok(())
-                    }
-                    CatalogSubCommands::Add {
-                        id,
-                        name,
-                        description,
-                        tags,
-                        subpath,
-                        kind,
-                        url,
-                        reference,
-                        checksum,
-                    } => {
-                        let mut catalog = McpCatalog::load(&paths.mcp_catalog_path())?;
-                        add_mcp(
-                            &paths,
-                            &mut catalog,
-                            id.clone(),
-                            name.clone(),
-                            description.clone(),
-                            tags.clone(),
-                            subpath.clone(),
-                            kind.clone(),
-                            url.clone(),
-                            reference.clone(),
-                            checksum.clone(),
-                        )
-                    }
-                    CatalogSubCommands::Remove { id } => {
-                        let mut catalog = McpCatalog::load(&paths.mcp_catalog_path())?;
-                        remove_mcp(&paths, &mut catalog, id.clone())
-                    }
-                },
-                CatalogCommands::ImportUrl {
-                    kind,
-                    id,
-                    url,
-                    name,
-                    description,
-                    tags,
-                } => import_url(
-                    &paths,
-                    kind,
-                    id.clone(),
-                    url.clone(),
-                    name.clone(),
-                    description.clone(),
-                    tags.clone(),
-                ),
-                CatalogCommands::SearchRemote {
-                    api,
-                    kind,
-                    q,
-                    add,
-                    add_ids,
-                } => run_remote_search(
-                    &paths,
-                    api.clone(),
-                    kind.clone(),
-                    q.clone(),
-                    *add,
-                    add_ids.clone(),
-                ),
-            }
+            commands::catalog::CatalogCommand::new(app.clone(), catalog_command).run()
         }
         Some(Commands::Install { install_command }) => {
-            let paths = macc_core::find_project_root(&absolute_cwd)?;
-            match install_command {
-                InstallCommands::Skill { tool, id } => install_skill(&paths, tool, id, &engine),
-                InstallCommands::Mcp { id } => install_mcp(&paths, id, &engine),
-            }
+            commands::install::InstallCommand::new(app.clone(), install_command).run()
         }
         Some(Commands::Tui) => {
-            let paths = ensure_initialized_paths(&absolute_cwd)?;
+            let paths = engine.project_ensure_initialized_paths(&absolute_cwd)?;
             std::env::set_current_dir(&paths.root).map_err(|e| MaccError::Io {
                 path: paths.root.to_string_lossy().into(),
                 action: "set current_dir for tui".into(),
@@ -875,96 +678,29 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             })
         }
         Some(Commands::Tool { tool_command }) => {
-            let paths = ensure_initialized_paths(&absolute_cwd)?;
-            match tool_command {
-                ToolCommands::Install { tool_id, yes } => install_tool(&paths, tool_id, *yes),
-                ToolCommands::Update {
-                    tool_id,
-                    all,
-                    only,
-                    check,
-                    yes,
-                    force,
-                    rollback_on_fail,
-                } => update_tools(
-                    &paths,
-                    ToolUpdateCommandOptions {
-                        tool_id: tool_id.as_deref(),
-                        all: *all,
-                        only: only.as_deref(),
-                        check: *check,
-                        assume_yes: *yes,
-                        force: *force,
-                        rollback_on_fail: *rollback_on_fail,
-                    },
-                ),
-                ToolCommands::Outdated { only } => show_outdated_tools(&paths, only.as_deref()),
-            }
+            commands::tool::ToolCommand::new(app.clone(), tool_command).run()
         }
         Some(Commands::Context {
             tool,
             from_files,
             dry_run,
             print_prompt,
-        }) => {
-            let paths = ensure_initialized_paths(&absolute_cwd)?;
-            run_context_generation(&paths, tool.as_deref(), from_files, *dry_run, *print_prompt)
-        }
+        }) => commands::context::ContextCommand::new(
+            app.clone(),
+            tool.as_deref(),
+            from_files,
+            *dry_run,
+            *print_prompt,
+        )
+        .run(),
         Some(Commands::Doctor { fix }) => {
-            let paths = macc_core::find_project_root(&absolute_cwd)?;
-            run_doctor(&paths, &engine, *fix)
+            commands::doctor::DoctorCommand::new(app.clone(), *fix).run()
         }
         Some(Commands::Migrate { apply }) => {
-            let paths = macc_core::find_project_root(&absolute_cwd)?;
-            let canonical = load_canonical_config(&paths.config_path)?;
-
-            let (descriptors, diagnostics) = engine.list_tools(&paths);
-            report_diagnostics(&diagnostics);
-            let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
-
-            let result = macc_core::migrate::migrate_with_known_tools(canonical, &allowed_tools);
-
-            if result.warnings.is_empty() {
-                println!("No legacy configuration found. Your config is up to date.");
-                return Ok(());
-            }
-
-            println!("Legacy configuration detected:");
-            for warning in &result.warnings {
-                println!("  - {}", warning);
-            }
-
-            if *apply {
-                let yaml = result.config.to_yaml().map_err(|e| {
-                    MaccError::Validation(format!("Failed to serialize migrated config: {}", e))
-                })?;
-
-                macc_core::atomic_write(&paths, &paths.config_path, yaml.as_bytes())?;
-                println!(
-                    "\nMigrated configuration written to {}",
-                    paths.config_path.display()
-                );
-            } else {
-                println!("\nDry-run: use --apply to write the migrated configuration to disk.");
-                println!("Preview of migrated config:");
-                println!("---");
-                println!("{}", result.config.to_yaml().unwrap());
-                println!("---");
-            }
-
-            Ok(())
+            commands::migrate::MigrateCommand::new(app.clone(), *apply).run()
         }
         Some(Commands::Backups { backups_command }) => {
-            let paths = macc_core::find_project_root(&absolute_cwd)?;
-            match backups_command {
-                BackupsCommands::List { user } => list_backup_sets_command(&paths, *user),
-                BackupsCommands::Open {
-                    id,
-                    latest,
-                    user,
-                    editor,
-                } => open_backup_set_command(&paths, id.as_deref(), *latest, *user, editor),
-            }
+            commands::backups::BackupsCommand::new(app.clone(), backups_command).run()
         }
         Some(Commands::Restore {
             latest,
@@ -972,428 +708,25 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             backup,
             dry_run,
             yes,
-        }) => {
-            let paths = macc_core::find_project_root(&absolute_cwd)?;
-            if !*latest && backup.is_none() {
-                return Err(MaccError::Validation(
-                    "restore requires --latest or --backup <id>".into(),
-                ));
-            }
-            restore_backup_set_command(&paths, *user, backup.as_deref(), *latest, *dry_run, *yes)
+        }) => commands::restore::RestoreCommand::new(
+            app.clone(),
+            *latest,
+            *user,
+            backup.as_deref(),
+            *dry_run,
+            *yes,
+        )
+        .run(),
+        Some(Commands::Clear) => commands::clear::ClearCommand::new(app.clone()).run(),
+        Some(Commands::Worktree { worktree_command }) => {
+            commands::worktree::WorktreeCommand::new(app.clone(), worktree_command).run()
         }
-        Some(Commands::Clear) => {
-            let paths = macc_core::find_project_root(&absolute_cwd)?;
-            println!("This will:");
-            println!("  1) Remove all non-root worktrees (equivalent to: macc worktree remove --all --force)");
-            println!("  2) Remove MACC-managed files/directories in this project (macc clear)");
-            if !confirm_yes_no("Continue [y/N]? ")? {
-                return Err(MaccError::Validation("Clear cancelled.".into()));
-            }
-            let removed = remove_all_worktrees(&paths.root, false)?;
-            macc_core::prune_worktrees(&paths.root)?;
-            println!("Removed worktrees: {}", removed);
-            let report = macc_core::clear(&paths)?;
-            println!(
-                "Cleared managed paths: removed={}, skipped={}",
-                report.removed, report.skipped
-            );
-            Ok(())
-        }
-        Some(Commands::Worktree { worktree_command }) => match worktree_command {
-            WorktreeCommands::Create {
-                slug,
-                tool,
-                count,
-                base,
-                scope,
-                feature,
-                skip_apply,
-                allow_user_scope,
-            } => {
-                let paths = macc_core::find_project_root(&absolute_cwd)?;
-                let canonical = load_canonical_config(&paths.config_path)?;
-
-                let spec = macc_core::WorktreeCreateSpec {
-                    slug: slug.clone(),
-                    tool: tool.clone(),
-                    count: *count,
-                    base: base.clone(),
-                    dir: std::path::PathBuf::from(".macc/worktree"),
-                    scope: scope.clone(),
-                    feature: feature.clone(),
-                };
-                let created = macc_core::create_worktrees(&paths.root, &spec)?;
-
-                let (descriptors, diagnostics) = engine.list_tools(&paths);
-                report_diagnostics(&diagnostics);
-                let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
-                let overrides = CliOverrides::from_tools_csv(tool.as_str(), &allowed_tools)?;
-
-                let yaml = canonical.to_yaml().map_err(|e| {
-                    MaccError::Validation(format!("Failed to serialize config for worktree: {}", e))
-                })?;
-
-                for entry in &created {
-                    let worktree_paths = macc_core::ProjectPaths::from_root(&entry.path);
-                    macc_core::init(&worktree_paths, false)?;
-                    macc_core::atomic_write(
-                        &worktree_paths,
-                        &worktree_paths.config_path,
-                        yaml.as_bytes(),
-                    )?;
-                    write_tool_json(&paths.root, &entry.path, tool)?;
-
-                    if !*skip_apply {
-                        let resolved = resolve(&canonical, &overrides);
-                        let fetch_units = resolve_fetch_units(&worktree_paths, &resolved)?;
-                        let materialized_units =
-                            macc_adapter_shared::fetch::materialize_fetch_units(
-                                &worktree_paths,
-                                fetch_units,
-                            )?;
-                        let mut plan = engine.plan(
-                            &worktree_paths,
-                            &canonical,
-                            &materialized_units,
-                            &overrides,
-                        )?;
-                        let _ = engine.apply(&worktree_paths, &mut plan, *allow_user_scope)?;
-                    }
-                }
-
-                println!("Created {} worktree(s):", created.len());
-                for entry in created {
-                    println!(
-                        "  {}  branch={} base={} path={}",
-                        entry.id,
-                        entry.branch,
-                        entry.base,
-                        entry.path.display()
-                    );
-                }
-                if *skip_apply {
-                    println!("Note: config apply skipped (--skip-apply).");
-                }
-                Ok(())
-            }
-            WorktreeCommands::Status => {
-                let entries = macc_core::list_worktrees(&absolute_cwd)?;
-                let current = macc_core::current_worktree(&absolute_cwd, &entries);
-                println!("Worktree status:");
-                if let Some(entry) = current {
-                    println!("  Path: {}", entry.path.display());
-                    if let Some(branch) = entry.branch {
-                        println!("  Branch: {}", branch);
-                    }
-                    if let Some(head) = entry.head {
-                        println!("  HEAD: {}", head);
-                    }
-                    println!("  Locked: {}", if entry.locked { "yes" } else { "no" });
-                    println!("  Prunable: {}", if entry.prunable { "yes" } else { "no" });
-                } else {
-                    println!("  Not a git worktree (or git worktree list unavailable).");
-                }
-                println!("  Total worktrees: {}", entries.len());
-                Ok(())
-            }
-            WorktreeCommands::List => {
-                let entries = macc_core::list_worktrees(&absolute_cwd)?;
-                if entries.is_empty() {
-                    println!("No git worktrees found.");
-                    return Ok(());
-                }
-                let project_paths = macc_core::find_project_root(&absolute_cwd)
-                    .map(|root| macc_core::ProjectPaths::from_root(&root.root))
-                    .ok();
-                let session_map = load_worktree_session_map(project_paths.as_ref())?;
-
-                println!(
-                    "{:<54} {:<12} {:<24} {:<8} {:<10} {:<16} {:<8} {:<8}",
-                    "WORKTREE", "TOOL", "BRANCH", "SCOPE", "STATE", "SESSION", "LOCKED", "PRUNE"
-                );
-                println!(
-                    "{:-<54} {:-<12} {:-<24} {:-<8} {:-<10} {:-<16} {:-<8} {:-<8}",
-                    "", "", "", "", "", "", "", ""
-                );
-                for entry in entries {
-                    let metadata = macc_core::read_worktree_metadata(&entry.path)
-                        .ok()
-                        .flatten();
-                    let tool = metadata
-                        .as_ref()
-                        .map(|m| m.tool.as_str())
-                        .unwrap_or("n/a")
-                        .to_string();
-                    let branch = metadata
-                        .as_ref()
-                        .map(|m| m.branch.as_str())
-                        .or(entry.branch.as_deref())
-                        .unwrap_or("-")
-                        .to_string();
-                    let scope = metadata
-                        .as_ref()
-                        .and_then(|m| m.scope.as_ref())
-                        .map(|s| truncate_cell(s, 8))
-                        .unwrap_or_else(|| "-".into());
-                    let git_state = if git_worktree_is_dirty(&entry.path).unwrap_or(false) {
-                        "dirty"
-                    } else {
-                        "clean"
-                    };
-                    let session = session_map
-                        .get(&canonicalize_path_fallback(&entry.path))
-                        .map(format_worktree_session_status)
-                        .unwrap_or_else(|| "-".into());
-                    println!(
-                        "{:<54} {:<12} {:<24} {:<8} {:<10} {:<16} {:<8} {:<8}",
-                        truncate_cell(&entry.path.display().to_string(), 54),
-                        truncate_cell(&tool, 12),
-                        truncate_cell(&branch, 24),
-                        scope,
-                        git_state,
-                        truncate_cell(&session, 16),
-                        if entry.locked { "yes" } else { "no" },
-                        if entry.prunable { "yes" } else { "no" }
-                    );
-                }
-                Ok(())
-            }
-            WorktreeCommands::Open {
-                id,
-                editor,
-                terminal,
-            } => {
-                let paths = macc_core::find_project_root(&absolute_cwd)?;
-                let worktree_path = resolve_worktree_path(&paths.root, id)?;
-                if !worktree_path.exists() {
-                    return Err(MaccError::Validation(format!(
-                        "Worktree path does not exist: {}",
-                        worktree_path.display()
-                    )));
-                }
-
-                if *terminal {
-                    open_in_terminal(&worktree_path)?;
-                }
-                if let Some(cmd) = editor {
-                    open_in_editor(&worktree_path, cmd)?;
-                } else {
-                    open_in_editor(&worktree_path, "code")?;
-                }
-
-                println!("Opened worktree: {}", worktree_path.display());
-                Ok(())
-            }
-            WorktreeCommands::Apply {
-                id,
-                all,
-                allow_user_scope,
-            } => {
-                let paths = macc_core::find_project_root(&absolute_cwd)?;
-                if *all {
-                    let entries = macc_core::list_worktrees(&paths.root)?;
-                    let root = paths.root.canonicalize().unwrap_or(paths.root.clone());
-                    let mut applied = 0;
-                    for entry in entries {
-                        if entry.path == root {
-                            continue;
-                        }
-                        apply_worktree(&engine, &entry.path, *allow_user_scope)?;
-                        applied += 1;
-                    }
-                    println!("Applied {} worktree(s).", applied);
-                    return Ok(());
-                }
-
-                let id = id.as_ref().ok_or_else(|| {
-                    MaccError::Validation("worktree apply requires <ID> or --all".into())
-                })?;
-                let worktree_path = resolve_worktree_path(&paths.root, id)?;
-                apply_worktree(&engine, &worktree_path, *allow_user_scope)?;
-                println!("Applied worktree: {}", worktree_path.display());
-                Ok(())
-            }
-            WorktreeCommands::Doctor { id } => {
-                let paths = macc_core::find_project_root(&absolute_cwd)?;
-                let worktree_path = resolve_worktree_path(&paths.root, id)?;
-                if !worktree_path.exists() {
-                    return Err(MaccError::Validation(format!(
-                        "Worktree path does not exist: {}",
-                        worktree_path.display()
-                    )));
-                }
-                let worktree_paths = macc_core::ProjectPaths::from_root(&worktree_path);
-                let checks = engine.doctor(&worktree_paths);
-                print_checks(&checks);
-                Ok(())
-            }
-            WorktreeCommands::Run { id } => {
-                let paths = macc_core::find_project_root(&absolute_cwd)?;
-                let worktree_path = resolve_worktree_path(&paths.root, id)?;
-                if !worktree_path.exists() {
-                    return Err(MaccError::Validation(format!(
-                        "Worktree path does not exist: {}",
-                        worktree_path.display()
-                    )));
-                }
-
-                let metadata = macc_core::read_worktree_metadata(&worktree_path)?
-                    .ok_or_else(|| MaccError::Validation("Missing .macc/worktree.json".into()))?;
-                ensure_tool_json(&paths.root, &worktree_path, &metadata.tool)?;
-                let (task_id, prd_path) =
-                    resolve_worktree_task_context(&paths.root, &worktree_path, &metadata.id)?;
-                let performer_path = ensure_performer(&paths.root, &worktree_path)?;
-                let registry_path = paths.root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
-
-                let status = std::process::Command::new(&performer_path)
-                    .current_dir(&worktree_path)
-                    .arg("--repo")
-                    .arg(&paths.root)
-                    .arg("--worktree")
-                    .arg(&worktree_path)
-                    .arg("--task-id")
-                    .arg(&task_id)
-                    .arg("--tool")
-                    .arg(&metadata.tool)
-                    .arg("--registry")
-                    .arg(&registry_path)
-                    .arg("--prd")
-                    .arg(&prd_path)
-                    .status()
-                    .map_err(|e| MaccError::Io {
-                        path: performer_path.to_string_lossy().into(),
-                        action: "run worktree performer".into(),
-                        source: e,
-                    })?;
-                if !status.success() {
-                    return Err(MaccError::Validation(format!(
-                        "Performer failed with status: {}. Inspect logs with `macc logs tail --component performer --worktree {}` and if the task is stuck run `macc coordinator unlock --task {}`.",
-                        status, metadata.id, task_id
-                    )));
-                }
-                Ok(())
-            }
-            WorktreeCommands::Exec { id, cmd } => {
-                let paths = macc_core::find_project_root(&absolute_cwd)?;
-                let worktree_path = resolve_worktree_path(&paths.root, id)?;
-                if !worktree_path.exists() {
-                    return Err(MaccError::Validation(format!(
-                        "Worktree path does not exist: {}",
-                        worktree_path.display()
-                    )));
-                }
-                if cmd.is_empty() {
-                    return Err(MaccError::Validation(
-                        "worktree exec requires a command after --".into(),
-                    ));
-                }
-
-                let mut command = std::process::Command::new(&cmd[0]);
-                if cmd.len() > 1 {
-                    command.args(&cmd[1..]);
-                }
-                let status =
-                    command
-                        .current_dir(&worktree_path)
-                        .status()
-                        .map_err(|e| MaccError::Io {
-                            path: worktree_path.to_string_lossy().into(),
-                            action: "run worktree exec".into(),
-                            source: e,
-                        })?;
-                if !status.success() {
-                    return Err(MaccError::Validation(format!(
-                        "Command failed with status: {}",
-                        status
-                    )));
-                }
-                Ok(())
-            }
-            WorktreeCommands::Remove {
-                id,
-                force,
-                all,
-                remove_branch,
-            } => {
-                let paths = macc_core::find_project_root(&absolute_cwd)?;
-                if *all {
-                    let entries = macc_core::list_worktrees(&paths.root)?;
-                    let root = paths.root.canonicalize().unwrap_or(paths.root.clone());
-                    let mut removed = 0;
-                    for entry in entries {
-                        if entry.path == root {
-                            continue;
-                        }
-                        let branch = entry.branch.clone();
-                        macc_core::remove_worktree(&paths.root, &entry.path, *force)?;
-                        if *remove_branch {
-                            delete_branch(&paths.root, branch.as_deref(), *force)?;
-                        }
-                        println!("Removed worktree: {}", entry.path.display());
-                        removed += 1;
-                    }
-                    println!("Removed {} worktree(s).", removed);
-                    return Ok(());
-                }
-
-                let id = id.as_ref().ok_or_else(|| {
-                    MaccError::Validation("worktree remove requires <ID> or --all".into())
-                })?;
-                let entries = macc_core::list_worktrees(&paths.root)?;
-                let candidate = std::path::Path::new(id);
-                let worktree_path =
-                    if candidate.is_absolute() || id.contains(std::path::MAIN_SEPARATOR) {
-                        std::path::PathBuf::from(id)
-                    } else {
-                        paths.root.join(".macc/worktree").join(id)
-                    };
-
-                let branch = entries
-                    .iter()
-                    .find(|entry| entry.path == worktree_path)
-                    .and_then(|entry| entry.branch.clone());
-                macc_core::remove_worktree(&paths.root, &worktree_path, *force)?;
-                if *remove_branch {
-                    delete_branch(&paths.root, branch.as_deref(), *force)?;
-                }
-                println!("Removed worktree: {}", worktree_path.display());
-                Ok(())
-            }
-            WorktreeCommands::Prune => {
-                let paths = macc_core::find_project_root(&absolute_cwd)?;
-                macc_core::prune_worktrees(&paths.root)?;
-                println!("Pruned git worktrees.");
-                Ok(())
-            }
-        },
         Some(Commands::Logs { logs_command }) => {
-            let paths = ensure_initialized_paths(&absolute_cwd)?;
-            match logs_command {
-                LogsCommands::Tail {
-                    component,
-                    worktree,
-                    task,
-                    lines,
-                    follow,
-                } => {
-                    let file = select_log_file(
-                        &paths,
-                        component.as_str(),
-                        worktree.as_deref(),
-                        task.as_deref(),
-                    )?;
-                    println!("Log file: {}", file.display());
-                    if *follow {
-                        tail_file_follow(&file, *lines)?;
-                    } else {
-                        print_file_tail(&file, *lines)?;
-                    }
-                    Ok(())
-                }
-            }
+            commands::logs::LogsCommand::new(app.clone(), logs_command).run()
         }
         Some(Commands::Coordinator {
             action,
+            no_tui,
             graceful,
             remove_worktrees,
             remove_branches,
@@ -1407,109 +740,53 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
             max_parallel,
             timeout_seconds,
             phase_runner_max_attempts,
+            log_flush_lines,
+            log_flush_ms,
+            mirror_json_debounce_ms,
             stale_claimed_seconds,
             stale_in_progress_seconds,
             stale_changes_requested_seconds,
             stale_action,
+            storage_mode,
             extra_args,
-        }) => {
-            let paths = ensure_initialized_paths(&absolute_cwd)?;
-            let canonical = load_canonical_config(&paths.config_path)?;
-            let coordinator = canonical.automation.coordinator.clone();
-
-            let _ = macc_core::ensure_embedded_automation_scripts(&paths)?;
-            let coordinator_path = paths.automation_coordinator_path();
-            if !coordinator_path.exists() {
-                return Err(MaccError::Validation(format!(
-                    "Coordinator script not found: {}",
-                    coordinator_path.display()
-                )));
-            }
-
-            let env_cfg = CoordinatorEnvConfig {
-                prd: prd.clone(),
-                coordinator_tool: coordinator_tool.clone(),
-                reference_branch: reference_branch.clone(),
-                tool_priority: tool_priority.clone(),
-                max_parallel_per_tool_json: max_parallel_per_tool_json.clone(),
-                tool_specializations_json: tool_specializations_json.clone(),
-                max_dispatch: *max_dispatch,
-                max_parallel: *max_parallel,
-                timeout_seconds: *timeout_seconds,
-                phase_runner_max_attempts: *phase_runner_max_attempts,
-                stale_claimed_seconds: *stale_claimed_seconds,
-                stale_in_progress_seconds: *stale_in_progress_seconds,
-                stale_changes_requested_seconds: *stale_changes_requested_seconds,
-                stale_action: stale_action.clone(),
-            };
-
-            if action == "stop" {
-                let stopped =
-                    stop_coordinator_process_groups(&paths.root, &coordinator_path, *graceful)?;
-                println!("Coordinator process groups signaled: {}", stopped);
-
-                run_coordinator_action(
-                    &paths.root,
-                    &coordinator_path,
-                    "reconcile",
-                    &[],
-                    &canonical,
-                    coordinator.as_ref(),
-                    &env_cfg,
-                )?;
-                run_coordinator_action(
-                    &paths.root,
-                    &coordinator_path,
-                    "cleanup",
-                    &[],
-                    &canonical,
-                    coordinator.as_ref(),
-                    &env_cfg,
-                )?;
-                run_coordinator_action(
-                    &paths.root,
-                    &coordinator_path,
-                    "unlock",
-                    &["--all".to_string()],
-                    &canonical,
-                    coordinator.as_ref(),
-                    &env_cfg,
-                )?;
-
-                if *remove_worktrees {
-                    let removed = remove_all_worktrees(&paths.root, *remove_branches)?;
-                    println!("Removed {} worktree(s).", removed);
-                    macc_core::prune_worktrees(&paths.root)?;
-                    println!("Pruned git worktrees.");
-                }
-            } else if action == "run" {
-                if !extra_args.is_empty() {
-                    return Err(MaccError::Validation(
-                        "Action 'run' does not accept extra args after '--'.".into(),
-                    ));
-                }
-                run_coordinator_full_cycle(
-                    &paths.root,
-                    &coordinator_path,
-                    &canonical,
-                    coordinator.as_ref(),
-                    &env_cfg,
-                )?;
-            } else {
-                run_coordinator_action(
-                    &paths.root,
-                    &coordinator_path,
-                    action,
-                    extra_args,
-                    &canonical,
-                    coordinator.as_ref(),
-                    &env_cfg,
-                )?;
-            }
-            Ok(())
-        }
+        }) => commands::coordinator::CoordinatorCommand::new(
+            app.clone(),
+            coordinator::command::CoordinatorCommandInput {
+                action: action.clone(),
+                no_tui: *no_tui,
+                graceful: *graceful,
+                remove_worktrees: *remove_worktrees,
+                remove_branches: *remove_branches,
+                env_cfg: CoordinatorEnvConfig {
+                    prd: prd.clone(),
+                    coordinator_tool: coordinator_tool.clone(),
+                    reference_branch: reference_branch.clone(),
+                    tool_priority: tool_priority.clone(),
+                    max_parallel_per_tool_json: max_parallel_per_tool_json.clone(),
+                    tool_specializations_json: tool_specializations_json.clone(),
+                    max_dispatch: *max_dispatch,
+                    max_parallel: *max_parallel,
+                    timeout_seconds: *timeout_seconds,
+                    phase_runner_max_attempts: *phase_runner_max_attempts,
+                    log_flush_lines: *log_flush_lines,
+                    log_flush_ms: *log_flush_ms,
+                    mirror_json_debounce_ms: *mirror_json_debounce_ms,
+                    stale_claimed_seconds: *stale_claimed_seconds,
+                    stale_in_progress_seconds: *stale_in_progress_seconds,
+                    stale_changes_requested_seconds: *stale_changes_requested_seconds,
+                    stale_action: stale_action.clone(),
+                    storage_mode: storage_mode.clone(),
+                    error_code_retry_list: std::env::var("ERROR_CODE_RETRY_LIST").ok(),
+                    error_code_retry_max: std::env::var("ERROR_CODE_RETRY_MAX")
+                        .ok()
+                        .and_then(|v| v.parse().ok()),
+                },
+                extra_args: extra_args.clone(),
+            },
+        )
+        .run(),
         None => {
-            let paths = ensure_initialized_paths(&absolute_cwd)?;
+            let paths = engine.project_ensure_initialized_paths(&absolute_cwd)?;
             std::env::set_current_dir(&paths.root).map_err(|e| MaccError::Io {
                 path: paths.root.to_string_lossy().into(),
                 action: "set current_dir for tui".into(),
@@ -1524,1813 +801,7 @@ fn run_with_engine<E: Engine>(cli: Cli, engine: E) -> Result<()> {
     }
 }
 
-fn ensure_initialized_paths(start_dir: &std::path::Path) -> Result<macc_core::ProjectPaths> {
-    let paths = macc_core::find_project_root(start_dir)
-        .unwrap_or_else(|_| macc_core::ProjectPaths::from_root(start_dir));
-    macc_core::init(&paths, false)?;
-    Ok(paths)
-}
-
-fn run_quickstart<E: Engine>(
-    absolute_cwd: &std::path::Path,
-    engine: &E,
-    assume_yes: bool,
-    apply: bool,
-    no_tui: bool,
-) -> Result<()> {
-    let paths = macc_core::find_project_root(absolute_cwd)
-        .unwrap_or_else(|_| macc_core::ProjectPaths::from_root(absolute_cwd));
-
-    let mut missing = Vec::new();
-    for cmd in ["git", "curl", "jq"] {
-        if !is_command_available(cmd) {
-            missing.push(cmd);
-        }
-    }
-    if !missing.is_empty() {
-        return Err(MaccError::Validation(format!(
-            "Missing required commands: {}",
-            missing.join(", ")
-        )));
-    }
-
-    if !paths.root.join(".git").exists() {
-        println!("No .git directory found in {}.", paths.root.display());
-        if !assume_yes && !confirm_yes_no("Continue anyway [y/N]? ")? {
-            return Err(MaccError::Validation("Quickstart cancelled.".into()));
-        }
-    }
-
-    if !paths.macc_dir.exists() && !assume_yes {
-        println!(".macc/ was not found in this project.");
-        if !confirm_yes_no("Run 'macc init' now [y/N]? ")? {
-            return Err(MaccError::Validation(
-                "Quickstart requires initialization. Cancelled.".into(),
-            ));
-        }
-    }
-
-    // init seeds config, catalogs, automation scripts, and gitignore entries.
-    macc_core::init(&paths, false)?;
-    println!(
-        "Quickstart: initialized project at {}",
-        paths.root.display()
-    );
-
-    if apply {
-        run_plan_then_optional_apply(engine, &paths, assume_yes)?;
-        return Ok(());
-    }
-
-    if no_tui {
-        println!("Quickstart complete.");
-        println!("Next: run 'macc plan' then 'macc apply'.");
-        return Ok(());
-    }
-
-    println!("Quickstart complete. Opening TUI...");
-    std::env::set_current_dir(&paths.root).map_err(|e| MaccError::Io {
-        path: paths.root.to_string_lossy().into(),
-        action: "set current_dir for tui".into(),
-        source: e,
-    })?;
-    macc_tui::run_tui().map_err(|e| MaccError::Io {
-        path: "tui".into(),
-        action: "run_tui".into(),
-        source: std::io::Error::other(e.to_string()),
-    })
-}
-
-fn run_plan_then_optional_apply<E: Engine>(
-    engine: &E,
-    paths: &macc_core::ProjectPaths,
-    assume_yes: bool,
-) -> Result<()> {
-    let canonical = load_canonical_config(&paths.config_path)?;
-    let (_descriptors, diagnostics) = engine.list_tools(paths);
-    report_diagnostics(&diagnostics);
-    let overrides = CliOverrides::default();
-    let resolved = resolve(&canonical, &overrides);
-    let fetch_units = resolve_fetch_units(paths, &resolved)?;
-    let materialized_units =
-        macc_adapter_shared::fetch::materialize_fetch_units(paths, fetch_units)?;
-
-    let plan = engine.plan(paths, &canonical, &materialized_units, &overrides)?;
-    macc_core::preview_plan(&plan, paths)?;
-    println!("Core: Total actions planned: {}", plan.actions.len());
-
-    if !assume_yes && !confirm_yes_no("Apply this plan now [y/N]? ")? {
-        println!("Plan generated only. Run 'macc apply' when ready.");
-        return Ok(());
-    }
-
-    // Re-resolve from disk before apply.
-    let canonical = load_canonical_config(&paths.config_path)?;
-    let overrides = CliOverrides::default();
-    let resolved = resolve(&canonical, &overrides);
-    let fetch_units = resolve_fetch_units(paths, &resolved)?;
-    let materialized_units =
-        macc_adapter_shared::fetch::materialize_fetch_units(paths, fetch_units)?;
-    let mut apply_plan = engine.plan(paths, &canonical, &materialized_units, &overrides)?;
-    let report = engine.apply(paths, &mut apply_plan, false)?;
-    println!("{}", report.render_cli());
-    mark_apply_completed(paths)?;
-    Ok(())
-}
-
-fn run_init_wizard<E: Engine>(paths: &macc_core::ProjectPaths, engine: &E) -> Result<()> {
-    println!("Init wizard (3 questions)");
-    let mut config = load_canonical_config(&paths.config_path)?;
-    let (descriptors, diagnostics) = engine.list_tools(paths);
-    report_diagnostics(&diagnostics);
-    let tool_ids: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
-
-    if !tool_ids.is_empty() {
-        println!("Available tools: {}", tool_ids.join(", "));
-    }
-    let tools_answer = prompt_line("Q1/3 - Enabled tools (CSV, empty keeps current): ")?;
-    if !tools_answer.is_empty() {
-        let selected = parse_csv(&tools_answer);
-        if selected.is_empty() {
-            return Err(MaccError::Validation(
-                "Wizard: at least one tool is required when tools are provided.".into(),
-            ));
-        }
-        let unknown: Vec<String> = selected
-            .iter()
-            .filter(|id| !tool_ids.iter().any(|known| known == *id))
-            .cloned()
-            .collect();
-        if !unknown.is_empty() {
-            return Err(MaccError::Validation(format!(
-                "Wizard: unknown tools: {}",
-                unknown.join(", ")
-            )));
-        }
-        config.tools.enabled = selected;
-    }
-
-    println!("Standards presets: minimal | strict | none");
-    let preset = prompt_line("Q2/3 - Standards preset [minimal]: ")?;
-    apply_standards_preset(
-        &mut config,
-        if preset.is_empty() {
-            "minimal"
-        } else {
-            &preset
-        },
-    )?;
-
-    let mcp_answer = prompt_line("Q3/3 - Enable default MCP templates in selections? [y/N]: ")?;
-    let enable_mcp = matches!(mcp_answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
-    if enable_mcp {
-        let ids: Vec<String> = config.mcp_templates.iter().map(|t| t.id.clone()).collect();
-        let mut selections = config.selections.unwrap_or_default();
-        selections.mcp = ids;
-        config.selections = Some(selections);
-    } else if let Some(selections) = config.selections.as_mut() {
-        selections.mcp.clear();
-    }
-
-    let yaml = config
-        .to_yaml()
-        .map_err(|e| MaccError::Validation(format!("Failed to serialize wizard config: {}", e)))?;
-    macc_core::atomic_write(paths, &paths.config_path, yaml.as_bytes())?;
-    println!("Wizard saved: {}", paths.config_path.display());
-    Ok(())
-}
-
-fn apply_standards_preset(
-    config: &mut macc_core::config::CanonicalConfig,
-    preset: &str,
-) -> Result<()> {
-    config.standards.path = None;
-    config.standards.inline.clear();
-
-    match preset.trim().to_ascii_lowercase().as_str() {
-        "minimal" => {
-            config
-                .standards
-                .inline
-                .insert("language".into(), "English".into());
-            config
-                .standards
-                .inline
-                .insert("package_manager".into(), "pnpm".into());
-        }
-        "strict" => {
-            config
-                .standards
-                .inline
-                .insert("language".into(), "English".into());
-            config
-                .standards
-                .inline
-                .insert("package_manager".into(), "pnpm".into());
-            config
-                .standards
-                .inline
-                .insert("typescript".into(), "strict".into());
-            config
-                .standards
-                .inline
-                .insert("imports".into(), "absolute:@/".into());
-        }
-        "none" => {}
-        other => {
-            return Err(MaccError::Validation(format!(
-                "Wizard: unknown standards preset '{}'. Use minimal|strict|none.",
-                other
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn parse_csv(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-fn prompt_line(prompt: &str) -> Result<String> {
-    use std::io::{self, Write};
-    print!("{}", prompt);
-    io::stdout().flush().map_err(|e| MaccError::Io {
-        path: "stdout".into(),
-        action: "flush prompt".into(),
-        source: e,
-    })?;
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .map_err(|e| MaccError::Io {
-            path: "stdin".into(),
-            action: "read input".into(),
-            source: e,
-        })?;
-    Ok(input.trim().to_string())
-}
-
-fn is_command_available(cmd: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {} >/dev/null 2>&1", cmd))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn unix_timestamp_secs() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn delete_branch(root: &std::path::Path, branch: Option<&str>, force: bool) -> Result<()> {
-    let Some(branch) = branch else {
-        return Ok(());
-    };
-    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
-    if branch.is_empty() {
-        return Ok(());
-    }
-
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("branch");
-    if force {
-        cmd.arg("-D");
-    } else {
-        cmd.arg("-d");
-    }
-    let output = cmd
-        .arg(branch)
-        .current_dir(root)
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: root.to_string_lossy().into(),
-            action: "run git branch delete".into(),
-            source: e,
-        })?;
-
-    if !output.status.success() {
-        return Err(MaccError::Validation(format!(
-            "git branch delete failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(())
-}
-
-fn resolve_worktree_path(root: &std::path::Path, id: &str) -> Result<std::path::PathBuf> {
-    let candidate = std::path::Path::new(id);
-    Ok(
-        if candidate.is_absolute() || id.contains(std::path::MAIN_SEPARATOR) {
-            std::path::PathBuf::from(id)
-        } else {
-            root.join(".macc/worktree").join(id)
-        },
-    )
-}
-
-fn write_tool_json(
-    repo_root: &std::path::Path,
-    worktree_path: &std::path::Path,
-    tool_id: &str,
-) -> Result<std::path::PathBuf> {
-    let search_paths = macc_core::tool::ToolSpecLoader::default_search_paths(repo_root);
-    let loader = macc_core::tool::ToolSpecLoader::new(search_paths);
-    let (specs, diagnostics) = loader.load_all_with_embedded();
-    report_diagnostics(&diagnostics);
-
-    let spec = specs
-        .into_iter()
-        .find(|spec| spec.id == tool_id)
-        .ok_or_else(|| MaccError::Validation(format!("Tool spec not found: {}", tool_id)))?;
-    let mut runtime = spec.to_runtime_config().ok_or_else(|| {
-        MaccError::Validation(format!("Tool spec missing performer section: {}", tool_id))
-    })?;
-
-    let worktree_paths = macc_core::ProjectPaths::from_root(worktree_path);
-    let _ = macc_core::ensure_embedded_automation_scripts(&worktree_paths)?;
-    if let Some(runner_path) =
-        macc_core::embedded_runner_path_for_ref(&worktree_paths, &runtime.performer.runner)?
-    {
-        runtime.performer.runner = runner_path.to_string_lossy().into_owned();
-    }
-
-    let macc_dir = worktree_path.join(".macc");
-    std::fs::create_dir_all(&macc_dir).map_err(|e| MaccError::Io {
-        path: macc_dir.to_string_lossy().into(),
-        action: "create .macc directory".into(),
-        source: e,
-    })?;
-
-    let tool_json_path = macc_dir.join("tool.json");
-    let content = serde_json::to_string_pretty(&runtime)
-        .map_err(|e| MaccError::Validation(format!("Failed to serialize tool.json: {}", e)))?;
-    std::fs::write(&tool_json_path, content).map_err(|e| MaccError::Io {
-        path: tool_json_path.to_string_lossy().into(),
-        action: "write tool.json".into(),
-        source: e,
-    })?;
-    Ok(tool_json_path)
-}
-
-fn ensure_tool_json(
-    repo_root: &std::path::Path,
-    worktree_path: &std::path::Path,
-    tool_id: &str,
-) -> Result<std::path::PathBuf> {
-    let tool_json_path = worktree_path.join(".macc").join("tool.json");
-    if tool_json_path.exists() {
-        return Ok(tool_json_path);
-    }
-    write_tool_json(repo_root, worktree_path, tool_id)
-}
-
-fn ensure_performer(
-    _repo_root: &std::path::Path,
-    worktree_path: &std::path::Path,
-) -> Result<std::path::PathBuf> {
-    let target = worktree_path.join("performer.sh");
-    if target.exists() {
-        return Ok(target);
-    }
-
-    let worktree_paths = macc_core::ProjectPaths::from_root(worktree_path);
-    let _ = macc_core::ensure_embedded_automation_scripts(&worktree_paths)?;
-    let source = worktree_paths.automation_performer_path();
-
-    std::fs::copy(&source, &target).map_err(|e| MaccError::Io {
-        path: target.to_string_lossy().into(),
-        action: "copy performer.sh".into(),
-        source: e,
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&target)
-            .map_err(|e| MaccError::Io {
-                path: target.to_string_lossy().into(),
-                action: "read performer permissions".into(),
-                source: e,
-            })?
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&target, perms).map_err(|e| MaccError::Io {
-            path: target.to_string_lossy().into(),
-            action: "set performer permissions".into(),
-            source: e,
-        })?;
-    }
-
-    Ok(target)
-}
-
-fn resolve_worktree_task_context(
-    repo_root: &std::path::Path,
-    worktree_path: &std::path::Path,
-    fallback_id: &str,
-) -> Result<(String, std::path::PathBuf)> {
-    let prd_path = worktree_path.join("worktree.prd.json");
-    if prd_path.exists() {
-        let content = std::fs::read_to_string(&prd_path).map_err(|e| MaccError::Io {
-            path: prd_path.to_string_lossy().into(),
-            action: "read worktree.prd.json".into(),
-            source: e,
-        })?;
-        let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-            MaccError::Validation(format!("Failed to parse worktree.prd.json: {}", e))
-        })?;
-        let task_id = json
-            .get("tasks")
-            .and_then(|tasks| tasks.get(0))
-            .and_then(|task| task.get("id"))
-            .and_then(|id| match id {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                MaccError::Validation("worktree.prd.json is missing tasks[0].id".into())
-            })?;
-        return Ok((task_id, prd_path));
-    }
-
-    let fallback_prd = repo_root.join("prd.json");
-    if !fallback_prd.exists() {
-        return Err(MaccError::Validation(
-            "Missing worktree.prd.json and prd.json".into(),
-        ));
-    }
-    Ok((fallback_id.to_string(), fallback_prd))
-}
-
-struct CoordinatorEnvConfig {
-    prd: Option<String>,
-    coordinator_tool: Option<String>,
-    reference_branch: Option<String>,
-    tool_priority: Option<String>,
-    max_parallel_per_tool_json: Option<String>,
-    tool_specializations_json: Option<String>,
-    max_dispatch: Option<usize>,
-    max_parallel: Option<usize>,
-    timeout_seconds: Option<usize>,
-    phase_runner_max_attempts: Option<usize>,
-    stale_claimed_seconds: Option<usize>,
-    stale_in_progress_seconds: Option<usize>,
-    stale_changes_requested_seconds: Option<usize>,
-    stale_action: Option<String>,
-}
-
-const COORDINATOR_TASK_REGISTRY_REL_PATH: &str = ".macc/automation/task/task_registry.json";
-
-fn apply_coordinator_env(
-    command: &mut std::process::Command,
-    canonical: &macc_core::config::CanonicalConfig,
-    coordinator: Option<&macc_core::config::CoordinatorConfig>,
-    env_cfg: &CoordinatorEnvConfig,
-) {
-    command.env("ENABLED_TOOLS_CSV", canonical.tools.enabled.join(","));
-
-    if let Some(value) = env_cfg
-        .prd
-        .clone()
-        .or_else(|| coordinator.and_then(|c| c.prd_file.clone()))
-    {
-        command.env("PRD_FILE", value);
-    }
-    command.env("TASK_REGISTRY_FILE", COORDINATOR_TASK_REGISTRY_REL_PATH);
-    if let Some(value) = env_cfg
-        .coordinator_tool
-        .clone()
-        .or_else(|| coordinator.and_then(|c| c.coordinator_tool.clone()))
-    {
-        command.env("COORDINATOR_TOOL", value);
-    }
-    if let Some(value) = env_cfg
-        .reference_branch
-        .clone()
-        .or_else(|| coordinator.and_then(|c| c.reference_branch.clone()))
-    {
-        command.env("DEFAULT_BASE_BRANCH", value);
-    }
-    if let Some(value) = env_cfg.tool_priority.clone().or_else(|| {
-        coordinator.and_then(|c| {
-            if c.tool_priority.is_empty() {
-                None
-            } else {
-                Some(c.tool_priority.join(","))
-            }
-        })
-    }) {
-        command.env("TOOL_PRIORITY_CSV", value);
-    }
-    if let Some(value) = env_cfg.max_parallel_per_tool_json.clone().or_else(|| {
-        coordinator.and_then(|c| {
-            if c.max_parallel_per_tool.is_empty() {
-                None
-            } else {
-                serde_json::to_string(&c.max_parallel_per_tool).ok()
-            }
-        })
-    }) {
-        command.env("MAX_PARALLEL_PER_TOOL_JSON", value);
-    }
-    if let Some(value) = env_cfg.tool_specializations_json.clone().or_else(|| {
-        coordinator.and_then(|c| {
-            if c.tool_specializations.is_empty() {
-                None
-            } else {
-                serde_json::to_string(&c.tool_specializations).ok()
-            }
-        })
-    }) {
-        command.env("TOOL_SPECIALIZATIONS_JSON", value);
-    }
-    if let Some(value) = env_cfg
-        .max_dispatch
-        .or_else(|| coordinator.and_then(|c| c.max_dispatch))
-    {
-        command.env("MAX_DISPATCH", value.to_string());
-    }
-    if let Some(value) = env_cfg
-        .max_parallel
-        .or_else(|| coordinator.and_then(|c| c.max_parallel))
-    {
-        command.env("MAX_PARALLEL", value.to_string());
-    }
-    if let Some(value) = env_cfg
-        .timeout_seconds
-        .or_else(|| coordinator.and_then(|c| c.timeout_seconds))
-    {
-        command.env("TIMEOUT_SECONDS", value.to_string());
-    }
-    if let Some(value) = env_cfg
-        .phase_runner_max_attempts
-        .or_else(|| coordinator.and_then(|c| c.phase_runner_max_attempts))
-    {
-        command.env("PHASE_RUNNER_MAX_ATTEMPTS", value.to_string());
-    }
-    if let Some(value) = env_cfg
-        .stale_claimed_seconds
-        .or_else(|| coordinator.and_then(|c| c.stale_claimed_seconds))
-    {
-        command.env("STALE_CLAIMED_SECONDS", value.to_string());
-    }
-    if let Some(value) = env_cfg
-        .stale_in_progress_seconds
-        .or_else(|| coordinator.and_then(|c| c.stale_in_progress_seconds))
-    {
-        command.env("STALE_IN_PROGRESS_SECONDS", value.to_string());
-    }
-    if let Some(value) = env_cfg
-        .stale_changes_requested_seconds
-        .or_else(|| coordinator.and_then(|c| c.stale_changes_requested_seconds))
-    {
-        command.env("STALE_CHANGES_REQUESTED_SECONDS", value.to_string());
-    }
-    if let Some(value) = env_cfg
-        .stale_action
-        .clone()
-        .or_else(|| coordinator.and_then(|c| c.stale_action.clone()))
-    {
-        command.env("STALE_ACTION", value);
-    }
-}
-
-fn run_coordinator_action(
-    repo_root: &std::path::Path,
-    coordinator_path: &std::path::Path,
-    action: &str,
-    extra_args: &[String],
-    canonical: &macc_core::config::CanonicalConfig,
-    coordinator: Option<&macc_core::config::CoordinatorConfig>,
-    env_cfg: &CoordinatorEnvConfig,
-) -> Result<()> {
-    let mut command = std::process::Command::new(coordinator_path);
-    command.current_dir(repo_root);
-    command.arg(action);
-    command.args(extra_args);
-    apply_coordinator_env(&mut command, canonical, coordinator, env_cfg);
-
-    let status = command.status().map_err(|e| MaccError::Io {
-        path: coordinator_path.to_string_lossy().into(),
-        action: format!("run coordinator action '{}'", action),
-        source: e,
-    })?;
-    if !status.success() {
-        let hint = coordinator_action_hint(action);
-        return Err(MaccError::Validation(format!(
-            "Coordinator '{}' failed with status: {}. {}",
-            action, status, hint
-        )));
-    }
-    Ok(())
-}
-
-fn coordinator_action_hint(action: &str) -> &'static str {
-    match action {
-        "dispatch" => {
-            "Run `macc coordinator status` and inspect logs with `macc logs tail --component coordinator`."
-        }
-        "advance" => {
-            "Run `macc coordinator reconcile`, then `macc coordinator unlock --all` if tasks are stuck."
-        }
-        "reconcile" | "cleanup" => {
-            "Run `macc worktree prune` and retry; if locks remain, run `macc coordinator unlock --all`."
-        }
-        "unlock" => {
-            "Inspect lock owners in .macc/automation/task/task_registry.json then retry dispatch."
-        }
-        "sync" => "Check PRD/registry JSON validity and rerun `macc coordinator sync`.",
-        _ => "Inspect logs with `macc logs tail --component coordinator`.",
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RegistryCounts {
-    total: usize,
-    todo: usize,
-    active: usize,
-    blocked: usize,
-    merged: usize,
-}
-
-fn read_registry_counts(path: &std::path::Path) -> Result<RegistryCounts> {
-    let content = std::fs::read_to_string(path).map_err(|e| MaccError::Io {
-        path: path.to_string_lossy().into(),
-        action: "read task registry".into(),
-        source: e,
-    })?;
-    let root: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-        MaccError::Validation(format!(
-            "Failed to parse task registry JSON '{}': {}",
-            path.display(),
-            e
-        ))
-    })?;
-    let tasks = root
-        .get("tasks")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| MaccError::Validation("Task registry missing 'tasks' array".into()))?;
-
-    let mut counts = RegistryCounts {
-        total: tasks.len(),
-        todo: 0,
-        active: 0,
-        blocked: 0,
-        merged: 0,
-    };
-
-    for task in tasks {
-        let state = task
-            .get("state")
-            .and_then(|v| v.as_str())
-            .unwrap_or("todo")
-            .to_ascii_lowercase();
-        match state.as_str() {
-            "todo" => counts.todo += 1,
-            "claimed" | "in_progress" | "pr_open" | "changes_requested" | "queued" => {
-                counts.active += 1
-            }
-            "blocked" => counts.blocked += 1,
-            "merged" => counts.merged += 1,
-            _ => {}
-        }
-    }
-    Ok(counts)
-}
-
-fn run_coordinator_full_cycle(
-    repo_root: &std::path::Path,
-    coordinator_path: &std::path::Path,
-    canonical: &macc_core::config::CanonicalConfig,
-    coordinator: Option<&macc_core::config::CoordinatorConfig>,
-    env_cfg: &CoordinatorEnvConfig,
-) -> Result<()> {
-    let registry_path = repo_root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
-
-    let timeout_seconds = env_cfg
-        .timeout_seconds
-        .or_else(|| coordinator.and_then(|c| c.timeout_seconds))
-        .unwrap_or(3600) as u64;
-    let max_cycles = 128usize;
-    let mut no_progress_cycles = 0usize;
-    let started = std::time::Instant::now();
-
-    for cycle in 1..=max_cycles {
-        run_coordinator_action(
-            repo_root,
-            coordinator_path,
-            "sync",
-            &[],
-            canonical,
-            coordinator,
-            env_cfg,
-        )?;
-
-        let before = read_registry_counts(&registry_path)?;
-        run_coordinator_action(
-            repo_root,
-            coordinator_path,
-            "dispatch",
-            &[],
-            canonical,
-            coordinator,
-            env_cfg,
-        )?;
-        run_coordinator_action(
-            repo_root,
-            coordinator_path,
-            "advance",
-            &[],
-            canonical,
-            coordinator,
-            env_cfg,
-        )?;
-        run_coordinator_action(
-            repo_root,
-            coordinator_path,
-            "reconcile",
-            &[],
-            canonical,
-            coordinator,
-            env_cfg,
-        )?;
-        run_coordinator_action(
-            repo_root,
-            coordinator_path,
-            "cleanup",
-            &[],
-            canonical,
-            coordinator,
-            env_cfg,
-        )?;
-        run_coordinator_action(
-            repo_root,
-            coordinator_path,
-            "sync",
-            &[],
-            canonical,
-            coordinator,
-            env_cfg,
-        )?;
-        let after = read_registry_counts(&registry_path)?;
-
-        println!(
-            "Coordinator cycle {}: total={} todo={} active={} blocked={} merged={}",
-            cycle, after.total, after.todo, after.active, after.blocked, after.merged
-        );
-
-        if after.todo == 0 && after.active == 0 {
-            if after.blocked > 0 {
-                return Err(MaccError::Validation(format!(
-                    "Coordinator run finished with blocked tasks: {} (registry: {})",
-                    after.blocked,
-                    registry_path.display()
-                )));
-            }
-            println!("Coordinator run complete.");
-            return Ok(());
-        }
-
-        if after == before {
-            no_progress_cycles += 1;
-        } else {
-            no_progress_cycles = 0;
-        }
-
-        if no_progress_cycles >= 2 {
-            return Err(MaccError::Validation(format!(
-                "Coordinator made no progress for {} cycles (todo={}, active={}, blocked={}). Run `macc coordinator status`, then `macc coordinator unlock --all`, and inspect logs with `macc logs tail --component coordinator`.",
-                no_progress_cycles, after.todo, after.active, after.blocked
-            )));
-        }
-
-        if started.elapsed() > std::time::Duration::from_secs(timeout_seconds) {
-            return Err(MaccError::Validation(format!(
-                "Coordinator run timed out after {} seconds. Run `macc coordinator status` and `macc logs tail --component coordinator`.",
-                timeout_seconds
-            )));
-        }
-    }
-
-    Err(MaccError::Validation(format!(
-        "Coordinator run reached max cycles ({}) without converging.",
-        max_cycles
-    )))
-}
-
-fn stop_coordinator_process_groups(
-    repo_root: &std::path::Path,
-    coordinator_path: &std::path::Path,
-    graceful: bool,
-) -> Result<usize> {
-    let repo = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
-    let mut pids = pgrep_pids(&coordinator_path.to_string_lossy())?;
-    if pids.is_empty() {
-        pids = pgrep_pids("coordinator.sh")?;
-    }
-
-    let mut pgids = std::collections::BTreeSet::new();
-    for pid in pids {
-        if pid == std::process::id() as i32 {
-            continue;
-        }
-        if !pid_in_repo(pid, &repo) {
-            continue;
-        }
-        if let Some(pgid) = get_pgid(pid)? {
-            pgids.insert(pgid);
-        }
-    }
-
-    for pgid in &pgids {
-        signal_process_group(*pgid, "-TERM")?;
-    }
-    if !pgids.is_empty() {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-
-    if !graceful {
-        for _ in 0..20 {
-            if pgids.iter().all(|pgid| !pgid_is_alive(*pgid)) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        }
-        for pgid in &pgids {
-            if pgid_is_alive(*pgid) {
-                signal_process_group(*pgid, "-KILL")?;
-            }
-        }
-    }
-
-    Ok(pgids.len())
-}
-
-fn pgrep_pids(pattern: &str) -> Result<Vec<i32>> {
-    let output = std::process::Command::new("pgrep")
-        .arg("-f")
-        .arg(pattern)
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: "pgrep".into(),
-            action: "find coordinator processes".into(),
-            source: e,
-        })?;
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(text
-        .lines()
-        .filter_map(|line| line.trim().parse::<i32>().ok())
-        .collect())
-}
-
-fn pid_in_repo(pid: i32, repo_root: &std::path::Path) -> bool {
-    let proc_cwd = std::path::PathBuf::from(format!("/proc/{}/cwd", pid));
-    let Ok(cwd) = std::fs::read_link(proc_cwd) else {
-        return false;
-    };
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
-    cwd.starts_with(repo_root)
-}
-
-fn get_pgid(pid: i32) -> Result<Option<i32>> {
-    let output = std::process::Command::new("ps")
-        .arg("-o")
-        .arg("pgid=")
-        .arg("-p")
-        .arg(pid.to_string())
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: "ps".into(),
-            action: "read process group".into(),
-            source: e,
-        })?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(value.parse::<i32>().ok())
-}
-
-fn signal_process_group(pgid: i32, signal: &str) -> Result<()> {
-    let target = format!("-{}", pgid);
-    let status = std::process::Command::new("kill")
-        .arg(signal)
-        .arg(target)
-        .status()
-        .map_err(|e| MaccError::Io {
-            path: "kill".into(),
-            action: format!("send {} to process group", signal),
-            source: e,
-        })?;
-    // Group can disappear between discovery and signaling; treat that as success.
-    let _ = status;
-    Ok(())
-}
-
-fn pgid_is_alive(pgid: i32) -> bool {
-    let target = format!("-{}", pgid);
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(target)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn remove_all_worktrees(root: &std::path::Path, remove_branches: bool) -> Result<usize> {
-    let entries = macc_core::list_worktrees(root)?;
-    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let mut removed = 0usize;
-
-    for entry in entries {
-        if entry.path == root_canon {
-            continue;
-        }
-        let branch = entry.branch.clone();
-        macc_core::remove_worktree(root, &entry.path, true)?;
-        if remove_branches {
-            delete_branch(root, branch.as_deref(), true)?;
-        }
-        removed += 1;
-    }
-    Ok(removed)
-}
-
-fn install_tool(paths: &macc_core::ProjectPaths, tool_id: &str, assume_yes: bool) -> Result<()> {
-    let search_paths = macc_core::tool::ToolSpecLoader::default_search_paths(&paths.root);
-    let loader = macc_core::tool::ToolSpecLoader::new(search_paths);
-    let (specs, diagnostics) = loader.load_all_with_embedded();
-    report_diagnostics(&diagnostics);
-
-    let spec = specs
-        .into_iter()
-        .find(|s| s.id == tool_id)
-        .ok_or_else(|| MaccError::Validation(format!("Unknown tool: {}", tool_id)))?;
-
-    let install = spec.install.clone().ok_or_else(|| {
-        MaccError::Validation(format!(
-            "Tool '{}' does not define installation steps in ToolSpec.",
-            tool_id
-        ))
-    })?;
-
-    if install.commands.is_empty() {
-        return Err(MaccError::Validation(format!(
-            "Tool '{}' install commands are empty.",
-            tool_id
-        )));
-    }
-
-    let confirm_message = install.confirm_message.unwrap_or_else(|| {
-        "You must already have an account or API key for this tool. Continue installation?"
-            .to_string()
-    });
-    if !assume_yes {
-        println!("{}", confirm_message);
-        if !confirm_yes_no("Proceed [y/N]? ")? {
-            return Err(MaccError::Validation("Installation cancelled.".into()));
-        }
-    }
-
-    println!("Installing tool '{}'.", tool_id);
-    for command in &install.commands {
-        run_install_command(&paths.root, command, false)?;
-    }
-
-    let initial_checks = run_tool_health_checks(&spec);
-    print_checks(&initial_checks);
-    if !checks_all_installed(&initial_checks) {
-        return Err(MaccError::Validation(format!(
-            "Install completed but doctor checks are still failing for '{}'.",
-            tool_id
-        )));
-    }
-
-    if let Some(post_install) = &install.post_install {
-        println!("Running post-install setup for '{}'.", tool_id);
-        run_install_command(&paths.root, post_install, true)?;
-    }
-
-    let final_checks = run_tool_health_checks(&spec);
-    print_checks(&final_checks);
-    if !checks_all_installed(&final_checks) {
-        return Err(MaccError::Validation(format!(
-            "Post-install validation failed for '{}'.",
-            tool_id
-        )));
-    }
-
-    println!("Tool '{}' is installed and healthy.", tool_id);
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct ToolUpdateStatus {
-    id: String,
-    installed: bool,
-    current_version: Option<String>,
-    latest_version: Option<String>,
-    source: String,
-}
-
-impl ToolUpdateStatus {
-    fn is_outdated(&self) -> bool {
-        match (&self.current_version, &self.latest_version) {
-            (Some(current), Some(latest)) => current != latest,
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ToolUpdateCommandOptions<'a> {
-    tool_id: Option<&'a str>,
-    all: bool,
-    only: Option<&'a str>,
-    check: bool,
-    assume_yes: bool,
-    force: bool,
-    rollback_on_fail: bool,
-}
-
-fn load_toolspecs_with_diagnostics(paths: &macc_core::ProjectPaths) -> Result<Vec<ToolSpec>> {
-    let search_paths = macc_core::tool::ToolSpecLoader::default_search_paths(&paths.root);
-    let loader = macc_core::tool::ToolSpecLoader::new(search_paths);
-    let (specs, diagnostics) = loader.load_all_with_embedded();
-    report_diagnostics(&diagnostics);
-    Ok(specs)
-}
-
-fn update_tools(paths: &macc_core::ProjectPaths, opts: ToolUpdateCommandOptions<'_>) -> Result<()> {
-    let specs = load_toolspecs_with_diagnostics(paths)?;
-    let canonical = load_canonical_config(&paths.config_path)?;
-    let selected = select_tools_for_update(&specs, &canonical, opts.tool_id, opts.all, opts.only)?;
-
-    if selected.is_empty() {
-        return Err(MaccError::Validation(
-            "No matching tools found for update.".into(),
-        ));
-    }
-
-    let mut updated = 0usize;
-    let mut already_latest = 0usize;
-    let mut skipped = 0usize;
-    let mut failed: Vec<String> = Vec::new();
-
-    for spec in selected {
-        let status = get_tool_update_status(&spec);
-        let latest_display = status
-            .latest_version
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        let current_display = status
-            .current_version
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-
-        if !status.installed && !opts.force {
-            println!(
-                "Skipping '{}': not currently installed (run `macc tool install {}`).",
-                spec.id, spec.id
-            );
-            skipped += 1;
-            continue;
-        }
-
-        if !opts.force && status.latest_version.is_some() && !status.is_outdated() {
-            println!(
-                "Skipping '{}': already latest (current={}, latest={}).",
-                spec.id, current_display, latest_display
-            );
-            already_latest += 1;
-            continue;
-        }
-
-        if opts.check {
-            println!(
-                "[check] tool={} installed={} current={} latest={} source={}",
-                spec.id, status.installed, current_display, latest_display, status.source
-            );
-            continue;
-        }
-
-        match update_single_tool(paths, &spec, opts.assume_yes, opts.rollback_on_fail) {
-            Ok(()) => {
-                println!("Updated '{}'.", spec.id);
-                updated += 1;
-            }
-            Err(err) => {
-                eprintln!("Failed to update '{}': {}", spec.id, err);
-                failed.push(spec.id.clone());
-            }
-        }
-    }
-
-    if opts.check {
-        return Ok(());
-    }
-
-    println!(
-        "Update summary: updated={} already_latest={} skipped={} failed={}",
-        updated,
-        already_latest,
-        skipped,
-        failed.len()
-    );
-
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(MaccError::Validation(format!(
-            "Tool update failed for: {}",
-            failed.join(", ")
-        )))
-    }
-}
-
-fn update_single_tool(
-    paths: &macc_core::ProjectPaths,
-    spec: &ToolSpec,
-    assume_yes: bool,
-    rollback_on_fail: bool,
-) -> Result<()> {
-    let update_spec = spec
-        .update
-        .clone()
-        .or_else(|| spec.install.clone())
-        .ok_or_else(|| {
-            MaccError::Validation(format!(
-                "Tool '{}' does not define update/install steps in ToolSpec.",
-                spec.id
-            ))
-        })?;
-    if update_spec.commands.is_empty() {
-        return Err(MaccError::Validation(format!(
-            "Tool '{}' update commands are empty.",
-            spec.id
-        )));
-    }
-
-    if !assume_yes {
-        println!(
-            "{}",
-            update_spec.confirm_message.unwrap_or_else(|| {
-                format!(
-                    "This will run update commands for '{}'. Continue?",
-                    spec.display_name
-                )
-            })
-        );
-        if !confirm_yes_no("Proceed [y/N]? ")? {
-            return Err(MaccError::Validation("Update cancelled.".into()));
-        }
-    }
-
-    let update_result: Result<()> = (|| {
-        for command in &update_spec.commands {
-            run_install_command(&paths.root, command, false)?;
-        }
-
-        if let Some(post_install) = &update_spec.post_install {
-            run_install_command(&paths.root, post_install, true)?;
-        }
-
-        let final_checks = run_tool_health_checks(spec);
-        print_checks(&final_checks);
-        if !checks_all_installed(&final_checks) {
-            return Err(MaccError::Validation(format!(
-                "Post-update validation failed for '{}'.",
-                spec.id
-            )));
-        }
-        Ok(())
-    })();
-
-    if update_result.is_ok() || !rollback_on_fail {
-        return update_result;
-    }
-
-    eprintln!(
-        "Rollback requested for '{}' but no generic rollback contract is defined. Configure tool-specific rollback in ToolSpec before enabling this in production.",
-        spec.id
-    );
-
-    update_result
-}
-
-fn show_outdated_tools(paths: &macc_core::ProjectPaths, only: Option<&str>) -> Result<()> {
-    let specs = load_toolspecs_with_diagnostics(paths)?;
-    let canonical = load_canonical_config(&paths.config_path)?;
-    let selected = select_tools_for_update(&specs, &canonical, None, true, only)?;
-
-    println!(
-        "{:<14} {:<10} {:<16} {:<16} {:<14}",
-        "TOOL", "INSTALLED", "CURRENT", "LATEST", "STATE"
-    );
-    println!(
-        "{:-<14} {:-<10} {:-<16} {:-<16} {:-<14}",
-        "", "", "", "", ""
-    );
-
-    let mut outdated_count = 0usize;
-    for spec in selected {
-        let status = get_tool_update_status(&spec);
-        let state = if !status.installed {
-            "not_installed"
-        } else if status.is_outdated() {
-            outdated_count += 1;
-            "outdated"
-        } else if status.latest_version.is_some() {
-            "up_to_date"
-        } else {
-            "unknown"
-        };
-        println!(
-            "{:<14} {:<10} {:<16} {:<16} {:<14}",
-            status.id,
-            if status.installed { "yes" } else { "no" },
-            status.current_version.unwrap_or_else(|| "-".to_string()),
-            status.latest_version.unwrap_or_else(|| "-".to_string()),
-            state
-        );
-    }
-
-    println!();
-    println!("Outdated tools: {}", outdated_count);
-    Ok(())
-}
-
-fn select_tools_for_update(
-    specs: &[ToolSpec],
-    canonical: &macc_core::config::CanonicalConfig,
-    tool_id: Option<&str>,
-    all: bool,
-    only: Option<&str>,
-) -> Result<Vec<ToolSpec>> {
-    if !all && tool_id.is_none() {
-        return Err(MaccError::Validation(
-            "Use `macc tool update <tool_id>` or `macc tool update --all`.".into(),
-        ));
-    }
-    if all && tool_id.is_some() {
-        return Err(MaccError::Validation(
-            "Use either <tool_id> or --all, not both.".into(),
-        ));
-    }
-
-    let mut selected: Vec<ToolSpec> = if let Some(id) = tool_id {
-        let spec = specs
-            .iter()
-            .find(|s| s.id == id)
-            .ok_or_else(|| MaccError::Validation(format!("Unknown tool: {}", id)))?;
-        vec![spec.clone()]
-    } else {
-        specs.to_vec()
-    };
-
-    selected.retain(|spec| spec.install.is_some());
-
-    if let Some(filter) = only {
-        match filter {
-            "enabled" => {
-                selected.retain(|spec| canonical.tools.enabled.iter().any(|id| id == &spec.id));
-            }
-            "installed" => {
-                selected.retain(|spec| get_tool_update_status(spec).installed);
-            }
-            _ => {}
-        }
-    }
-
-    Ok(selected)
-}
-
-fn get_tool_update_status(spec: &ToolSpec) -> ToolUpdateStatus {
-    let checks = run_tool_health_checks(spec);
-    let installed = checks_all_installed(&checks);
-    let (current_version, latest_version, source) = if let Some(vs) = &spec.version_check {
-        let current = run_version_command(&vs.current);
-        let latest = vs.latest.as_ref().and_then(run_version_command);
-        (
-            current,
-            latest,
-            format!(
-                "{}{}",
-                vs.current.command,
-                if vs.latest.is_some() {
-                    " (+latest)"
-                } else {
-                    ""
-                }
-            ),
-        )
-    } else {
-        (None, None, "unknown".to_string())
-    };
-    ToolUpdateStatus {
-        id: spec.id.clone(),
-        installed,
-        current_version,
-        latest_version,
-        source,
-    }
-}
-
-fn run_version_command(cmd_spec: &macc_core::tool::ToolInstallCommand) -> Option<String> {
-    let output = std::process::Command::new(&cmd_spec.command)
-        .args(&cmd_spec.args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !stdout.is_empty() && stdout.chars().all(|c| !c.is_whitespace()) {
-        return Some(stdout.trim_start_matches('v').to_string());
-    }
-    let text = format!(
-        "{} {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    extract_version_token(&text)
-}
-
-fn extract_version_token(text: &str) -> Option<String> {
-    for raw in text.split_whitespace() {
-        let token = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
-        let normalized = token.trim_start_matches('v');
-        if normalized
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-            && normalized.chars().any(|c| c.is_ascii_digit())
-            && normalized.contains('.')
-        {
-            return Some(normalized.to_string());
-        }
-    }
-    None
-}
-
-fn run_context_generation(
-    paths: &macc_core::ProjectPaths,
-    tool_filter: Option<&str>,
-    from_files: &[String],
-    dry_run: bool,
-    print_prompt: bool,
-) -> Result<()> {
-    require_apply_before_context(paths)?;
-
-    let canonical = load_canonical_config(&paths.config_path)?;
-    let loader = ToolSpecLoader::new(ToolSpecLoader::default_search_paths(&paths.root));
-    let (specs, diagnostics) = loader.load_all_with_embedded();
-    report_diagnostics(&diagnostics);
-
-    let selected_tools: Vec<String> = if let Some(tool_id) = tool_filter {
-        vec![tool_id.to_string()]
-    } else {
-        canonical.tools.enabled.clone()
-    };
-
-    if selected_tools.is_empty() {
-        return Err(MaccError::Validation(
-            "No tool selected. Enable tools in .macc/macc.yaml or pass --tool <id>.".into(),
-        ));
-    }
-
-    let mut generated = 0usize;
-    let mut missing_tools = Vec::new();
-    for tool_id in selected_tools {
-        let Some(spec) = specs.iter().find(|s| s.id == tool_id) else {
-            missing_tools.push(tool_id.clone());
-            println!("Skipping '{}': ToolSpec not found.", tool_id);
-            continue;
-        };
-        let performer = spec.performer.as_ref().ok_or_else(|| {
-            MaccError::Validation(format!(
-                "Tool '{}' has no performer config; cannot generate context via AI tool.",
-                tool_id
-            ))
-        })?;
-
-        let target_rel = resolve_context_target_rel(&canonical, spec);
-        let target_abs = paths.root.join(&target_rel);
-        let prompt = build_context_prompt(paths, &canonical, spec, &target_rel, from_files)?;
-
-        if print_prompt {
-            println!(
-                "\n--- Prompt for {} ({}) ---\n{}\n",
-                spec.display_name, spec.id, prompt
-            );
-        }
-
-        if dry_run {
-            println!(
-                "[dry-run] tool={} target={} prompt_chars={}",
-                spec.id,
-                target_rel,
-                prompt.chars().count()
-            );
-            generated += 1;
-            continue;
-        }
-
-        let generated_content = invoke_context_tool(paths, performer, &prompt)?;
-        let cleaned = normalize_generated_markdown(&generated_content);
-        if cleaned.trim().is_empty() {
-            return Err(MaccError::Validation(format!(
-                "Tool '{}' returned empty content for '{}'",
-                spec.id, target_rel
-            )));
-        }
-
-        if let Some(parent) = target_abs.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
-                path: parent.to_string_lossy().into(),
-                action: "create context target parent directory".into(),
-                source: e,
-            })?;
-        }
-        std::fs::write(&target_abs, cleaned.as_bytes()).map_err(|e| MaccError::Io {
-            path: target_abs.to_string_lossy().into(),
-            action: "write generated context file".into(),
-            source: e,
-        })?;
-
-        println!("Generated {} with {}", target_rel, spec.display_name);
-        generated += 1;
-    }
-
-    if generated == 0 {
-        if tool_filter.is_some() && !missing_tools.is_empty() {
-            return Err(MaccError::Validation(format!(
-                "ToolSpec not found for tool '{}'.",
-                missing_tools[0]
-            )));
-        }
-        return Err(MaccError::Validation(
-            "No context files generated. Check enabled tools and ToolSpecs.".into(),
-        ));
-    }
-
-    println!("Context generation complete. Files handled: {}", generated);
-    Ok(())
-}
-
-fn context_apply_marker_path(paths: &macc_core::ProjectPaths) -> std::path::PathBuf {
-    paths
-        .macc_dir
-        .join("state")
-        .join("context_ready_after_apply")
-}
-
-fn require_apply_before_context(paths: &macc_core::ProjectPaths) -> Result<()> {
-    let marker = context_apply_marker_path(paths);
-    if marker.exists() {
-        return Ok(());
-    }
-    Err(MaccError::Validation(
-        "macc context is locked until at least one successful 'macc apply' has completed in this project.".into(),
-    ))
-}
-
-fn mark_apply_completed(paths: &macc_core::ProjectPaths) -> Result<()> {
-    let marker = context_apply_marker_path(paths);
-    if let Some(parent) = marker.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
-            path: parent.to_string_lossy().into(),
-            action: "create apply marker directory".into(),
-            source: e,
-        })?;
-    }
-    std::fs::write(&marker, b"applied\n").map_err(|e| MaccError::Io {
-        path: marker.to_string_lossy().into(),
-        action: "write apply marker".into(),
-        source: e,
-    })?;
-    Ok(())
-}
-
-fn resolve_context_target_rel(
-    canonical: &macc_core::config::CanonicalConfig,
-    spec: &ToolSpec,
-) -> String {
-    if let Some(rel) = context_target_from_tool_settings(canonical, &spec.id) {
-        return rel;
-    }
-
-    if let Some(md) = spec.gitignore.iter().find_map(|entry| {
-        let path = std::path::Path::new(entry);
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if ext.eq_ignore_ascii_case("md") {
-            Some(entry.clone())
-        } else {
-            None
-        }
-    }) {
-        return md;
-    }
-
-    format!("{}.md", spec.id.to_ascii_uppercase().replace('-', "_"))
-}
-
-fn context_target_from_tool_settings(
-    canonical: &macc_core::config::CanonicalConfig,
-    tool_id: &str,
-) -> Option<String> {
-    let config_map_entry = canonical.tools.config.get(tool_id);
-    let legacy_entry = canonical.tools.settings.get(tool_id);
-    for entry in [config_map_entry, legacy_entry].into_iter().flatten() {
-        if let Some(target) = extract_context_file_name_from_json(entry) {
-            return Some(target);
-        }
-    }
-    None
-}
-
-fn extract_context_file_name_from_json(value: &serde_json::Value) -> Option<String> {
-    let context = value.get("context")?;
-    let file_name = context.get("fileName")?;
-    match file_name {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Array(items) => items.first()?.as_str().map(|s| s.to_string()),
-        _ => None,
-    }
-}
-
-fn build_context_prompt(
-    paths: &macc_core::ProjectPaths,
-    canonical: &macc_core::config::CanonicalConfig,
-    spec: &ToolSpec,
-    target_rel: &str,
-    from_files: &[String],
-) -> Result<String> {
-    let mut sources: Vec<String> = Vec::new();
-    for item in from_files {
-        if !sources.contains(item) {
-            sources.push(item.clone());
-        }
-    }
-
-    let mut snippets = Vec::new();
-    for rel in sources {
-        let abs = paths.root.join(&rel);
-        if !abs.exists() || !abs.is_file() {
-            continue;
-        }
-        let content = std::fs::read_to_string(&abs).map_err(|e| MaccError::Io {
-            path: abs.to_string_lossy().into(),
-            action: "read context source file".into(),
-            source: e,
-        })?;
-        let excerpt = truncate_text_for_prompt(&content, 6000);
-        snippets.push((rel, excerpt));
-    }
-
-    let mut prompt = String::new();
-    prompt.push_str(
-        "You are a technical audit agent and developer assistant embedded in this repository.\n",
-    );
-    prompt.push_str(&format!(
-        "Your mission is to update `{}` as operational context and a working guide for {} AI agent (or developer) contributing to this project.\n\n",
-        target_rel,
-        spec.id
-    ));
-    prompt.push_str(&format!("Tool ID: {}\n", spec.id));
-    prompt.push_str(&format!("Tool Name: {}\n", spec.display_name));
-    prompt.push_str(&format!("Target file: {}\n", target_rel));
-    prompt.push_str(&format!(
-        "Enabled tools: {}\n\n",
-        canonical.tools.enabled.join(", ")
-    ));
-    prompt.push_str("Strict constraints\n");
-    prompt.push_str("- Rely only on the repository's actual contents (README, docs, folder structure, config, CI, scripts).\n");
-    prompt.push_str("- Do not invent anything.\n");
-    prompt.push_str("- If information is missing, write: `Unknown (to verify)` + indicate where to find it (files/commands).\n");
-    prompt.push_str("- For important statements (setup, commands, CI, tests, env vars, rules), indicate source as: `seen in <path/file>`.\n");
-    prompt.push_str("- Priority: security + compliance + quality + maintainability.\n");
-    prompt.push_str("- Style: clear, actionable, concise Markdown with checklists.\n\n");
-
-    prompt.push_str("Required method (perform before writing)\n");
-    prompt.push_str(
-        "1. Scan the folder structure: identify modules, entry points, key directories.\n",
-    );
-    prompt.push_str("2. Detect the stack: languages, frameworks, dependency management, tooling (lint/format/build).\n");
-    prompt.push_str("3. Map workflows: local execution, tests, CI, release.\n");
-    prompt.push_str("4. Security audit: secrets, auth, permissions, dependencies, sensitive data, attack surfaces.\n");
-    prompt.push_str("5. Compliance audit: licenses, personal data, logs, retention, traceability, requirements (if present).\n");
-    prompt.push_str(
-        "6. Tests & quality audit: test types, coverage, flakiness, mocks, fixtures, strategy.\n",
-    );
-    prompt.push_str("7. Synthesis: produce a context file that is immediately usable.\n\n");
-
-    prompt.push_str("Deliverable: write the target file with this exact outline\n");
-    prompt.push_str("0. TL;DR (max 10 lines)\n");
-    prompt.push_str("1. Project identity card\n");
-    prompt.push_str("2. Stack & tooling (with sources)\n");
-    prompt.push_str("3. Architecture & components\n");
-    prompt.push_str("4. Reproducible local setup\n");
-    prompt.push_str("5. Essential commands (copy/paste)\n");
-    prompt.push_str("6. Developer standards (Do / Don't)\n");
-    prompt.push_str("7. Test & quality strategy\n");
-    prompt.push_str("8. Productivity playbooks (typical tasks)\n");
-    prompt.push_str("9. Security (priority)\n");
-    prompt.push_str("10. Compliance & governance\n");
-    prompt.push_str("11. \"Where to find what\" (agent FAQ)\n");
-    prompt.push_str("12. Unknowns & documentation debt\n\n");
-
-    prompt.push_str("Output rules\n");
-    prompt.push_str(&format!(
-        "- Provide only the final content of `{}` in Markdown.\n",
-        target_rel
-    ));
-    prompt.push_str("- Every command must be copyable, exact, and sourced when possible.\n");
-    prompt.push_str(
-        "- Add Markdown checklists (`- [ ]`) for PR / security / release (if applicable).\n",
-    );
-    prompt.push_str("- Clearly mark what is observed vs inferred.\n\n");
-
-    if snippets.is_empty() {
-        prompt.push_str("Sources:\n- none provided\n");
-    } else {
-        prompt.push_str("Sources:\n");
-        for (rel, excerpt) in snippets {
-            prompt.push_str(&format!("\n--- BEGIN SOURCE: {} ---\n", rel));
-            prompt.push_str(&excerpt);
-            prompt.push_str(&format!("\n--- END SOURCE: {} ---\n", rel));
-        }
-    }
-    Ok(prompt)
-}
-
-fn truncate_text_for_prompt(input: &str, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input.to_string();
-    }
-    input.chars().take(max_chars).collect::<String>()
-}
-
-fn invoke_context_tool(
-    paths: &macc_core::ProjectPaths,
-    performer: &ToolPerformerSpec,
-    prompt: &str,
-) -> Result<String> {
-    if !command_exists(&performer.command) {
-        return Err(MaccError::Validation(format!(
-            "Tool command '{}' not found in PATH. Run 'macc doctor' and install/login the tool first.",
-            performer.command
-        )));
-    }
-
-    let mut cmd = std::process::Command::new(&performer.command);
-    cmd.current_dir(&paths.root);
-    cmd.args(&performer.args);
-
-    let prompt_mode = performer
-        .prompt
-        .as_ref()
-        .map(|p| p.mode.as_str())
-        .unwrap_or("stdin");
-
-    match prompt_mode {
-        "arg" => {
-            let arg = performer
-                .prompt
-                .as_ref()
-                .and_then(|p| p.arg.as_ref())
-                .ok_or_else(|| {
-                    MaccError::Validation(format!(
-                        "Tool '{}' prompt mode is 'arg' but no prompt arg is configured.",
-                        performer.command
-                    ))
-                })?;
-            cmd.arg(arg);
-            cmd.arg(prompt);
-            let output = cmd.output().map_err(|e| MaccError::Io {
-                path: performer.command.clone(),
-                action: "run tool context generation command".into(),
-                source: e,
-            })?;
-            decode_context_output(&performer.command, output)
-        }
-        "stdin" => {
-            use std::io::Write;
-            let mut child = cmd
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|e| MaccError::Io {
-                    path: performer.command.clone(),
-                    action: "spawn tool context generation command".into(),
-                    source: e,
-                })?;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(prompt.as_bytes())
-                    .map_err(|e| MaccError::Io {
-                        path: performer.command.clone(),
-                        action: "write prompt to tool stdin".into(),
-                        source: e,
-                    })?;
-            }
-            let output = child.wait_with_output().map_err(|e| MaccError::Io {
-                path: performer.command.clone(),
-                action: "wait for tool context generation command".into(),
-                source: e,
-            })?;
-            decode_context_output(&performer.command, output)
-        }
-        other => Err(MaccError::Validation(format!(
-            "Unsupported prompt mode '{}' for tool '{}'.",
-            other, performer.command
-        ))),
-    }
-}
-
-fn decode_context_output(command: &str, output: std::process::Output) -> Result<String> {
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if !output.status.success() {
-        let reason = if !stderr.trim().is_empty() {
-            stderr.trim().to_string()
-        } else if !stdout.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            format!("exit status {}", output.status)
-        };
-        return Err(MaccError::Validation(format!(
-            "Context generation command '{}' failed: {}",
-            command, reason
-        )));
-    }
-
-    if !stdout.trim().is_empty() {
-        return Ok(stdout);
-    }
-    if !stderr.trim().is_empty() {
-        return Ok(stderr);
-    }
-    Ok(String::new())
-}
-
-fn normalize_generated_markdown(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.starts_with("```") {
-        let mut lines = trimmed.lines();
-        let _ = lines.next();
-        let mut body = Vec::new();
-        for line in lines {
-            if line.trim_start().starts_with("```") {
-                break;
-            }
-            body.push(line);
-        }
-        let joined = body.join("\n").trim().to_string();
-        if !joined.is_empty() {
-            return format!("{}\n", joined);
-        }
-    }
-    format!("{}\n", trimmed)
-}
-
-fn command_exists(cmd: &str) -> bool {
-    std::process::Command::new("bash")
-        .arg("-lc")
-        .arg(format!("command -v {} >/dev/null 2>&1", shell_escape(cmd)))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn shell_escape(input: &str) -> String {
-    if input
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/')
-    {
-        input.to_string()
-    } else {
-        format!("'{}'", input.replace('\'', "'\"'\"'"))
-    }
-}
-
-fn confirm_yes_no(prompt: &str) -> Result<bool> {
+pub(crate) fn confirm_yes_no(prompt: &str) -> Result<bool> {
     use std::io::{self, Write};
 
     print!("{}", prompt);
@@ -3352,69 +823,7 @@ fn confirm_yes_no(prompt: &str) -> Result<bool> {
     Ok(value == "y" || value == "yes")
 }
 
-fn run_install_command(
-    cwd: &std::path::Path,
-    command: &macc_core::tool::ToolInstallCommand,
-    interactive: bool,
-) -> Result<()> {
-    let mut cmd = std::process::Command::new(&command.command);
-    cmd.args(&command.args).current_dir(cwd);
-    if interactive {
-        cmd.stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit());
-    }
-    let status = cmd.status().map_err(|e| MaccError::Io {
-        path: command.command.clone(),
-        action: "run tool install command".into(),
-        source: e,
-    })?;
-    if !status.success() {
-        return Err(MaccError::Validation(format!(
-            "Command failed: {} {} (status: {})",
-            command.command,
-            command.args.join(" "),
-            status
-        )));
-    }
-    Ok(())
-}
-
-fn run_tool_health_checks(spec: &macc_core::tool::ToolSpec) -> Vec<macc_core::doctor::ToolCheck> {
-    let mut checks = Vec::new();
-    if let Some(doctor_specs) = &spec.doctor {
-        for check_spec in doctor_specs {
-            checks.push(macc_core::doctor::ToolCheck {
-                name: spec.display_name.clone(),
-                tool_id: Some(spec.id.clone()),
-                check_target: check_spec.value.clone(),
-                kind: check_spec.kind.clone(),
-                status: macc_core::doctor::ToolStatus::Missing,
-                severity: check_spec.severity.clone(),
-            });
-        }
-    } else {
-        checks.push(macc_core::doctor::ToolCheck {
-            name: spec.display_name.clone(),
-            tool_id: Some(spec.id.clone()),
-            check_target: spec.id.clone(),
-            kind: macc_core::tool::DoctorCheckKind::Which,
-            status: macc_core::doctor::ToolStatus::Missing,
-            severity: macc_core::tool::CheckSeverity::Warning,
-        });
-    }
-
-    macc_core::doctor::run_checks(&mut checks);
-    checks
-}
-
-fn checks_all_installed(checks: &[macc_core::doctor::ToolCheck]) -> bool {
-    checks
-        .iter()
-        .all(|check| matches!(check.status, macc_core::doctor::ToolStatus::Installed))
-}
-
-fn print_checks(checks: &[macc_core::doctor::ToolCheck]) {
+pub(crate) fn print_checks(checks: &[macc_core::doctor::ToolCheck]) {
     println!("{:<20} {:<10} {:<30}", "CHECK", "STATUS", "TARGET");
     println!("{:-<20} {:-<10} {:-<30}", "", "", "");
 
@@ -3429,282 +838,6 @@ fn print_checks(checks: &[macc_core::doctor::ToolCheck]) {
             check.name, status_str, check.check_target
         );
     }
-}
-
-#[derive(Debug, Clone)]
-struct WorktreeSessionStatus {
-    tool: String,
-    session_id: String,
-    stale: bool,
-}
-
-fn canonicalize_path_fallback(path: &std::path::Path) -> std::path::PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn truncate_cell(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_string();
-    }
-    if max <= 1 {
-        return ".".to_string();
-    }
-    let keep = max.saturating_sub(3);
-    let trimmed = value.chars().take(keep).collect::<String>();
-    format!("{}...", trimmed)
-}
-
-fn git_worktree_is_dirty(worktree: &std::path::Path) -> Result<bool> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["status", "--porcelain"])
-        .output()
-        .map_err(|e| MaccError::Io {
-            path: worktree.to_string_lossy().into(),
-            action: "read git worktree status".into(),
-            source: e,
-        })?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
-}
-
-fn load_worktree_session_map(
-    project_paths: Option<&macc_core::ProjectPaths>,
-) -> Result<BTreeMap<std::path::PathBuf, WorktreeSessionStatus>> {
-    let mut map = BTreeMap::new();
-    let Some(paths) = project_paths else {
-        return Ok(map);
-    };
-
-    let sessions_path = paths.macc_dir.join("state/tool-sessions.json");
-    if !sessions_path.exists() {
-        return Ok(map);
-    }
-
-    let now = unix_timestamp_secs() as i64;
-    let content = std::fs::read_to_string(&sessions_path).map_err(|e| MaccError::Io {
-        path: sessions_path.to_string_lossy().into(),
-        action: "read tool sessions state".into(),
-        source: e,
-    })?;
-    let root: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-        MaccError::Validation(format!(
-            "Failed to parse sessions file '{}': {}",
-            sessions_path.display(),
-            e
-        ))
-    })?;
-
-    let tools = root
-        .get("tools")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    for (tool_id, tool_value) in tools {
-        let leases = tool_value
-            .get("leases")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
-        for (session_id, lease) in leases {
-            let status = lease
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            if status != "active" {
-                continue;
-            }
-            let owner = lease
-                .get("owner_worktree")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            if owner.is_empty() {
-                continue;
-            }
-            let heartbeat = lease
-                .get("heartbeat_epoch")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let stale = heartbeat <= 0 || (now - heartbeat) > 1800;
-            let owner_path = canonicalize_path_fallback(std::path::Path::new(owner));
-            map.insert(
-                owner_path,
-                WorktreeSessionStatus {
-                    tool: tool_id.clone(),
-                    session_id,
-                    stale,
-                },
-            );
-        }
-    }
-
-    Ok(map)
-}
-
-fn format_worktree_session_status(status: &WorktreeSessionStatus) -> String {
-    if status.stale {
-        format!("stale:{}:{}", status.tool, status.session_id)
-    } else {
-        format!("occupied:{}:{}", status.tool, status.session_id)
-    }
-}
-
-fn select_log_file(
-    paths: &macc_core::ProjectPaths,
-    component: &str,
-    worktree_filter: Option<&str>,
-    task_filter: Option<&str>,
-) -> Result<std::path::PathBuf> {
-    let normalized = component.to_ascii_lowercase();
-    let mut files = Vec::new();
-
-    if normalized == "all" || normalized == "coordinator" {
-        files.extend(collect_log_files(
-            &paths.macc_dir.join("log/coordinator"),
-            None,
-        )?);
-    }
-    if normalized == "all" || normalized == "performer" {
-        files.extend(collect_log_files(
-            &paths.macc_dir.join("log/performer"),
-            task_filter,
-        )?);
-        files.extend(collect_performer_worktree_logs(
-            &paths.root,
-            worktree_filter,
-            task_filter,
-        )?);
-    }
-
-    if files.is_empty() {
-        return Err(MaccError::Validation(
-            "No logs found. Run `macc coordinator run` or `macc worktree run <id>` first.".into(),
-        ));
-    }
-
-    files.sort_by(|a, b| {
-        let am = std::fs::metadata(a)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let bm = std::fs::metadata(b)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        bm.cmp(&am)
-    });
-    Ok(files[0].clone())
-}
-
-fn collect_log_files(
-    dir: &std::path::Path,
-    task_filter: Option<&str>,
-) -> Result<Vec<std::path::PathBuf>> {
-    let mut files = Vec::new();
-    if !dir.exists() {
-        return Ok(files);
-    }
-    for entry in std::fs::read_dir(dir).map_err(|e| MaccError::Io {
-        path: dir.to_string_lossy().into(),
-        action: "read log directory".into(),
-        source: e,
-    })? {
-        let path = entry
-            .map_err(|e| MaccError::Io {
-                path: dir.to_string_lossy().into(),
-                action: "iterate log directory".into(),
-                source: e,
-            })?
-            .path();
-        if !path.is_file() {
-            continue;
-        }
-        if let Some(filter) = task_filter {
-            let name = path
-                .file_name()
-                .and_then(|v| v.to_str())
-                .unwrap_or_default();
-            if !name.contains(filter) {
-                continue;
-            }
-        }
-        files.push(path);
-    }
-    Ok(files)
-}
-
-fn collect_performer_worktree_logs(
-    root: &std::path::Path,
-    worktree_filter: Option<&str>,
-    task_filter: Option<&str>,
-) -> Result<Vec<std::path::PathBuf>> {
-    let mut files = Vec::new();
-    let base = root.join(".macc/worktree");
-    if !base.exists() {
-        return Ok(files);
-    }
-    for entry in std::fs::read_dir(&base).map_err(|e| MaccError::Io {
-        path: base.to_string_lossy().into(),
-        action: "read worktree log base".into(),
-        source: e,
-    })? {
-        let wt = entry
-            .map_err(|e| MaccError::Io {
-                path: base.to_string_lossy().into(),
-                action: "iterate worktree log base".into(),
-                source: e,
-            })?
-            .path();
-        if !wt.is_dir() {
-            continue;
-        }
-        if let Some(filter) = worktree_filter {
-            let needle = filter.to_ascii_lowercase();
-            let text = wt.display().to_string().to_ascii_lowercase();
-            if !text.contains(&needle) {
-                continue;
-            }
-        }
-        let log_dir = wt.join(".macc/log/performer");
-        files.extend(collect_log_files(&log_dir, task_filter)?);
-    }
-    Ok(files)
-}
-
-fn print_file_tail(path: &std::path::Path, lines: usize) -> Result<()> {
-    let content = std::fs::read_to_string(path).map_err(|e| MaccError::Io {
-        path: path.to_string_lossy().into(),
-        action: "read log file".into(),
-        source: e,
-    })?;
-    let all = content.lines().collect::<Vec<_>>();
-    let start = all.len().saturating_sub(lines);
-    for line in &all[start..] {
-        println!("{}", line);
-    }
-    Ok(())
-}
-
-fn tail_file_follow(path: &std::path::Path, lines: usize) -> Result<()> {
-    let status = std::process::Command::new("tail")
-        .arg("-n")
-        .arg(lines.to_string())
-        .arg("-F")
-        .arg(path)
-        .status()
-        .map_err(|e| MaccError::Io {
-            path: "tail".into(),
-            action: "follow log file".into(),
-            source: e,
-        })?;
-    if !status.success() {
-        return Err(MaccError::Validation(format!(
-            "tail failed with status: {}",
-            status
-        )));
-    }
-    Ok(())
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3954,7 +1087,7 @@ fn confirm_user_scope_apply(
         println!("    ... and {} more", user_ops.len() - preview_limit);
     }
 
-    let user_backup_root = user_backup_root()?;
+    let user_backup_root = macc_core::domain::backups::user_backup_root()?;
     println!(
         "  - Backups will be written under: {}",
         user_backup_root.display()
@@ -3975,1595 +1108,24 @@ fn confirm_user_scope_apply(
     Ok(())
 }
 
-fn user_backup_root() -> Result<std::path::PathBuf> {
-    let home = macc_core::find_user_home().ok_or(MaccError::HomeDirNotFound)?;
-    Ok(home.join(".macc/backups"))
-}
-
-fn backup_root(paths: &macc_core::ProjectPaths, user: bool) -> Result<std::path::PathBuf> {
-    if user {
-        user_backup_root()
-    } else {
-        Ok(paths.backups_dir.clone())
-    }
-}
-
-fn list_backup_sets(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut sets = Vec::new();
-    for entry in std::fs::read_dir(root).map_err(|e| MaccError::Io {
-        path: root.to_string_lossy().into(),
-        action: "read backup root".into(),
-        source: e,
-    })? {
-        let entry = entry.map_err(|e| MaccError::Io {
-            path: root.to_string_lossy().into(),
-            action: "iterate backup root".into(),
-            source: e,
-        })?;
-        let path = entry.path();
-        if path.is_dir() {
-            sets.push(path);
-        }
-    }
-    sets.sort_by(|a, b| {
-        let an = a.file_name().and_then(|v| v.to_str()).unwrap_or_default();
-        let bn = b.file_name().and_then(|v| v.to_str()).unwrap_or_default();
-        bn.cmp(an)
-    });
-    Ok(sets)
-}
-
-fn resolve_backup_set_path(
-    paths: &macc_core::ProjectPaths,
-    user: bool,
-    id: Option<&str>,
-    latest: bool,
-) -> Result<std::path::PathBuf> {
-    let root = backup_root(paths, user)?;
-    let sets = list_backup_sets(&root)?;
-    if sets.is_empty() {
-        return Err(MaccError::Validation(format!(
-            "No backup sets found in {}",
-            root.display()
-        )));
-    }
-
-    if latest {
-        return Ok(sets[0].clone());
-    }
-
-    let id = id.ok_or_else(|| {
-        MaccError::Validation("backup id is required unless --latest is provided".into())
-    })?;
-    let candidate = root.join(id);
-    if !candidate.is_dir() {
-        return Err(MaccError::Validation(format!(
-            "Backup set not found: {}",
-            candidate.display()
-        )));
-    }
-    Ok(candidate)
-}
-
-fn list_backup_sets_command(paths: &macc_core::ProjectPaths, user: bool) -> Result<()> {
-    let root = backup_root(paths, user)?;
-    let sets = list_backup_sets(&root)?;
-    if sets.is_empty() {
-        println!("No backup sets in {}", root.display());
-        return Ok(());
-    }
-    println!("Backup sets in {}:", root.display());
-    for set in sets {
-        let id = set.file_name().and_then(|v| v.to_str()).unwrap_or_default();
-        let files = count_files_recursive(&set)?;
-        println!("  - {} ({} file(s))", id, files);
-    }
-    Ok(())
-}
-
-fn open_backup_set_command(
-    paths: &macc_core::ProjectPaths,
-    id: Option<&str>,
-    latest: bool,
-    user: bool,
-    editor: &Option<String>,
-) -> Result<()> {
-    let set = resolve_backup_set_path(paths, user, id, latest)?;
-    println!("Backup set: {}", set.display());
-    if let Some(cmd) = editor {
-        open_in_editor(&set, cmd)?;
-    }
-    Ok(())
-}
-
-fn restore_backup_set_command(
-    paths: &macc_core::ProjectPaths,
-    user: bool,
-    id: Option<&str>,
-    latest: bool,
-    dry_run: bool,
-    yes: bool,
-) -> Result<()> {
-    let set = resolve_backup_set_path(paths, user, id, latest)?;
-    let target_root = if user {
-        macc_core::find_user_home().ok_or(MaccError::HomeDirNotFound)?
-    } else {
-        paths.root.clone()
-    };
-
-    let files = collect_files_recursive(&set)?;
-    if files.is_empty() {
-        println!("Backup set {} is empty.", set.display());
-        return Ok(());
-    }
-
-    println!("Restore source: {}", set.display());
-    println!("Restore target: {}", target_root.display());
-    println!("Files to restore: {}", files.len());
-    if dry_run {
-        for (idx, file) in files.iter().enumerate() {
-            if idx >= 20 {
-                println!("  ... and {} more", files.len() - idx);
-                break;
-            }
-            let rel = file.strip_prefix(&set).unwrap_or(file.as_path());
-            println!("  - {}", rel.display());
-        }
-        return Ok(());
-    }
-
-    if !yes && !confirm_yes_no("Proceed with restore [y/N]? ")? {
-        return Err(MaccError::Validation("Restore cancelled.".into()));
-    }
-
-    let mut restored = 0usize;
-    for file in files {
-        let rel = file.strip_prefix(&set).map_err(|e| {
-            MaccError::Validation(format!(
-                "Failed to compute backup relative path for {}: {}",
-                file.display(),
-                e
-            ))
-        })?;
-        let destination = target_root.join(rel);
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
-                path: parent.to_string_lossy().into(),
-                action: "create restore parent directory".into(),
-                source: e,
-            })?;
-        }
-        std::fs::copy(&file, &destination).map_err(|e| MaccError::Io {
-            path: file.to_string_lossy().into(),
-            action: format!("restore to {}", destination.display()),
-            source: e,
-        })?;
-        restored += 1;
-    }
-    println!("Restored {} file(s).", restored);
-    Ok(())
-}
-
-fn count_files_recursive(root: &std::path::Path) -> Result<usize> {
-    Ok(collect_files_recursive(root)?.len())
-}
-
-fn collect_files_recursive(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
-    let mut files = Vec::new();
-    if !root.exists() {
-        return Ok(files);
-    }
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        for entry in std::fs::read_dir(&current).map_err(|e| MaccError::Io {
-            path: current.to_string_lossy().into(),
-            action: "read backup set directory".into(),
-            source: e,
-        })? {
-            let entry = entry.map_err(|e| MaccError::Io {
-                path: current.to_string_lossy().into(),
-                action: "iterate backup set directory".into(),
-                source: e,
-            })?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.is_file() {
-                files.push(path);
-            }
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DoctorLevel {
-    Info,
-    Warning,
-    Error,
-}
-
-struct DoctorIssue {
-    level: DoctorLevel,
-    check: String,
-    status: String,
-    detail: String,
-    suggestion: Option<String>,
-    fixed: bool,
-}
-
-fn run_doctor<E: Engine>(paths: &macc_core::ProjectPaths, engine: &E, fix: bool) -> Result<()> {
-    let mut issues = Vec::<DoctorIssue>::new();
-    let checks = engine.doctor(paths);
-    let search_paths = macc_core::tool::ToolSpecLoader::default_search_paths(&paths.root);
-    let loader = macc_core::tool::ToolSpecLoader::new(search_paths);
-    let (specs, diagnostics) = loader.load_all_with_embedded();
-    report_diagnostics(&diagnostics);
-
-    collect_tool_binary_issues(&checks, &specs, &mut issues);
-    collect_tool_update_issues(&specs, &mut issues);
-    collect_path_permission_issues(paths, fix, &mut issues)?;
-    collect_worktree_and_session_issues(paths, fix, &mut issues)?;
-    collect_cache_issues(paths, fix, &mut issues)?;
-    collect_gitignore_cache_issue(paths, fix, &mut issues)?;
-
-    print_doctor_issues(&issues);
-
-    let errors = issues
-        .iter()
-        .filter(|i| matches!(i.level, DoctorLevel::Error))
-        .count();
-    let warnings = issues
-        .iter()
-        .filter(|i| matches!(i.level, DoctorLevel::Warning))
-        .count();
-    let fixed = issues.iter().filter(|i| i.fixed).count();
-
-    println!(
-        "\nDoctor summary: errors={}, warnings={}, fixed={}",
-        errors, warnings, fixed
-    );
-
-    if errors > 0 {
-        return Err(MaccError::Validation(
-            "Doctor found blocking issues. See actionable suggestions above.".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn collect_tool_update_issues(specs: &[macc_core::tool::ToolSpec], issues: &mut Vec<DoctorIssue>) {
-    for spec in specs {
-        if spec.install.is_none() {
-            continue;
-        }
-        let status = get_tool_update_status(spec);
-        if !status.installed {
-            continue;
-        }
-
-        if status.is_outdated() {
-            issues.push(DoctorIssue {
-                level: DoctorLevel::Warning,
-                check: format!("update:{}", status.id),
-                status: "OUTDATED".to_string(),
-                detail: format!(
-                    "current={} latest={} source={}",
-                    status
-                        .current_version
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    status
-                        .latest_version
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    status.source.clone()
-                ),
-                suggestion: Some(format!(
-                    "Run: macc tool update {} (or macc tool update --all --only installed)",
-                    status.id
-                )),
-                fixed: false,
-            });
-        }
-    }
-}
-
-fn collect_tool_binary_issues(
-    checks: &[macc_core::doctor::ToolCheck],
-    specs: &[macc_core::tool::ToolSpec],
-    issues: &mut Vec<DoctorIssue>,
-) {
-    for check in checks {
-        let level = match (&check.status, &check.severity) {
-            (macc_core::doctor::ToolStatus::Installed, _) => DoctorLevel::Info,
-            (macc_core::doctor::ToolStatus::Missing, macc_core::tool::CheckSeverity::Error) => {
-                DoctorLevel::Error
-            }
-            (macc_core::doctor::ToolStatus::Missing, macc_core::tool::CheckSeverity::Warning) => {
-                DoctorLevel::Warning
-            }
-            (macc_core::doctor::ToolStatus::Error(_), _) => DoctorLevel::Error,
-        };
-
-        let status = match &check.status {
-            macc_core::doctor::ToolStatus::Installed => "OK".to_string(),
-            macc_core::doctor::ToolStatus::Missing => "MISSING".to_string(),
-            macc_core::doctor::ToolStatus::Error(err) => format!("ERROR ({})", err),
-        };
-
-        let suggestion = if matches!(check.status, macc_core::doctor::ToolStatus::Missing) {
-            check
-                .tool_id
-                .as_ref()
-                .map(|tool_id| format!("Run: macc tool install {}", tool_id))
-                .or_else(|| {
-                    if check.check_target == "git" {
-                        Some("Install git with your package manager (e.g. apt install git).".into())
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| find_tool_install_hint(check.tool_id.as_deref(), specs))
-        } else {
-            None
-        };
-
-        issues.push(DoctorIssue {
-            level,
-            check: format!("tool:{}", check.name),
-            status,
-            detail: format!("target={}", check.check_target),
-            suggestion,
-            fixed: false,
-        });
-    }
-}
-
-fn find_tool_install_hint(
-    tool_id: Option<&str>,
-    specs: &[macc_core::tool::ToolSpec],
-) -> Option<String> {
-    let id = tool_id?;
-    let spec = specs.iter().find(|s| s.id == id)?;
-    let install = spec.install.as_ref()?;
-    let first = install.commands.first()?;
-    Some(format!(
-        "Suggested install command: {} {}",
-        first.command,
-        first.args.join(" ")
-    ))
-}
-
-fn collect_path_permission_issues(
-    paths: &macc_core::ProjectPaths,
-    fix: bool,
-    issues: &mut Vec<DoctorIssue>,
-) -> Result<()> {
-    let expected_dirs = vec![
-        paths.macc_dir.clone(),
-        paths.cache_dir.clone(),
-        paths.macc_dir.join("state"),
-        paths.macc_dir.join("log"),
-        paths.macc_dir.join("log/coordinator"),
-        paths.macc_dir.join("log/performer"),
-        paths.automation_dir(),
-    ];
-
-    for dir in expected_dirs {
-        let mut fixed = false;
-        if !dir.exists() {
-            let mut suggestion = Some("Create missing directory.".to_string());
-            let mut level = DoctorLevel::Warning;
-            let mut status = "MISSING".to_string();
-            if fix {
-                std::fs::create_dir_all(&dir).map_err(|e| MaccError::Io {
-                    path: dir.to_string_lossy().into(),
-                    action: "create missing doctor directory".into(),
-                    source: e,
-                })?;
-                fixed = true;
-                level = DoctorLevel::Info;
-                status = "FIXED".to_string();
-                suggestion = None;
-            }
-            issues.push(DoctorIssue {
-                level,
-                check: "path".into(),
-                status,
-                detail: format!("missing directory {}", dir.display()),
-                suggestion,
-                fixed,
-            });
-            continue;
-        }
-
-        if !dir.is_dir() {
-            issues.push(DoctorIssue {
-                level: DoctorLevel::Error,
-                check: "path".into(),
-                status: "INVALID".into(),
-                detail: format!("expected directory but found file: {}", dir.display()),
-                suggestion: Some("Replace this path with a directory.".into()),
-                fixed: false,
-            });
-            continue;
-        }
-
-        match test_dir_permissions(&dir) {
-            Ok(()) => issues.push(DoctorIssue {
-                level: DoctorLevel::Info,
-                check: "path".into(),
-                status: "OK".into(),
-                detail: format!("read/write {}", dir.display()),
-                suggestion: None,
-                fixed: false,
-            }),
-            Err(reason) => issues.push(DoctorIssue {
-                level: DoctorLevel::Error,
-                check: "path".into(),
-                status: "PERMISSION".into(),
-                detail: format!("{} ({})", dir.display(), reason),
-                suggestion: Some(format!(
-                    "Fix permissions, e.g. chmod/chown so current user can read/write {}",
-                    dir.display()
-                )),
-                fixed: false,
-            }),
-        }
-    }
-
-    Ok(())
-}
-
-fn test_dir_permissions(dir: &std::path::Path) -> std::result::Result<(), String> {
-    std::fs::read_dir(dir).map_err(|e| format!("cannot read dir: {}", e))?;
-    let probe = dir.join(format!(".doctor-write-{}.tmp", std::process::id()));
-    std::fs::write(&probe, b"ok").map_err(|e| format!("cannot write dir: {}", e))?;
-    std::fs::remove_file(&probe).map_err(|e| format!("cannot cleanup probe file: {}", e))?;
-    Ok(())
-}
-
-fn collect_worktree_and_session_issues(
-    paths: &macc_core::ProjectPaths,
-    fix: bool,
-    issues: &mut Vec<DoctorIssue>,
-) -> Result<()> {
-    let entries = macc_core::list_worktrees(&paths.root)?;
-    let root_canon = paths
-        .root
-        .canonicalize()
-        .unwrap_or_else(|_| paths.root.clone());
-    let active = entries.iter().filter(|e| e.path != root_canon).count();
-    issues.push(DoctorIssue {
-        level: DoctorLevel::Info,
-        check: "worktree".into(),
-        status: "OK".into(),
-        detail: format!("worktrees total={}, active={}", entries.len(), active),
-        suggestion: None,
-        fixed: false,
-    });
-
-    let sessions_path = paths.macc_dir.join("state/tool-sessions.json");
-    if !sessions_path.exists() {
-        let mut fixed_now = false;
-        if fix {
-            write_default_sessions_file(&sessions_path)?;
-            fixed_now = true;
-        }
-        issues.push(DoctorIssue {
-            level: if fixed_now {
-                DoctorLevel::Info
-            } else {
-                DoctorLevel::Warning
-            },
-            check: "sessions".into(),
-            status: if fixed_now {
-                "FIXED".into()
-            } else {
-                "MISSING".into()
-            },
-            detail: format!("missing {}", sessions_path.display()),
-            suggestion: if fixed_now {
-                None
-            } else {
-                Some("Create .macc/state/tool-sessions.json (or run with --fix).".into())
-            },
-            fixed: fixed_now,
-        });
-        return Ok(());
-    }
-
-    let content = std::fs::read_to_string(&sessions_path).map_err(|e| MaccError::Io {
-        path: sessions_path.to_string_lossy().into(),
-        action: "read tool sessions".into(),
-        source: e,
-    })?;
-    match serde_json::from_str::<serde_json::Value>(&content) {
-        Ok(value) => {
-            let tools = value
-                .get("tools")
-                .and_then(|v| v.as_object())
-                .map(|v| v.len())
-                .unwrap_or(0);
-            let active_leases = value
-                .get("tools")
-                .and_then(|t| t.as_object())
-                .map(|all| {
-                    all.values()
-                        .filter_map(|tool| tool.get("leases").and_then(|v| v.as_object()))
-                        .flat_map(|leases| leases.values())
-                        .filter(|lease| {
-                            lease.get("status").and_then(|s| s.as_str()) == Some("active")
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-            issues.push(DoctorIssue {
-                level: DoctorLevel::Info,
-                check: "sessions".into(),
-                status: "OK".into(),
-                detail: format!(
-                    "session state valid (tools={}, active_leases={})",
-                    tools, active_leases
-                ),
-                suggestion: None,
-                fixed: false,
-            });
-        }
-        Err(err) => {
-            let mut fixed_now = false;
-            let mut detail = format!("invalid JSON in {} ({})", sessions_path.display(), err);
-            if fix {
-                let backup =
-                    sessions_path.with_extension(format!("corrupt-{}.json", unix_timestamp_secs()));
-                std::fs::rename(&sessions_path, &backup).map_err(|e| MaccError::Io {
-                    path: sessions_path.to_string_lossy().into(),
-                    action: format!("backup corrupt sessions to {}", backup.display()),
-                    source: e,
-                })?;
-                write_default_sessions_file(&sessions_path)?;
-                fixed_now = true;
-                detail = format!(
-                    "replaced corrupt sessions file; backup kept at {}",
-                    backup.display()
-                );
-            }
-            issues.push(DoctorIssue {
-                level: if fixed_now {
-                    DoctorLevel::Warning
-                } else {
-                    DoctorLevel::Error
-                },
-                check: "sessions".into(),
-                status: if fixed_now {
-                    "FIXED".into()
-                } else {
-                    "CORRUPT".into()
-                },
-                detail,
-                suggestion: if fixed_now {
-                    None
-                } else {
-                    Some("Run `macc doctor --fix` to backup and recreate sessions state.".into())
-                },
-                fixed: fixed_now,
-            });
-        }
-    }
-    Ok(())
-}
-
-fn write_default_sessions_file(path: &std::path::Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| MaccError::Io {
-            path: parent.to_string_lossy().into(),
-            action: "create sessions state parent directory".into(),
-            source: e,
-        })?;
-    }
-    let data = serde_json::json!({
-        "tools": {}
-    });
-    let mut content = serde_json::to_string_pretty(&data)
-        .map_err(|e| MaccError::Validation(format!("serialize default sessions JSON: {}", e)))?;
-    content.push('\n');
-    std::fs::write(path, content).map_err(|e| MaccError::Io {
-        path: path.to_string_lossy().into(),
-        action: "write default sessions state".into(),
-        source: e,
-    })?;
-    Ok(())
-}
-
-fn collect_cache_issues(
-    paths: &macc_core::ProjectPaths,
-    fix: bool,
-    issues: &mut Vec<DoctorIssue>,
-) -> Result<()> {
-    let cache_dir = &paths.cache_dir;
-    if !cache_dir.exists() {
-        let mut fixed_now = false;
-        if fix {
-            std::fs::create_dir_all(cache_dir).map_err(|e| MaccError::Io {
-                path: cache_dir.to_string_lossy().into(),
-                action: "create cache directory".into(),
-                source: e,
-            })?;
-            fixed_now = true;
-        }
-        issues.push(DoctorIssue {
-            level: if fixed_now {
-                DoctorLevel::Info
-            } else {
-                DoctorLevel::Warning
-            },
-            check: "cache".into(),
-            status: if fixed_now { "FIXED" } else { "MISSING" }.into(),
-            detail: format!("cache directory {}", cache_dir.display()),
-            suggestion: if fixed_now {
-                None
-            } else {
-                Some("Create .macc/cache (or run with --fix).".into())
-            },
-            fixed: fixed_now,
-        });
-        return Ok(());
-    }
-
-    let mut entries = 0usize;
-    let mut broken = 0usize;
-    for entry in std::fs::read_dir(cache_dir).map_err(|e| MaccError::Io {
-        path: cache_dir.to_string_lossy().into(),
-        action: "read cache directory".into(),
-        source: e,
-    })? {
-        let entry = match entry {
-            Ok(v) => v,
-            Err(_) => {
-                broken += 1;
-                continue;
-            }
-        };
-        entries += 1;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
-            broken += 1;
-            if fix {
-                let _ = std::fs::remove_file(&path);
-            }
-            continue;
-        }
-        if let Ok(meta) = std::fs::symlink_metadata(&path) {
-            if meta.file_type().is_symlink() && std::fs::metadata(&path).is_err() {
-                broken += 1;
-                if fix {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-    }
-    issues.push(DoctorIssue {
-        level: if broken == 0 {
-            DoctorLevel::Info
-        } else {
-            DoctorLevel::Warning
-        },
-        check: "cache".into(),
-        status: if broken == 0 {
-            "OK".into()
-        } else if fix {
-            "FIXED/PARTIAL".into()
-        } else {
-            "WARN".into()
-        },
-        detail: format!(
-            "cache entries={}, suspicious_or_corrupt={}",
-            entries, broken
-        ),
-        suggestion: if broken == 0 {
-            None
-        } else {
-            Some("Run `macc doctor --fix` or remove corrupted cache entries manually.".into())
-        },
-        fixed: fix && broken > 0,
-    });
-    Ok(())
-}
-
-fn collect_gitignore_cache_issue(
-    paths: &macc_core::ProjectPaths,
-    fix: bool,
-    issues: &mut Vec<DoctorIssue>,
-) -> Result<()> {
-    let gitignore = paths.root.join(".gitignore");
-    let required = ".macc/cache/";
-    let mut content = String::new();
-    if gitignore.exists() {
-        content = std::fs::read_to_string(&gitignore).map_err(|e| MaccError::Io {
-            path: gitignore.to_string_lossy().into(),
-            action: "read .gitignore".into(),
-            source: e,
-        })?;
-    }
-    let present = content.lines().any(|line| line.trim() == required);
-    if present {
-        issues.push(DoctorIssue {
-            level: DoctorLevel::Info,
-            check: "gitignore".into(),
-            status: "OK".into(),
-            detail: format!("contains '{}'", required),
-            suggestion: None,
-            fixed: false,
-        });
-        return Ok(());
-    }
-
-    let mut fixed_now = false;
-    if fix {
-        if !content.ends_with('\n') && !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str(required);
-        content.push('\n');
-        std::fs::write(&gitignore, content).map_err(|e| MaccError::Io {
-            path: gitignore.to_string_lossy().into(),
-            action: "update .gitignore with cache entry".into(),
-            source: e,
-        })?;
-        fixed_now = true;
-    }
-
-    issues.push(DoctorIssue {
-        level: if fixed_now {
-            DoctorLevel::Info
-        } else {
-            DoctorLevel::Warning
-        },
-        check: "gitignore".into(),
-        status: if fixed_now { "FIXED" } else { "MISSING" }.into(),
-        detail: format!("missing '{}' in {}", required, gitignore.display()),
-        suggestion: if fixed_now {
-            None
-        } else {
-            Some("Add '.macc/cache/' to .gitignore (or run with --fix).".into())
-        },
-        fixed: fixed_now,
-    });
-    Ok(())
-}
-
-fn print_doctor_issues(issues: &[DoctorIssue]) {
-    println!(
-        "{:<10} {:<18} {:<14} {:<60}",
-        "LEVEL", "CHECK", "STATUS", "DETAIL"
-    );
-    println!("{:-<10} {:-<18} {:-<14} {:-<60}", "", "", "", "");
-
-    for issue in issues {
-        let level = match issue.level {
-            DoctorLevel::Info => "INFO",
-            DoctorLevel::Warning => "WARN",
-            DoctorLevel::Error => "ERROR",
-        };
-        println!(
-            "{:<10} {:<18} {:<14} {:<60}",
-            level, issue.check, issue.status, issue.detail
-        );
-        if let Some(s) = &issue.suggestion {
-            println!("{:<10} {:<18} {:<14} -> {}", "", "suggestion", "", s);
-        }
-    }
-}
-
-fn apply_worktree<E: Engine>(
-    engine: &E,
-    worktree_root: &std::path::Path,
-    allow_user_scope: bool,
-) -> Result<()> {
-    let paths = macc_core::ProjectPaths::from_root(worktree_root);
-    let canonical = load_canonical_config(&paths.config_path)?;
-    let metadata = macc_core::read_worktree_metadata(worktree_root)?
-        .ok_or_else(|| MaccError::Validation("Missing .macc/worktree.json".into()))?;
-
-    let (descriptors, diagnostics) = engine.list_tools(&paths);
-    report_diagnostics(&diagnostics);
-    let allowed_tools: Vec<String> = descriptors.iter().map(|d| d.id.clone()).collect();
-    let overrides = CliOverrides::from_tools_csv(metadata.tool.as_str(), &allowed_tools)?;
-
-    let resolved = resolve(&canonical, &overrides);
-    let fetch_units = resolve_fetch_units(&paths, &resolved)?;
-    let materialized_units =
-        macc_adapter_shared::fetch::materialize_fetch_units(&paths, fetch_units)?;
-
-    let mut plan = engine.plan(&paths, &canonical, &materialized_units, &overrides)?;
-    let _ = engine.apply(&paths, &mut plan, allow_user_scope)?;
-    Ok(())
-}
-
-fn open_in_editor(path: &std::path::Path, command: &str) -> Result<()> {
-    let mut parts = command.split_whitespace();
-    let Some(bin) = parts.next() else {
-        return Ok(());
-    };
-    let mut cmd = std::process::Command::new(bin);
-    for arg in parts {
-        cmd.arg(arg);
-    }
-    let status = cmd.arg(path).status().map_err(|e| MaccError::Io {
-        path: path.to_string_lossy().into(),
-        action: "launch editor".into(),
-        source: e,
-    })?;
-    if !status.success() {
-        return Err(MaccError::Validation(format!(
-            "Editor command failed with status: {}",
-            status
-        )));
-    }
-    Ok(())
-}
-
-fn open_in_terminal(path: &std::path::Path) -> Result<()> {
-    if let Ok(term) = std::env::var("TERMINAL") {
-        launch_terminal(&term, path)?;
-        return Ok(());
-    }
-
-    let candidates = [
-        ("x-terminal-emulator", &["-e", "bash", "-lc"]),
-        ("gnome-terminal", &["--", "bash", "-lc"]),
-        ("konsole", &["-e", "bash", "-lc"]),
-        ("xterm", &["-e", "bash", "-lc"]),
-    ];
-    for (bin, prefix) in candidates {
-        if launch_terminal_with_prefix(bin, prefix, path).is_ok() {
-            return Ok(());
-        }
-    }
-
-    Err(MaccError::Validation(
-        "No terminal launcher found (set $TERMINAL)".into(),
-    ))
-}
-
-fn launch_terminal(command: &str, path: &std::path::Path) -> Result<()> {
-    let mut parts = command.split_whitespace();
-    let Some(bin) = parts.next() else {
-        return Ok(());
-    };
-    let mut cmd = std::process::Command::new(bin);
-    for arg in parts {
-        cmd.arg(arg);
-    }
-    cmd.arg("--");
-    cmd.arg("bash");
-    cmd.arg("-lc");
-    cmd.arg(format!("cd {}; exec $SHELL", path.display()));
-    cmd.spawn().map_err(|e| MaccError::Io {
-        path: path.to_string_lossy().into(),
-        action: "launch terminal".into(),
-        source: e,
-    })?;
-    Ok(())
-}
-
-fn launch_terminal_with_prefix(bin: &str, prefix: &[&str], path: &std::path::Path) -> Result<()> {
-    let mut cmd = std::process::Command::new(bin);
-    for arg in prefix {
-        cmd.arg(arg);
-    }
-    cmd.arg(format!("cd {}; exec $SHELL", path.display()));
-    cmd.spawn().map_err(|e| MaccError::Io {
-        path: path.to_string_lossy().into(),
-        action: "launch terminal".into(),
-        source: e,
-    })?;
-    Ok(())
-}
-
 // ... existing catalog functions (run_remote_search, list_skills, etc) ...
-
-fn run_remote_search(
-    paths: &macc_core::ProjectPaths,
-    api: String,
-    kind: String,
-    q: String,
-    add: bool,
-    add_ids: Option<String>,
-) -> Result<()> {
-    let search_kind = match kind.as_str() {
-        "skill" => RemoteSearchKind::Skill,
-        "mcp" => RemoteSearchKind::Mcp,
-        _ => {
-            return Err(MaccError::Validation(format!(
-                "Invalid kind: {}. Must be 'skill' or 'mcp'.",
-                kind
-            )))
-        }
-    };
-
-    println!("Searching {} for '{}' in {}...", kind, q, api);
-
-    let whitelist: Option<Vec<String>> = add_ids
-        .as_ref()
-        .map(|s| s.split(',').map(|i| i.trim().to_string()).collect());
-    let should_save = add || whitelist.is_some();
-
-    match search_kind {
-        RemoteSearchKind::Skill => {
-            let results: Vec<SkillEntry> = remote_search(&api, search_kind, &q)?;
-            if results.is_empty() {
-                println!("No skills found.");
-                return Ok(());
-            }
-
-            println!("{:<20} {:<30} {:<10} {:<20}", "ID", "NAME", "KIND", "TAGS");
-            println!("{:-<20} {:-<30} {:-<10} {:-<20}", "", "", "", "");
-
-            let mut catalog = if should_save {
-                Some(SkillsCatalog::load(&paths.skills_catalog_path())?)
-            } else {
-                None
-            };
-
-            for entry in &results {
-                let tags = entry.tags.join(", ");
-                let kind_str = match entry.source.kind {
-                    SourceKind::Git => "git",
-                    SourceKind::Http => "http",
-                    SourceKind::Local => "local",
-                };
-                println!(
-                    "{:<20} {:<30} {:<10} {:<20}",
-                    entry.id, entry.name, kind_str, tags
-                );
-
-                if let Some(cat) = &mut catalog {
-                    let should_add = if add {
-                        true
-                    } else if let Some(wl) = &whitelist {
-                        wl.contains(&entry.id)
-                    } else {
-                        false
-                    };
-
-                    if should_add {
-                        cat.upsert_skill_entry(entry.clone());
-                        println!("  [+] Queued import for '{}'", entry.id);
-                    }
-                }
-            }
-
-            if let Some(cat) = catalog {
-                cat.save_atomically(paths, &paths.skills_catalog_path())?;
-                println!("Saved changes to skills catalog.");
-            }
-        }
-        RemoteSearchKind::Mcp => {
-            let results: Vec<McpEntry> = remote_search(&api, search_kind, &q)?;
-            if results.is_empty() {
-                println!("No MCP servers found.");
-                return Ok(());
-            }
-
-            println!("{:<20} {:<30} {:<10} {:<20}", "ID", "NAME", "KIND", "TAGS");
-            println!("{:-<20} {:-<30} {:-<10} {:-<20}", "", "", "", "");
-
-            let mut catalog = if should_save {
-                Some(McpCatalog::load(&paths.mcp_catalog_path())?)
-            } else {
-                None
-            };
-
-            for entry in &results {
-                let tags = entry.tags.join(", ");
-                let kind_str = match entry.source.kind {
-                    SourceKind::Git => "git",
-                    SourceKind::Http => "http",
-                    SourceKind::Local => "local",
-                };
-                println!(
-                    "{:<20} {:<30} {:<10} {:<20}",
-                    entry.id, entry.name, kind_str, tags
-                );
-
-                if let Some(cat) = &mut catalog {
-                    let should_add = if add {
-                        true
-                    } else if let Some(wl) = &whitelist {
-                        wl.contains(&entry.id)
-                    } else {
-                        false
-                    };
-
-                    if should_add {
-                        cat.upsert_mcp_entry(entry.clone());
-                        println!("  [+] Queued import for '{}'", entry.id);
-                    }
-                }
-            }
-
-            if let Some(cat) = catalog {
-                cat.save_atomically(paths, &paths.mcp_catalog_path())?;
-                println!("Saved changes to MCP catalog.");
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn report_diagnostics(diagnostics: &[macc_core::tool::ToolDiagnostic]) {
-    for diag in diagnostics {
-        let location = match (diag.line, diag.column) {
-            (Some(l), Some(c)) => format!(" at {}:{}", l, c),
-            (Some(l), None) => format!(" at line {}", l),
-            _ => "".to_string(),
-        };
-        eprintln!(
-            "Error loading tool spec {}{}: {}",
-            diag.path.display(),
-            location,
-            diag.error
-        );
-    }
-}
-
-fn list_skills(catalog: &SkillsCatalog) {
-    if catalog.entries.is_empty() {
-        println!("No skills found in catalog.");
-        return;
-    }
-
-    println!("{:<20} {:<30} {:<10} {:<20}", "ID", "NAME", "KIND", "TAGS");
-    println!("{:-<20} {:-<30} {:-<10} {:-<20}", "", "", "", "");
-    for entry in &catalog.entries {
-        let tags = entry.tags.join(", ");
-        let kind = match entry.source.kind {
-            SourceKind::Git => "git",
-            SourceKind::Http => "http",
-            SourceKind::Local => "local",
-        };
-        println!(
-            "{:<20} {:<30} {:<10} {:<20}",
-            entry.id, entry.name, kind, tags
-        );
-    }
-}
-
-fn search_skills(catalog: &SkillsCatalog, query: &str) {
-    let query = query.to_lowercase();
-    let filtered: Vec<_> = catalog
-        .entries
-        .iter()
-        .filter(|e| {
-            e.id.to_lowercase().contains(&query)
-                || e.name.to_lowercase().contains(&query)
-                || e.description.to_lowercase().contains(&query)
-                || e.tags.iter().any(|t| t.to_lowercase().contains(&query))
-        })
-        .collect();
-
-    if filtered.is_empty() {
-        println!("No skills matching '{}' found.", query);
-        return;
-    }
-
-    println!("{:<20} {:<30} {:<10} {:<20}", "ID", "NAME", "KIND", "TAGS");
-    println!("{:-<20} {:-<30} {:-<10} {:-<20}", "", "", "", "");
-    for entry in filtered {
-        let tags = entry.tags.join(", ");
-        let kind = match entry.source.kind {
-            SourceKind::Git => "git",
-            SourceKind::Http => "http",
-            SourceKind::Local => "local",
-        };
-        println!(
-            "{:<20} {:<30} {:<10} {:<20}",
-            entry.id, entry.name, kind, tags
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn add_skill(
-    paths: &macc_core::ProjectPaths,
-    catalog: &mut SkillsCatalog,
-    id: String,
-    name: String,
-    description: String,
-    tags: Option<String>,
-    subpath: String,
-    kind: String,
-    url: String,
-    reference: String,
-    checksum: Option<String>,
-) -> Result<()> {
-    let tags = tags
-        .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
-        .unwrap_or_default();
-    let source_kind = match kind.to_lowercase().as_str() {
-        "git" => SourceKind::Git,
-        "http" => SourceKind::Http,
-        "local" => SourceKind::Local,
-        _ => {
-            return Err(MaccError::Validation(format!(
-                "Invalid source kind: {}. Must be 'git', 'http', or 'local'.",
-                kind
-            )))
-        }
-    };
-
-    let entry = SkillEntry {
-        id: id.clone(),
-        name,
-        description,
-        tags,
-        selector: Selector { subpath },
-        source: Source {
-            kind: source_kind,
-            url,
-            reference,
-            checksum,
-            subpaths: vec![],
-        },
-    };
-
-    catalog.upsert_skill_entry(entry);
-    catalog.save_atomically(paths, &paths.skills_catalog_path())?;
-    println!("Skill '{}' upserted successfully.", id);
-    Ok(())
-}
-
-fn remove_skill(
-    paths: &macc_core::ProjectPaths,
-    catalog: &mut SkillsCatalog,
-    id: String,
-) -> Result<()> {
-    if catalog.delete_skill_entry(&id) {
-        catalog.save_atomically(paths, &paths.skills_catalog_path())?;
-        println!("Skill '{}' removed successfully.", id);
-    } else {
-        println!("Skill '{}' not found in catalog.", id);
-    }
-    Ok(())
-}
-
-fn list_mcp(catalog: &McpCatalog) {
-    if catalog.entries.is_empty() {
-        println!("No MCP servers found in catalog.");
-        return;
-    }
-
-    println!("{:<20} {:<30} {:<10} {:<20}", "ID", "NAME", "KIND", "TAGS");
-    println!("{:-<20} {:-<30} {:-<10} {:-<20}", "", "", "", "");
-    for entry in &catalog.entries {
-        let tags = entry.tags.join(", ");
-        let kind = match entry.source.kind {
-            SourceKind::Git => "git",
-            SourceKind::Http => "http",
-            SourceKind::Local => "local",
-        };
-        println!(
-            "{:<20} {:<30} {:<10} {:<20}",
-            entry.id, entry.name, kind, tags
-        );
-    }
-}
-
-fn search_mcp(catalog: &McpCatalog, query: &str) {
-    let query = query.to_lowercase();
-    let filtered: Vec<_> = catalog
-        .entries
-        .iter()
-        .filter(|e| {
-            e.id.to_lowercase().contains(&query)
-                || e.name.to_lowercase().contains(&query)
-                || e.description.to_lowercase().contains(&query)
-                || e.tags.iter().any(|t| t.to_lowercase().contains(&query))
-        })
-        .collect();
-
-    if filtered.is_empty() {
-        println!("No MCP servers matching '{}' found.", query);
-        return;
-    }
-
-    println!("{:<20} {:<30} {:<10} {:<20}", "ID", "NAME", "KIND", "TAGS");
-    println!("{:-<20} {:-<30} {:-<10} {:-<20}", "", "", "", "");
-    for entry in filtered {
-        let tags = entry.tags.join(", ");
-        let kind = match entry.source.kind {
-            SourceKind::Git => "git",
-            SourceKind::Http => "http",
-            SourceKind::Local => "local",
-        };
-        println!(
-            "{:<20} {:<30} {:<10} {:<20}",
-            entry.id, entry.name, kind, tags
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn add_mcp(
-    paths: &macc_core::ProjectPaths,
-    catalog: &mut McpCatalog,
-    id: String,
-    name: String,
-    description: String,
-    tags: Option<String>,
-    subpath: String,
-    kind: String,
-    url: String,
-    reference: String,
-    checksum: Option<String>,
-) -> Result<()> {
-    let tags = tags
-        .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
-        .unwrap_or_default();
-    let source_kind = match kind.to_lowercase().as_str() {
-        "git" => SourceKind::Git,
-        "http" => SourceKind::Http,
-        "local" => SourceKind::Local,
-        _ => {
-            return Err(MaccError::Validation(format!(
-                "Invalid source kind: {}. Must be 'git', 'http', or 'local'.",
-                kind
-            )))
-        }
-    };
-
-    let entry = McpEntry {
-        id: id.clone(),
-        name,
-        description,
-        tags,
-        selector: Selector { subpath },
-        source: Source {
-            kind: source_kind,
-            url,
-            reference,
-            checksum,
-            subpaths: vec![],
-        },
-    };
-
-    catalog.upsert_mcp_entry(entry);
-    catalog.save_atomically(paths, &paths.mcp_catalog_path())?;
-    println!("MCP server '{}' upserted successfully.", id);
-    Ok(())
-}
-
-fn remove_mcp(paths: &macc_core::ProjectPaths, catalog: &mut McpCatalog, id: String) -> Result<()> {
-    if catalog.delete_mcp_entry(&id) {
-        catalog.save_atomically(paths, &paths.mcp_catalog_path())?;
-        println!("MCP server '{}' removed successfully.", id);
-    } else {
-        println!("MCP server '{}' not found in catalog.", id);
-    }
-    Ok(())
-}
-
-fn install_skill<E: Engine>(
-    paths: &macc_core::ProjectPaths,
-    tool: &str,
-    id: &str,
-    engine: &E,
-) -> Result<()> {
-    // 1. Find entry
-    let catalog = load_effective_skills_catalog(paths)?;
-    let entry =
-        catalog.entries.iter().find(|e| e.id == id).ok_or_else(|| {
-            MaccError::Validation(format!("Skill '{}' not found in catalog.", id))
-        })?;
-
-    let (descriptors, diagnostics) = engine.list_tools(paths);
-    report_diagnostics(&diagnostics);
-    let tool_title = descriptors
-        .iter()
-        .find(|d| d.id == tool)
-        .map(|d| d.title.as_str())
-        .unwrap_or(tool);
-
-    println!("Installing skill '{}' for {}...", id, tool_title);
-
-    // 2. Materialize
-    let mut source = entry.source.clone();
-    if !entry.selector.subpath.is_empty() && entry.selector.subpath != "." {
-        source.subpaths = vec![entry.selector.subpath.clone()];
-    }
-
-    let fetch_unit = FetchUnit {
-        source,
-        selections: vec![Selection {
-            id: entry.id.clone(),
-            subpath: entry.selector.subpath.clone(),
-            kind: SelectionKind::Skill,
-        }],
-    };
-    let materialized = macc_adapter_shared::fetch::materialize_fetch_unit(paths, fetch_unit)?;
-
-    // 3. Plan
-    let mut plan = ActionPlan::new();
-    plan_skill_install(
-        &mut plan,
-        tool,
-        id,
-        &materialized.source_root_path,
-        &entry.selector.subpath,
-    )
-    .map_err(MaccError::Validation)?;
-
-    // 4. Apply
-    let report = engine.apply(paths, &mut plan, false)?;
-    println!("{}", report.render_cli());
-
-    Ok(())
-}
-
-fn install_mcp<E: Engine>(paths: &macc_core::ProjectPaths, id: &str, engine: &E) -> Result<()> {
-    // 1. Load catalog and find MCP
-    let catalog = load_effective_mcp_catalog(paths)?;
-    let entry = catalog.entries.iter().find(|e| e.id == id).ok_or_else(|| {
-        MaccError::Validation(format!("MCP server '{}' not found in catalog.", id))
-    })?;
-
-    println!("Installing MCP server '{}'...", id);
-
-    // 2. Materialize
-    let mut source = entry.source.clone();
-    if !entry.selector.subpath.is_empty() && entry.selector.subpath != "." {
-        source.subpaths = vec![entry.selector.subpath.clone()];
-    }
-
-    let fetch_unit = FetchUnit {
-        source,
-        selections: vec![Selection {
-            id: entry.id.clone(),
-            subpath: entry.selector.subpath.clone(),
-            kind: SelectionKind::Mcp,
-        }],
-    };
-    let materialized = macc_adapter_shared::fetch::materialize_fetch_unit(paths, fetch_unit)?;
-
-    // 3. Plan
-    let mut plan = ActionPlan::new();
-    plan_mcp_install(
-        &mut plan,
-        id,
-        &materialized.source_root_path,
-        &entry.selector.subpath,
-    )
-    .map_err(MaccError::Validation)?;
-
-    // 4. Apply
-    let report = engine.apply(paths, &mut plan, false)?;
-    println!("{}", report.render_cli());
-
-    Ok(())
-}
-
-fn import_url(
-    paths: &macc_core::ProjectPaths,
-    kind: &str,
-    id: String,
-    url: String,
-    name: Option<String>,
-    description: String,
-    tags: Option<String>,
-) -> Result<()> {
-    // 1. Normalize URL (GitHub tree/repo preferred, HTTP fallback).
-    let (source_kind, clone_or_url, reference, subpath) =
-        if let Some(normalized) = macc_adapter_shared::url_parsing::normalize_git_input(&url) {
-            (
-                SourceKind::Git,
-                normalized.clone_url,
-                normalized.reference,
-                normalized.subpath,
-            )
-        } else if macc_adapter_shared::url_parsing::validate_http_url(&url) {
-            (
-                SourceKind::Http,
-                url.trim().to_string(),
-                String::new(),
-                String::new(),
-            )
-        } else {
-            return Err(MaccError::Validation(format!(
-                "Invalid or unsupported URL: {}",
-                url
-            )));
-        };
-
-    // 2. Prepare common fields
-    let name = name.unwrap_or_else(|| id.clone());
-    let tags_vec = tags
-        .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
-        .unwrap_or_default();
-
-    let selector = Selector {
-        subpath: subpath.clone(),
-    };
-    let source = Source {
-        kind: source_kind.clone(),
-        url: clone_or_url.clone(),
-        reference: reference.clone(),
-        checksum: None,
-        subpaths: vec![],
-    };
-
-    print_import_understanding(kind, &id, &source, &selector);
-    print_trust_hints(&source);
-    validate_import_source_now(paths, kind, &id, &source, &selector);
-
-    // 3. Upsert
-    match kind {
-        "skill" => {
-            let mut catalog = SkillsCatalog::load(&paths.skills_catalog_path())?;
-            let entry = SkillEntry {
-                id: id.clone(),
-                name,
-                description,
-                tags: tags_vec,
-                selector,
-                source,
-            };
-            catalog.upsert_skill_entry(entry);
-            catalog.save_atomically(paths, &paths.skills_catalog_path())?;
-            println!("Skill '{}' imported successfully.", id);
-        }
-        "mcp" => {
-            let mut catalog = McpCatalog::load(&paths.mcp_catalog_path())?;
-            let entry = McpEntry {
-                id: id.clone(),
-                name,
-                description,
-                tags: tags_vec,
-                selector,
-                source,
-            };
-            catalog.upsert_mcp_entry(entry);
-            catalog.save_atomically(paths, &paths.mcp_catalog_path())?;
-            println!("MCP server '{}' imported successfully.", id);
-        }
-        _ => unreachable!("clap should prevent this"),
-    }
-    Ok(())
-}
-
-fn print_import_understanding(kind: &str, id: &str, source: &Source, selector: &Selector) {
-    println!("Import URL: here's what I understood:");
-    println!("  - catalog kind: {}", kind);
-    println!("  - entry id: {}", id);
-    println!(
-        "  - source kind: {}",
-        match source.kind {
-            SourceKind::Git => "git",
-            SourceKind::Http => "http",
-            SourceKind::Local => "local",
-        }
-    );
-    println!("  - source url: {}", source.url);
-    println!(
-        "  - source ref: {}",
-        if source.reference.is_empty() {
-            "(default branch/head)"
-        } else {
-            source.reference.as_str()
-        }
-    );
-    println!(
-        "  - subpath: {}",
-        if selector.subpath.is_empty() {
-            "(root)"
-        } else {
-            selector.subpath.as_str()
-        }
-    );
-}
-
-fn print_trust_hints(source: &Source) {
-    let pinned_ref_hint = if source.kind == SourceKind::Git {
-        if is_commit_sha(&source.reference) {
-            "ref appears pinned to commit SHA (strong reproducibility)"
-        } else if source.reference.is_empty()
-            || source.reference.eq_ignore_ascii_case("main")
-            || source.reference.eq_ignore_ascii_case("master")
-        {
-            "ref is moving/default branch (lower reproducibility)"
-        } else {
-            "ref looks like tag/branch; pin to commit SHA for stronger reproducibility"
-        }
-    } else {
-        "non-git source; reproducibility depends on URL immutability + checksum"
-    };
-
-    let checksum_hint = if let Some(checksum) = &source.checksum {
-        if macc_adapter_shared::url_parsing::validate_checksum(checksum) {
-            "checksum format looks valid"
-        } else {
-            "checksum format looks invalid (expected sha256:<64-hex>)"
-        }
-    } else if source.kind == SourceKind::Http {
-        "checksum missing for HTTP source (recommended to add)"
-    } else {
-        "checksum not set"
-    };
-
-    println!("Trust hints (informational, not a security guarantee):");
-    println!("  - {}", pinned_ref_hint);
-    println!("  - {}", checksum_hint);
-}
-
-fn validate_import_source_now(
-    paths: &macc_core::ProjectPaths,
-    kind: &str,
-    id: &str,
-    source: &Source,
-    selector: &Selector,
-) {
-    use macc_core::resolve::{FetchUnit, Selection, SelectionKind};
-    let selection_kind = if kind == "skill" {
-        SelectionKind::Skill
-    } else {
-        SelectionKind::Mcp
-    };
-    let mut source_for_fetch = source.clone();
-    if !selector.subpath.is_empty() && selector.subpath != "." {
-        source_for_fetch.subpaths = vec![selector.subpath.clone()];
-    }
-
-    let unit = FetchUnit {
-        source: source_for_fetch,
-        selections: vec![Selection {
-            id: id.to_string(),
-            subpath: selector.subpath.clone(),
-            kind: selection_kind,
-        }],
-    };
-
-    match macc_adapter_shared::fetch::materialize_fetch_unit(paths, unit) {
-        Ok(materialized) => {
-            let effective = if selector.subpath.is_empty() || selector.subpath == "." {
-                materialized.source_root_path
-            } else {
-                materialized.source_root_path.join(&selector.subpath)
-            };
-            println!("Validation: OK");
-            println!("  - materialized source root: {}", effective.display());
-            if effective.join("macc.package.json").exists() {
-                println!("  - manifest: macc.package.json found");
-            } else {
-                println!("  - warning: macc.package.json not found");
-            }
-        }
-        Err(err) => {
-            println!("Validation: WARNING");
-            println!("  - could not fully validate source now: {}", err);
-            println!("  - import will continue, but installation may fail later if subpath/manifest is invalid.");
-        }
-    }
-}
-
-fn is_commit_sha(reference: &str) -> bool {
-    if reference.len() != 40 {
-        return false;
-    }
-    reference.chars().all(|c| c.is_ascii_hexdigit())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use macc_core::MaccError;
+    use crate::coordinator::legacy_helpers::{
+        read_registry_counts, run_coordinator_action, run_coordinator_full_cycle,
+        validate_coordinator_runtime_transition_action, validate_coordinator_transition_action,
+        COORDINATOR_TASK_REGISTRY_REL_PATH,
+    };
+    use crate::test_support::run_git_ok;
+    use macc_core::service::tooling::{extract_version_token, run_version_command};
     use macc_core::TestEngine;
+    use macc_core::{MaccError, McpCatalog, SkillsCatalog};
     use std::fs;
     use std::io;
     use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
 
     fn bind_loopback() -> Option<(TcpListener, u16)> {
         match TcpListener::bind("127.0.0.1:0") {
@@ -5572,7 +1134,7 @@ mod tests {
                 Some((listener, port))
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("Skipping test: cannot bind loopback socket ({})", e);
+                tracing::warn!("Skipping test: cannot bind loopback socket ({})", e);
                 None
             }
             Err(e) => panic!("Failed to bind loopback socket: {}", e),
@@ -5595,6 +1157,20 @@ mod tests {
             let mut perms = std::fs::metadata(path).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn collect_rs_files(root: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                out.push(path);
+            }
         }
     }
 
@@ -5634,6 +1210,177 @@ mod tests {
             }),
             6
         );
+    }
+
+    #[test]
+    fn test_no_direct_git_process_invocations_in_cli_tui() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cli_src = manifest_dir.join("src");
+        let tui_src = manifest_dir.join("../tui/src");
+        let patterns = [
+            "Command::new(\"git\")",
+            "std::process::Command::new(\"git\")",
+        ];
+
+        let mut files = Vec::new();
+        collect_rs_files(&cli_src, &mut files);
+        collect_rs_files(&tui_src, &mut files);
+
+        let mut violations = Vec::new();
+        for file in files {
+            let Ok(content) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            if patterns.iter().any(|p| content.contains(p)) {
+                violations.push(file.display().to_string());
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "Direct git process invocation detected; use macc_core::git facade instead: {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn test_tui_has_no_direct_process_management() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let tui_src = manifest_dir.join("../tui/src");
+        let patterns = [
+            "std::process::Child",
+            "std::process::Command",
+            "tokio::process::Child",
+            "tokio::process::Command",
+        ];
+
+        let mut files = Vec::new();
+        collect_rs_files(&tui_src, &mut files);
+
+        let mut violations = Vec::new();
+        for file in files {
+            let Ok(content) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            if patterns.iter().any(|p| content.contains(p)) {
+                violations.push(file.display().to_string());
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "Direct process management in TUI detected; route via Engine coordinator/task-runner APIs instead: {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn test_parse_coordinator_validate_transition_args() {
+        let args = vec![
+            "--from".to_string(),
+            "todo".to_string(),
+            "--to".to_string(),
+            "claimed".to_string(),
+        ];
+        let parsed = WorkflowTransitionArgs::try_from(args.as_slice()).unwrap();
+        let from = parsed.from;
+        let to = parsed.to;
+        assert_eq!(from, WorkflowState::Todo);
+        assert_eq!(to, WorkflowState::Claimed);
+    }
+
+    #[test]
+    fn test_validate_coordinator_transition_action_rejects_invalid() {
+        let args = vec![
+            "--from".to_string(),
+            "todo".to_string(),
+            "--to".to_string(),
+            "merged".to_string(),
+        ];
+        let err = validate_coordinator_transition_action(&args).unwrap_err();
+        assert!(err.to_string().contains("invalid transition"));
+    }
+
+    #[test]
+    fn test_parse_coordinator_validate_runtime_transition_args() {
+        let args = vec![
+            "--from".to_string(),
+            "running".to_string(),
+            "--to".to_string(),
+            "phase_done".to_string(),
+        ];
+        let parsed = RuntimeTransitionArgs::try_from(args.as_slice()).unwrap();
+        let from = parsed.from;
+        let to = parsed.to;
+        assert_eq!(from, RuntimeStatus::Running);
+        assert_eq!(to, RuntimeStatus::PhaseDone);
+    }
+
+    #[test]
+    fn test_validate_coordinator_runtime_transition_action_rejects_invalid() {
+        let args = vec![
+            "--from".to_string(),
+            "idle".to_string(),
+            "--to".to_string(),
+            "phase_done".to_string(),
+        ];
+        let err = validate_coordinator_runtime_transition_action(&args).unwrap_err();
+        assert!(err.to_string().contains("invalid runtime transition"));
+    }
+
+    #[test]
+    fn test_parse_coordinator_runtime_status_from_event_args() {
+        let args = vec![
+            "--type".to_string(),
+            "heartbeat".to_string(),
+            "--status".to_string(),
+            "running".to_string(),
+        ];
+        let parsed = RuntimeStatusFromEventArgs::try_from(args.as_slice()).unwrap();
+        let event_type = parsed.event_type;
+        let status = parsed.status;
+        assert_eq!(event_type, "heartbeat");
+        assert_eq!(status, "running");
+    }
+
+    #[test]
+    fn test_parse_coordinator_storage_sync_args() {
+        let args = vec!["--direction".to_string(), "import".to_string()];
+        let direction = StorageSyncArgs::try_from(args.as_slice())
+            .unwrap()
+            .direction;
+        assert_eq!(direction, CoordinatorStorageTransfer::ImportJsonToSqlite);
+    }
+
+    #[test]
+    fn test_read_coordinator_counts() {
+        let root = std::env::temp_dir().join(format!("macc_counts_test_{}", uuid_v4_like()));
+        let registry = root
+            .join(".macc")
+            .join("automation")
+            .join("task")
+            .join("task_registry.json");
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::write(
+            &registry,
+            r#"{
+  "tasks": [
+    {"id":"A","state":"todo"},
+    {"id":"B","state":"in_progress"},
+    {"id":"C","state":"blocked"},
+    {"id":"D","state":"merged"},
+    {"id":"E","state":"queued"}
+  ]
+}"#,
+        )
+        .unwrap();
+        let counts = read_registry_counts(&registry).unwrap();
+        assert_eq!(counts.total, 5);
+        assert_eq!(counts.todo, 1);
+        assert_eq!(counts.active, 2);
+        assert_eq!(counts.blocked, 1);
+        assert_eq!(counts.merged, 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5811,37 +1558,22 @@ mod tests {
 }"#,
         )
         .unwrap();
-
-        let script = root.join("fake-coordinator.sh");
-        write_executable_script(
-            &script,
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-action="${1:-dispatch}"
-case "$action" in
-  dispatch)
-    cat >"$TASK_REGISTRY_FILE" <<'JSON'
-{
-  "schema_version": 1,
+        let prd_path = root.join("prd.json");
+        fs::write(
+            &prd_path,
+            r#"{
+  "lot": "Test",
   "tasks": [
     {
       "id": "TASK-1",
-      "state": "merged",
+      "title": "Test task",
       "dependencies": [],
-      "exclusive_resources": [],
-      "worktree": null
+      "exclusive_resources": []
     }
-  ],
-  "resource_locks": {},
-  "state_mapping": {}
-}
-JSON
-    ;;
-  sync|reconcile|cleanup) ;;
-  *) ;;
-esac
-"#,
-        );
+  ]
+}"#,
+        )
+        .unwrap();
 
         let canonical = macc_core::config::CanonicalConfig::default();
         let coordinator_cfg = macc_core::config::CoordinatorConfig {
@@ -5859,13 +1591,19 @@ esac
             max_parallel: None,
             timeout_seconds: Some(10),
             phase_runner_max_attempts: None,
+            log_flush_lines: None,
+            log_flush_ms: None,
+            mirror_json_debounce_ms: None,
             stale_claimed_seconds: None,
             stale_in_progress_seconds: None,
             stale_changes_requested_seconds: None,
             stale_action: None,
+            storage_mode: None,
+            error_code_retry_list: None,
+            error_code_retry_max: None,
         };
 
-        run_coordinator_full_cycle(&root, &script, &canonical, Some(&coordinator_cfg), &env_cfg)?;
+        run_coordinator_full_cycle(&root, &canonical, Some(&coordinator_cfg), &env_cfg)?;
 
         let final_state: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&registry).unwrap()).unwrap();
@@ -5901,15 +1639,22 @@ esac
 }"#,
         )
         .unwrap();
-
-        let script = root.join("fake-stall-coordinator.sh");
-        write_executable_script(
-            &script,
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-exit 0
-"#,
-        );
+        let prd_path = root.join("prd.json");
+        fs::write(
+            &prd_path,
+            r#"{
+  "lot": "Test",
+  "tasks": [
+    {
+      "id": "TASK-STALL",
+      "title": "Stall task",
+      "dependencies": [],
+      "exclusive_resources": []
+    }
+  ]
+}"#,
+        )
+        .unwrap();
 
         let canonical = macc_core::config::CanonicalConfig::default();
         let coordinator_cfg = macc_core::config::CoordinatorConfig {
@@ -5927,20 +1672,20 @@ exit 0
             max_parallel: None,
             timeout_seconds: Some(10),
             phase_runner_max_attempts: None,
+            log_flush_lines: None,
+            log_flush_ms: None,
+            mirror_json_debounce_ms: None,
             stale_claimed_seconds: None,
             stale_in_progress_seconds: None,
             stale_changes_requested_seconds: None,
             stale_action: None,
+            storage_mode: None,
+            error_code_retry_list: None,
+            error_code_retry_max: None,
         };
 
-        let err = run_coordinator_full_cycle(
-            &root,
-            &script,
-            &canonical,
-            Some(&coordinator_cfg),
-            &env_cfg,
-        )
-        .expect_err("stalling coordinator should fail");
+        let err = run_coordinator_full_cycle(&root, &canonical, Some(&coordinator_cfg), &env_cfg)
+            .expect_err("stalling coordinator should fail");
         let msg = err.to_string();
         assert!(
             msg.contains("no progress"),
@@ -5952,48 +1697,317 @@ exit 0
     }
 
     #[test]
+    fn test_coordinator_control_plane_same_input_same_final_state() -> macc_core::Result<()> {
+        fn run_once(
+            root: &std::path::Path,
+            _script: &std::path::Path,
+        ) -> macc_core::Result<serde_json::Value> {
+            let registry = root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
+            std::fs::create_dir_all(registry.parent().expect("registry parent")).unwrap();
+            fs::write(
+                &registry,
+                r#"{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"T1","state":"todo","dependencies":[],"exclusive_resources":[]},
+    {"id":"T2","state":"todo","dependencies":[],"exclusive_resources":[]}
+  ],
+  "resource_locks": {},
+  "state_mapping": {}
+}"#,
+            )
+            .unwrap();
+
+            let canonical = macc_core::config::CanonicalConfig::default();
+            let coordinator_cfg = macc_core::config::CoordinatorConfig {
+                timeout_seconds: Some(10),
+                ..Default::default()
+            };
+            let env_cfg = CoordinatorEnvConfig {
+                prd: None,
+                coordinator_tool: None,
+                reference_branch: None,
+                tool_priority: None,
+                max_parallel_per_tool_json: None,
+                tool_specializations_json: None,
+                max_dispatch: None,
+                max_parallel: None,
+                timeout_seconds: Some(10),
+                phase_runner_max_attempts: None,
+                log_flush_lines: None,
+                log_flush_ms: None,
+                mirror_json_debounce_ms: None,
+                stale_claimed_seconds: None,
+                stale_in_progress_seconds: None,
+                stale_changes_requested_seconds: None,
+                stale_action: None,
+                storage_mode: None,
+                error_code_retry_list: None,
+                error_code_retry_max: None,
+            };
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .enable_io()
+                .build()
+                .map_err(|e| {
+                    MaccError::Validation(format!("Failed to initialize tokio runtime: {}", e))
+                })?;
+            runtime.block_on(macc_core::coordinator::engine::run_native_control_plane(
+                root,
+                &canonical,
+                Some(&coordinator_cfg),
+                &env_cfg,
+                None,
+            ))?;
+
+            let final_state: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&registry).unwrap()).unwrap();
+            Ok(final_state)
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("macc_cli_cp_deterministic_{}", uuid_v4_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("fake-cp-deterministic.sh");
+        write_executable_script(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+action="${1:-dispatch}"
+case "$action" in
+  dispatch)
+    tmp="$(mktemp)"
+    jq '
+      .tasks |= map(
+        if .state == "todo" then .state = "in_progress" else . end
+      )
+    ' "$TASK_REGISTRY_FILE" >"$tmp"
+    mv "$tmp" "$TASK_REGISTRY_FILE"
+    ;;
+  advance)
+    tmp="$(mktemp)"
+    jq '
+      .tasks |= map(
+        if .state == "in_progress" then .state = "merged" else . end
+      )
+    ' "$TASK_REGISTRY_FILE" >"$tmp"
+    mv "$tmp" "$TASK_REGISTRY_FILE"
+    ;;
+  sync|reconcile|cleanup) ;;
+  *) ;;
+esac
+"#,
+        );
+
+        let first = run_once(&root, &script)?;
+        let second = run_once(&root, &script)?;
+        assert_eq!(first, second, "same inputs must yield same final state");
+
+        std::fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_coordinator_parallel_dispatch_behavior() -> macc_core::Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("macc_cli_parallel_dispatch_{}", uuid_v4_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
+        std::fs::create_dir_all(registry.parent().expect("registry parent")).unwrap();
+        fs::write(
+            &registry,
+            r#"{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"T1","state":"todo","dependencies":[],"exclusive_resources":[]},
+    {"id":"T2","state":"todo","dependencies":[],"exclusive_resources":[]},
+    {"id":"T3","state":"todo","dependencies":[],"exclusive_resources":[]}
+  ],
+  "resource_locks": {},
+  "state_mapping": {}
+}"#,
+        )
+        .unwrap();
+
+        let script = root.join("fake-parallel-dispatch.sh");
+        write_executable_script(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+action="${1:-dispatch}"
+if [[ "$action" == "dispatch" ]]; then
+  tmp="$(mktemp)"
+  jq '
+    .tasks |= (
+      reduce .[] as $task ({count: 0, out: []};
+        if ($task.state == "todo" and .count < 2) then
+          {count: (.count + 1), out: (.out + [($task + {state: "in_progress"})])}
+        else
+          {count: .count, out: (.out + [$task])}
+        end
+      ) | .out
+    )
+  ' "$TASK_REGISTRY_FILE" >"$tmp"
+  mv "$tmp" "$TASK_REGISTRY_FILE"
+fi
+"#,
+        );
+
+        let canonical = macc_core::config::CanonicalConfig::default();
+        let env_cfg = CoordinatorEnvConfig {
+            prd: None,
+            coordinator_tool: None,
+            reference_branch: None,
+            tool_priority: None,
+            max_parallel_per_tool_json: None,
+            tool_specializations_json: None,
+            max_dispatch: None,
+            max_parallel: None,
+            timeout_seconds: None,
+            phase_runner_max_attempts: None,
+            log_flush_lines: None,
+            log_flush_ms: None,
+            mirror_json_debounce_ms: None,
+            stale_claimed_seconds: None,
+            stale_in_progress_seconds: None,
+            stale_changes_requested_seconds: None,
+            stale_action: None,
+            storage_mode: None,
+            error_code_retry_list: None,
+            error_code_retry_max: None,
+        };
+
+        run_coordinator_action(&root, &script, "dispatch", &[], &canonical, None, &env_cfg)?;
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&registry).unwrap()).unwrap();
+        let active = value["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["state"].as_str() == Some("in_progress"))
+            .count();
+        let todo = value["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["state"].as_str() == Some("todo"))
+            .count();
+        assert_eq!(active, 2, "dispatch should activate two tasks in parallel");
+        assert_eq!(todo, 1, "one task should remain todo");
+
+        std::fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn test_coordinator_retry_phase_behavior() -> macc_core::Result<()> {
+        let root = std::env::temp_dir().join(format!("macc_cli_retry_phase_{}", uuid_v4_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = root.join(COORDINATOR_TASK_REGISTRY_REL_PATH);
+        std::fs::create_dir_all(registry.parent().expect("registry parent")).unwrap();
+        fs::write(
+            &registry,
+            r#"{
+  "schema_version": 1,
+  "tasks": [
+    {"id":"TASK-R","state":"blocked","dependencies":[],"exclusive_resources":[]}
+  ],
+  "resource_locks": {},
+  "state_mapping": {}
+}"#,
+        )
+        .unwrap();
+
+        let script = root.join("fake-retry-phase.sh");
+        write_executable_script(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+action="${1:-dispatch}"
+if [[ "$action" == "retry-phase" ]]; then
+  shift
+  task=""
+  phase=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --retry-task) task="$2"; shift 2 ;;
+      --retry-phase) phase="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ "$task" == "TASK-R" ]] || exit 2
+  [[ "$phase" == "integrate" ]] || exit 3
+  tmp="$(mktemp)"
+  jq '.tasks |= map(if .id=="TASK-R" then .state="queued" else . end)' "$TASK_REGISTRY_FILE" >"$tmp"
+  mv "$tmp" "$TASK_REGISTRY_FILE"
+fi
+"#,
+        );
+
+        let canonical = macc_core::config::CanonicalConfig::default();
+        let env_cfg = CoordinatorEnvConfig {
+            prd: None,
+            coordinator_tool: None,
+            reference_branch: None,
+            tool_priority: None,
+            max_parallel_per_tool_json: None,
+            tool_specializations_json: None,
+            max_dispatch: None,
+            max_parallel: None,
+            timeout_seconds: None,
+            phase_runner_max_attempts: None,
+            log_flush_lines: None,
+            log_flush_ms: None,
+            mirror_json_debounce_ms: None,
+            stale_claimed_seconds: None,
+            stale_in_progress_seconds: None,
+            stale_changes_requested_seconds: None,
+            stale_action: None,
+            storage_mode: None,
+            error_code_retry_list: None,
+            error_code_retry_max: None,
+        };
+
+        run_coordinator_action(
+            &root,
+            &script,
+            "retry-phase",
+            &[
+                "--retry-task".to_string(),
+                "TASK-R".to_string(),
+                "--retry-phase".to_string(),
+                "integrate".to_string(),
+            ],
+            &canonical,
+            None,
+            &env_cfg,
+        )?;
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&registry).unwrap()).unwrap();
+        assert_eq!(
+            value["tasks"][0]["state"].as_str(),
+            Some("queued"),
+            "retry-phase integrate should update blocked task to queued in this test harness"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn test_coordinator_stop_removes_worktrees_and_branches() -> macc_core::Result<()> {
         let root = std::env::temp_dir().join(format!("macc_cli_coord_stop_{}", uuid_v4_like()));
         std::fs::create_dir_all(&root).unwrap();
         let ids = fixture_ids();
         std::fs::write(root.join("README.md"), "seed\n").unwrap();
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("init")
-            .status()
-            .unwrap();
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("config")
-            .arg("user.email")
-            .arg("macc-tests@example.com")
-            .status()
-            .unwrap();
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("config")
-            .arg("user.name")
-            .arg("macc-tests")
-            .status()
-            .unwrap();
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("add")
-            .arg("README.md")
-            .status()
-            .unwrap();
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("commit")
-            .arg("-m")
-            .arg("seed")
-            .status()
-            .unwrap();
+        run_git_ok(&root, &["init"]);
+        run_git_ok(&root, &["config", "user.email", "macc-tests@example.com"]);
+        run_git_ok(&root, &["config", "user.name", "macc-tests"]);
+        run_git_ok(&root, &["add", "README.md"]);
+        run_git_ok(&root, &["commit", "-m", "seed"]);
 
         run_with_engine(
             Cli {
@@ -6035,18 +2049,17 @@ exit 0
 
         let wt_path = root.join(".macc/worktree/stop-test");
         std::fs::create_dir_all(root.join(".macc/worktree")).unwrap();
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("worktree")
-            .arg("add")
-            .arg("-b")
-            .arg("ai/stop-test")
-            .arg(&wt_path)
-            .arg("HEAD")
-            .status()
-            .unwrap();
-        assert!(status.success(), "failed creating test worktree");
+        run_git_ok(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "ai/stop-test",
+                wt_path.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        );
 
         run_with_engine(
             Cli {
@@ -6054,6 +2067,7 @@ exit 0
                 verbose: false,
                 command: Some(Commands::Coordinator {
                     action: "stop".to_string(),
+                    no_tui: true,
                     graceful: true,
                     remove_worktrees: true,
                     remove_branches: true,
@@ -6067,10 +2081,14 @@ exit 0
                     max_parallel: None,
                     timeout_seconds: None,
                     phase_runner_max_attempts: None,
+                    log_flush_lines: None,
+                    log_flush_ms: None,
+                    mirror_json_debounce_ms: None,
                     stale_claimed_seconds: None,
                     stale_in_progress_seconds: None,
                     stale_changes_requested_seconds: None,
                     stale_action: None,
+                    storage_mode: None,
                     extra_args: Vec::new(),
                 }),
             },
@@ -6082,16 +2100,8 @@ exit 0
             "worktree should be removed by coordinator stop"
         );
 
-        let branch_check = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("rev-parse")
-            .arg("--verify")
-            .arg("ai/stop-test")
-            .status()
-            .unwrap();
         assert!(
-            !branch_check.success(),
+            !macc_core::git::rev_parse_verify(&root, "ai/stop-test").unwrap_or(false),
             "branch should be deleted by coordinator stop --remove-branches"
         );
 
@@ -6431,31 +2441,14 @@ exit 0
         std::fs::write(skill_source_dir.join("macc.package.json"), manifest).unwrap();
         std::fs::write(skill_source_dir.join("SKILL.md"), "remote content").unwrap();
 
-        std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(&skill_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(&skill_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&skill_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&skill_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(&skill_source_dir)
-            .status()
-            .unwrap();
+        run_git_ok(&skill_source_dir, &["init", "-b", "main"]);
+        run_git_ok(
+            &skill_source_dir,
+            &["config", "user.email", "test@example.com"],
+        );
+        run_git_ok(&skill_source_dir, &["config", "user.name", "Test"]);
+        run_git_ok(&skill_source_dir, &["add", "."]);
+        run_git_ok(&skill_source_dir, &["commit", "-m", "initial"]);
 
         run_with_engine(
             Cli {
@@ -6548,31 +2541,14 @@ exit 0
         )
         .unwrap();
 
-        std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(&mcp_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(&mcp_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&mcp_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&mcp_source_dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(&mcp_source_dir)
-            .status()
-            .unwrap();
+        run_git_ok(&mcp_source_dir, &["init", "-b", "main"]);
+        run_git_ok(
+            &mcp_source_dir,
+            &["config", "user.email", "test@example.com"],
+        );
+        run_git_ok(&mcp_source_dir, &["config", "user.name", "Test"]);
+        run_git_ok(&mcp_source_dir, &["add", "."]);
+        run_git_ok(&mcp_source_dir, &["commit", "-m", "initial"]);
 
         // 3. Add to catalog
         run_with_engine(
@@ -6965,8 +2941,6 @@ exit 0
 
     #[test]
     fn test_install_skill_multi_git_cli() -> macc_core::Result<()> {
-        use std::process::Command;
-
         let temp_base =
             std::env::temp_dir().join(format!("macc_install_multi_git_test_{}", uuid_v4_like()));
         std::fs::create_dir_all(&temp_base).unwrap();
@@ -6977,20 +2951,7 @@ exit 0
         std::fs::create_dir_all(&repo_path).unwrap();
 
         // 1. Initialize a local git repo
-        let run_git = |args: &[&str], dir: &std::path::Path| {
-            let output = Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .expect("Failed to execute git command");
-            if !output.status.success() {
-                panic!(
-                    "git command failed: {:?} -> {}",
-                    args,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        };
+        let run_git = |args: &[&str], dir: &std::path::Path| run_git_ok(dir, args);
 
         run_git(&["init"], &repo_path);
         // Set user info for commits
