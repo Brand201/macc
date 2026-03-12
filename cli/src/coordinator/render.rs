@@ -32,6 +32,7 @@ pub(crate) fn print_status_summary(repo_root: &Path, status: &CoordinatorStatus)
     }
     if let Some(report) = &status.failure_report {
         println!("Failure report:");
+        println!("  kind: {:?}", report.kind);
         println!("  source: {}", report.source);
         println!("  blocking: {}", report.blocking);
         if let Some(task) = &report.task_id {
@@ -42,6 +43,12 @@ pub(crate) fn print_status_summary(repo_root: &Path, status: &CoordinatorStatus)
         }
         if let Some(event_type) = &report.event_type {
             println!("  event: {}", event_type);
+        }
+        if !report.suggested_fixes.is_empty() {
+            println!("  suggested fixes:");
+            for fix in &report.suggested_fixes {
+                println!("    - {}", fix);
+            }
         }
     }
 }

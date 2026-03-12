@@ -4,6 +4,14 @@ use crate::coordinator_storage::{
 };
 use crate::{ProjectPaths, Result};
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FailureKind {
+    ProcessError,
+    ConfigurationError,
+    #[default]
+    InternalError,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FailureReport {
     pub message: String,
@@ -12,6 +20,8 @@ pub struct FailureReport {
     pub source: String,
     pub blocking: bool,
     pub event_type: Option<String>,
+    pub kind: FailureKind,
+    pub suggested_fixes: Vec<String>,
 }
 
 pub fn analyze_last_failure(paths: &ProjectPaths) -> Result<Option<FailureReport>> {
@@ -21,20 +31,20 @@ pub fn analyze_last_failure(paths: &ProjectPaths) -> Result<Option<FailureReport
             .and_then(serde_json::Value::as_str)
             .unwrap_or("Coordinator paused due to a blocking error.")
             .to_string();
-        return Ok(Some(FailureReport {
+        return Ok(Some(build_failure_report(
             message,
-            task_id: pause
+            pause
                 .get("task_id")
                 .and_then(serde_json::Value::as_str)
                 .map(|s| s.to_string()),
-            phase: pause
+            pause
                 .get("phase")
                 .and_then(serde_json::Value::as_str)
                 .map(|s| s.to_string()),
-            source: "pause_file".to_string(),
-            blocking: true,
-            event_type: Some("pause".to_string()),
-        }));
+            "pause_file",
+            true,
+            Some("pause".to_string()),
+        )));
     }
 
     let storage_paths = CoordinatorStoragePaths::from_project_paths(paths);
@@ -101,14 +111,14 @@ fn report_from_events(events: &[serde_json::Value]) -> Option<FailureReport> {
             .and_then(serde_json::Value::as_str)
             .map(|s| s.to_string())
             .or_else(|| infer_phase_from_status(status));
-        return Some(FailureReport {
+        return Some(build_failure_report(
             message,
             task_id,
             phase,
-            source: "event".to_string(),
-            blocking: true,
-            event_type: Some(event_type.to_string()),
-        });
+            "event",
+            true,
+            Some(event_type.to_string()),
+        ));
     }
     None
 }
@@ -129,14 +139,14 @@ fn report_from_logs(logs: &str) -> Option<FailureReport> {
                     message = v.to_string();
                 }
             }
-            return Some(FailureReport {
+            return Some(build_failure_report(
                 message,
                 task_id,
                 phase,
-                source: "log".to_string(),
-                blocking: true,
-                event_type: Some("run_paused".to_string()),
-            });
+                "log",
+                true,
+                Some("run_paused".to_string()),
+            ));
         }
         if let Some(rest) = trimmed.strip_prefix("- Merge failed task=") {
             let mut task_id = None;
@@ -148,17 +158,89 @@ fn report_from_logs(logs: &str) -> Option<FailureReport> {
                     message = v.to_string();
                 }
             }
-            return Some(FailureReport {
+            return Some(build_failure_report(
                 message,
                 task_id,
-                phase: Some("integrate".to_string()),
-                source: "log".to_string(),
-                blocking: true,
-                event_type: Some("local_merge_failed".to_string()),
-            });
+                Some("integrate".to_string()),
+                "log",
+                true,
+                Some("local_merge_failed".to_string()),
+            ));
         }
     }
     None
+}
+
+fn build_failure_report(
+    message: String,
+    task_id: Option<String>,
+    phase: Option<String>,
+    source: &str,
+    blocking: bool,
+    event_type: Option<String>,
+) -> FailureReport {
+    let (kind, suggested_fixes) = classify_failure(
+        &message,
+        event_type.as_deref().unwrap_or_default(),
+        phase.as_deref(),
+    );
+    FailureReport {
+        message,
+        task_id,
+        phase,
+        source: source.to_string(),
+        blocking,
+        event_type,
+        kind,
+        suggested_fixes,
+    }
+}
+
+fn classify_failure(
+    message: &str,
+    event_type: &str,
+    phase: Option<&str>,
+) -> (FailureKind, Vec<String>) {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("merge")
+        || lower.contains("conflict")
+        || event_type.contains("merge")
+        || event_type == "command_error"
+    {
+        return (
+            FailureKind::ProcessError,
+            vec![
+                "Inspect merge/log details and resolve conflicting files.".to_string(),
+                "Retry the failed phase from TUI or run `macc coordinator retry-phase ...`."
+                    .to_string(),
+            ],
+        );
+    }
+
+    if lower.contains("config")
+        || lower.contains("missing")
+        || lower.contains("not found")
+        || lower.contains("validation")
+    {
+        return (
+            FailureKind::ConfigurationError,
+            vec![
+                "Verify `.macc/macc.yaml` and coordinator settings values.".to_string(),
+                "Run `macc doctor` and fix reported tool/config issues.".to_string(),
+            ],
+        );
+    }
+
+    (
+        FailureKind::InternalError,
+        vec![
+            "Inspect coordinator and performer logs for stack/context details.".to_string(),
+            format!(
+                "If state looks stale, run `macc coordinator reconcile` and retry{}.",
+                phase.map(|p| format!(" phase `{}`", p)).unwrap_or_default()
+            ),
+        ],
+    )
 }
 
 fn infer_phase_from_status(status: &str) -> Option<String> {
