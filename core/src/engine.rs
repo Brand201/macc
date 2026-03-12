@@ -471,9 +471,6 @@ pub trait Engine {
         worktree_filter: Option<&str>,
         task_filter: Option<&str>,
     ) -> Result<std::path::PathBuf> {
-        if component.eq_ignore_ascii_case("all") || component.eq_ignore_ascii_case("performer") {
-            let _ = self.coordinator_aggregate_performer_logs(&paths.root);
-        }
         crate::service::logs::select_log_file(paths, component, worktree_filter, task_filter)
     }
 
@@ -507,9 +504,6 @@ pub trait Engine {
         component: &str,
         worktree_filter: Option<&str>,
     ) -> Result<String> {
-        if component.eq_ignore_ascii_case("all") || component.eq_ignore_ascii_case("performer") {
-            let _ = self.coordinator_aggregate_performer_logs(&paths.root);
-        }
         crate::service::logs::read_log_content(paths, component, worktree_filter, None)
     }
 

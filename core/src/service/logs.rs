@@ -18,6 +18,7 @@ pub fn select_log_file(
     task_filter: Option<&str>,
 ) -> Result<std::path::PathBuf> {
     let normalized = component.to_ascii_lowercase();
+    maybe_aggregate_performer_logs(paths, &normalized);
     let mut files = Vec::new();
 
     if normalized == "all" || normalized == "coordinator" {
@@ -143,11 +144,23 @@ fn collect_log_files(
 }
 
 pub fn list_log_entries(paths: &ProjectPaths) -> Result<Vec<LogFileEntry>> {
+    maybe_aggregate_performer_logs(paths, "all");
     let log_root = paths.root.join(".macc/log");
     let mut out = Vec::new();
     collect_log_entries(&log_root, &log_root, &mut out)?;
     out.sort_by(|a, b| b.relative.cmp(&a.relative));
     Ok(out)
+}
+
+fn maybe_aggregate_performer_logs(paths: &ProjectPaths, normalized_component: &str) {
+    if normalized_component == "all" || normalized_component == "performer" {
+        if let Err(err) = crate::coordinator::logs::aggregate_performer_logs(&paths.root) {
+            tracing::warn!(
+                "performer log aggregation failed before log retrieval: {}",
+                err
+            );
+        }
+    }
 }
 
 pub fn read_log_file(path: &std::path::Path) -> Result<String> {
